@@ -4,464 +4,529 @@
  *--------------------------------------------------------------------------------------------*/
 
 #include "CoreMinimal.h"
+
 #include "EdGraph/EdGraph.h"
+#include "EdGraph/EdGraphNode.h"
+#include "EdGraph/EdGraphPin.h"
 #include "Editor.h"
+#include "Framework/Commands/UICommandList.h"
+#include "Framework/Docking/TabManager.h"
+#include "Framework/MultiBox/MultiBoxBuilder.h"
+#include "GraphEditor.h"
+#include "GraphEditorSettings.h"
+#include "ISettingsModule.h"
+#include "Modules/ModuleManager.h"
+#include "Subsystems/AssetEditorSubsystem.h"
+#include "Toolkits/AssetEditorToolkit.h"
+#include "Widgets/Docking/SDockTab.h"
+#include "Widgets/Input/SComboBox.h"
+#include "Widgets/Input/SSpinBox.h"
+#include "Widgets/SBoxPanel.h"
+#include "Widgets/Text/STextBlock.h"
+
 #include "Formatter.h"
 #include "FormatterCommands.h"
+#include "FormatterLog.h"
 #include "FormatterSettings.h"
 #include "FormatterStyle.h"
-#include "ISettingsModule.h"
-#include "ISettingsSection.h"
-#include "Modules/ModuleManager.h"
-#include "Framework/MultiBox/MultiBoxDefs.h"
-#include "GraphEditorSettings.h"
-#include "ScopedTransaction.h"
-#include "FormatterLog.h"
-#include "SGraphPanel.h"
-#include "Widgets/Input/SSpinBox.h"
 
 #define LOCTEXT_NAMESPACE "GraphFormatter"
 
-class FFormatterModule : public IModuleInterface
+namespace
 {
-    virtual void StartupModule() override;
-    virtual void ShutdownModule() override;
-    
-    virtual void FormatGraphAutomated(TObjectPtr<UObject> Object);
-
-    void HandleAssetEditorOpened(UObject* Object, IAssetEditorInstance* Instance);
-    void ToggleStraightenConnections();
-    bool IsStraightenConnectionsEnabled() const;
-    SGraphEditor* FindEditorForObject(UObject* Object) const;
-    FDelegateHandle GraphEditorDelegateHandle;
-    TArray<TSharedPtr<EGraphFormatterPositioningAlgorithm>> AlgorithmOptions;
-    TSharedPtr<FExtender> ToolbarExtender;
-public:
-    void FillToolbar(FToolBarBuilder& ToolbarBuilder);
-    void ExtendToolBar(IAssetEditorInstance* Instance);
-    void MapCommands(UObject* Object, IAssetEditorInstance* Instance);
-    void OnGraphEditorDetected(UObject* Object, IAssetEditorInstance* Instance);
+struct FFormatterCommandContext
+{
+	TArray<TWeakObjectPtr<UObject>> Objects{};
 };
 
-class FAssetEditorInstance
+struct FResolvedGraphTarget
+{
+	SGraphEditor* Editor = nullptr;
+	UObject* Object = nullptr;
+};
+
+TArray<TWeakPtr<FUICommandList>>& GetMappedCommandLists()
+{
+	static TArray<TWeakPtr<FUICommandList>> CommandLists;
+	return CommandLists;
+}
+
+const TArray<TSharedPtr<EGraphFormatterPositioningAlgorithm>>& GetAlgorithmOptions()
+{
+	static const TArray<TSharedPtr<EGraphFormatterPositioningAlgorithm>> Options{
+		MakeShared<EGraphFormatterPositioningAlgorithm>(EGraphFormatterPositioningAlgorithm::EEvenlyInLayer),
+		MakeShared<EGraphFormatterPositioningAlgorithm>(EGraphFormatterPositioningAlgorithm::EFastAndSimpleMethodTop),
+		MakeShared<EGraphFormatterPositioningAlgorithm>(EGraphFormatterPositioningAlgorithm::EFastAndSimpleMethodMedian),
+		MakeShared<EGraphFormatterPositioningAlgorithm>(EGraphFormatterPositioningAlgorithm::ELayerSweep),
+	};
+	return Options;
+}
+
+FText GetAlgorithmName(const EGraphFormatterPositioningAlgorithm Algorithm)
+{
+	switch (Algorithm)
+	{
+		case EGraphFormatterPositioningAlgorithm::EEvenlyInLayer:
+			return LOCTEXT("EvenlyInLayerAlgorithm", "Evenly in layer");
+		case EGraphFormatterPositioningAlgorithm::EFastAndSimpleMethodTop:
+			return LOCTEXT("FastAndSimpleTopAlgorithm", "FAS Top");
+		case EGraphFormatterPositioningAlgorithm::EFastAndSimpleMethodMedian:
+			return LOCTEXT("FastAndSimpleMedianAlgorithm", "FAS Median");
+		case EGraphFormatterPositioningAlgorithm::ELayerSweep:
+			return LOCTEXT("LayerSweepAlgorithm", "Layer sweep");
+		default:
+			return LOCTEXT("InvalidAlgorithm", "Invalid");
+	}
+}
+
+TSharedPtr<EGraphFormatterPositioningAlgorithm> FindSelectedAlgorithm()
+{
+	const EGraphFormatterPositioningAlgorithm Selected = GetDefault<UFormatterSettings>()->PositioningAlgorithm;
+	const TArray<TSharedPtr<EGraphFormatterPositioningAlgorithm>>& Options = GetAlgorithmOptions();
+	const TSharedPtr<EGraphFormatterPositioningAlgorithm>* Match =
+		Options.FindByPredicate([Selected](const TSharedPtr<EGraphFormatterPositioningAlgorithm>& Option)
+								{ return Option.IsValid() && *Option == Selected; });
+	return Match != nullptr ? *Match : Options[0];
+}
+
+bool IsGraphOwnedByObject(const UEdGraph* Graph, const UObject* Object)
+{
+	for (const UObject* Outer = Graph; Outer != nullptr; Outer = Outer->GetOuter())
+	{
+		if (Outer == Object) { return true; }
+	}
+	return false;
+}
+
+UObject* FindContextObjectForEditor(const SGraphEditor* Editor, const FFormatterCommandContext& Context)
+{
+	if (Editor == nullptr) { return nullptr; }
+	const UEdGraph* Graph = Editor->GetCurrentGraph();
+	if (Graph == nullptr) { return nullptr; }
+
+	for (const TWeakObjectPtr<UObject>& WeakObject : Context.Objects)
+	{
+		if (UObject* Object = WeakObject.Get(); IsGraphOwnedByObject(Graph, Object)) { return Object; }
+	}
+	return nullptr;
+}
+
+void CollectGraphEditors(const TSharedRef<SWidget>& Widget, TArray<SGraphEditor*>& OutEditors)
+{
+	if (!Widget->GetVisibility().IsVisible()) { return; }
+	if (Widget->GetType() == TEXT("SGraphEditor"))
+	{
+		OutEditors.Add(StaticCast<SGraphEditor*>(&Widget.Get()));
+		return;
+	}
+
+	FChildren* Children = Widget->GetChildren();
+	if (Children == nullptr) { return; }
+	for (int32 Index = 0; Index < Children->Num(); ++Index)
+	{
+		CollectGraphEditors(Children->GetChildAt(Index), OutEditors);
+	}
+}
+
+void CollectActiveGraphTargets(const FFormatterCommandContext& Context, TArray<FResolvedGraphTarget>& OutTargets)
+{
+	if (GEditor == nullptr) { return; }
+	UAssetEditorSubsystem* AssetEditors = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>();
+	if (AssetEditors == nullptr) { return; }
+
+	for (const TWeakObjectPtr<UObject>& WeakObject : Context.Objects)
+	{
+		UObject* Object = WeakObject.Get();
+		IAssetEditorInstance* Instance = Object != nullptr ? AssetEditors->FindEditorForAsset(Object, false) : nullptr;
+		TSharedPtr<FTabManager> TabManager = Instance != nullptr ? Instance->GetAssociatedTabManager() : nullptr;
+		TSharedPtr<SDockTab> EditorRootTab = TabManager.IsValid() ? TabManager->GetOwnerTab() : nullptr;
+		if (!EditorRootTab.IsValid()) { continue; }
+
+		TArray<SGraphEditor*> TabEditors;
+		CollectGraphEditors(EditorRootTab.ToSharedRef(), TabEditors);
+		for (SGraphEditor* Editor : TabEditors)
+		{
+			if (!IsGraphOwnedByObject(Editor->GetCurrentGraph(), Object)) { continue; }
+			if (!OutTargets.ContainsByPredicate([Editor](const FResolvedGraphTarget& Target)
+												{ return Target.Editor == Editor; }))
+			{
+				OutTargets.Add({ Editor, Object });
+			}
+		}
+	}
+}
+
+bool ResolveGraphTarget(const TSharedPtr<const FFormatterCommandContext>& Context, SGraphEditor*& OutEditor, UObject*& OutObject)
+{
+	OutEditor = nullptr;
+	OutObject = nullptr;
+	if (!Context.IsValid()) { return false; }
+
+	if (SGraphEditor* CursorEditor = FFormatter::Instance().FindGraphEditorByCursor())
+	{
+		if (UObject* Object = FindContextObjectForEditor(CursorEditor, *Context))
+		{
+			OutEditor = CursorEditor;
+			OutObject = Object;
+			return true;
+		}
+	}
+
+	TArray<FResolvedGraphTarget> ActiveTargets;
+	CollectActiveGraphTargets(*Context, ActiveTargets);
+	if (ActiveTargets.Num() != 1) { return false; }
+	OutEditor = ActiveTargets[0].Editor;
+	OutObject = ActiveTargets[0].Object;
+	return true;
+}
+
+bool IsFormattingEnabledForObject(const UObject* Object)
+{
+	const UFormatterSettings* Settings = GetDefault<UFormatterSettings>();
+	return Object != nullptr && (FFormatter::IsAssetSupported(Object) || Settings->AutoDetectGraphEditor);
+}
+
+bool CanExecuteGraphCommand(const TSharedPtr<const FFormatterCommandContext> Context)
+{
+	SGraphEditor* Editor = nullptr;
+	UObject* Object = nullptr;
+	return ResolveGraphTarget(Context, Editor, Object) && IsFormattingEnabledForObject(Object);
+}
+
+void RecordDetectedGraphEditor(UObject* Object)
+{
+	if (Object == nullptr) { return; }
+	UFormatterSettings* Settings = GetMutableDefault<UFormatterSettings>();
+	const FString AssetType = Object->GetClass()->GetName();
+	if (Settings->SupportedAssetTypes.Contains(AssetType)) { return; }
+
+	Settings->SupportedAssetTypes.Add(AssetType, true);
+	Settings->PostEditChange();
+	Settings->SaveConfig();
+}
+
+void PrepareGraphCommand(UObject* Object, SGraphEditor* Editor)
+{
+	if (GetDefault<UFormatterSettings>()->AutoDetectGraphEditor) { RecordDetectedGraphEditor(Object); }
+	FFormatter::Instance().SetCurrentEditor(Editor, Object);
+}
+
+void ExecuteFormatGraph(const TSharedPtr<const FFormatterCommandContext> Context, const bool bRouteWires)
+{
+	SGraphEditor* Editor = nullptr;
+	UObject* Object = nullptr;
+	if (!ResolveGraphTarget(Context, Editor, Object) || !IsFormattingEnabledForObject(Object)) { return; }
+
+	PrepareGraphCommand(Object, Editor);
+	FFormatter::Instance().Format(bRouteWires);
+}
+
+void ExecutePlaceBlock(const TSharedPtr<const FFormatterCommandContext> Context)
+{
+	SGraphEditor* Editor = nullptr;
+	UObject* Object = nullptr;
+	if (!ResolveGraphTarget(Context, Editor, Object) || !IsFormattingEnabledForObject(Object)) { return; }
+
+	PrepareGraphCommand(Object, Editor);
+	FFormatter::Instance().PlaceBlock();
+}
+
+bool IsStraightenConnectionsEnabled()
+{
+	const UGraphEditorSettings* Settings = GetDefault<UGraphEditorSettings>();
+	return Settings->ForwardSplineTangentFromHorizontalDelta.IsZero()
+		&& Settings->ForwardSplineTangentFromVerticalDelta.IsZero()
+		&& Settings->BackwardSplineTangentFromHorizontalDelta.IsZero()
+		&& Settings->BackwardSplineTangentFromVerticalDelta.IsZero();
+}
+
+void ToggleStraightenConnections()
+{
+	UGraphEditorSettings* GraphSettings = GetMutableDefault<UGraphEditorSettings>();
+	if (IsStraightenConnectionsEnabled())
+	{
+		const UFormatterSettings* Settings = GetDefault<UFormatterSettings>();
+		GraphSettings->ForwardSplineTangentFromHorizontalDelta = Settings->ForwardSplineTangentFromHorizontalDelta;
+		GraphSettings->ForwardSplineTangentFromVerticalDelta = Settings->ForwardSplineTangentFromVerticalDelta;
+		GraphSettings->BackwardSplineTangentFromHorizontalDelta = Settings->BackwardSplineTangentFromHorizontalDelta;
+		GraphSettings->BackwardSplineTangentFromVerticalDelta = Settings->BackwardSplineTangentFromVerticalDelta;
+	}
+	else
+	{
+		UFormatterSettings* Settings = GetMutableDefault<UFormatterSettings>();
+		Settings->ForwardSplineTangentFromHorizontalDelta = GraphSettings->ForwardSplineTangentFromHorizontalDelta;
+		Settings->ForwardSplineTangentFromVerticalDelta = GraphSettings->ForwardSplineTangentFromVerticalDelta;
+		Settings->BackwardSplineTangentFromHorizontalDelta = GraphSettings->BackwardSplineTangentFromHorizontalDelta;
+		Settings->BackwardSplineTangentFromVerticalDelta = GraphSettings->BackwardSplineTangentFromVerticalDelta;
+		Settings->PostEditChange();
+		Settings->SaveConfig();
+
+		GraphSettings->ForwardSplineTangentFromHorizontalDelta = FVector2D::ZeroVector;
+		GraphSettings->ForwardSplineTangentFromVerticalDelta = FVector2D::ZeroVector;
+		GraphSettings->BackwardSplineTangentFromHorizontalDelta = FVector2D::ZeroVector;
+		GraphSettings->BackwardSplineTangentFromVerticalDelta = FVector2D::ZeroVector;
+	}
+	GraphSettings->PostEditChange();
+	GraphSettings->SaveConfig();
+}
+
+void SaveToolbarSpacing(const int32 Spacing, ETextCommit::Type)
+{
+	UFormatterSettings* Settings = GetMutableDefault<UFormatterSettings>();
+	Settings->HorizontalSpacing = Spacing;
+	Settings->K2HorizontalSpacing = Spacing;
+	Settings->PostEditChange();
+	Settings->SaveConfig();
+}
+
+void SaveFallbackAlgorithm(const TSharedPtr<EGraphFormatterPositioningAlgorithm> NewOption, const ESelectInfo::Type SelectInfo)
+{
+	if (SelectInfo == ESelectInfo::Direct || !NewOption.IsValid()) { return; }
+	UFormatterSettings* Settings = GetMutableDefault<UFormatterSettings>();
+	Settings->PositioningAlgorithm = *NewOption;
+	Settings->PostEditChange();
+	Settings->SaveConfig();
+}
+
+TSharedRef<SWidget> MakeAlgorithmWidget(const TSharedPtr<EGraphFormatterPositioningAlgorithm> Algorithm)
+{
+	return SNew(STextBlock)
+		.Text(Algorithm.IsValid() ? GetAlgorithmName(*Algorithm) : LOCTEXT("InvalidAlgorithmWidget", "Invalid"));
+}
+
+void FillToolbar(FToolBarBuilder& ToolbarBuilder)
+{
+	const FFormatterCommands& Commands = FFormatterCommands::Get();
+	const TArray<TSharedPtr<EGraphFormatterPositioningAlgorithm>>& AlgorithmOptions = GetAlgorithmOptions();
+
+	ToolbarBuilder.BeginSection("GraphFormatter");
+	ToolbarBuilder.AddToolBarButton(
+		Commands.FormatGraph,
+		NAME_None,
+		TAttribute<FText>(),
+		TAttribute<FText>(),
+		FSlateIcon(FFormatterStyle::Get()->GetStyleSetName(), "GraphFormatter.ApplyIcon"),
+		TEXT("GraphFormatter")
+	);
+	ToolbarBuilder.AddToolBarButton(
+		Commands.FormatGraphWithRouting,
+		NAME_None,
+		TAttribute<FText>(),
+		TAttribute<FText>(),
+		FSlateIcon(FFormatterStyle::Get()->GetStyleSetName(), "GraphFormatter.ApplyIcon"),
+		TEXT("GraphFormatterRoute")
+	);
+
+	ToolbarBuilder.AddWidget(
+		SNew(SHorizontalBox)
+		+ SHorizontalBox::Slot().Padding(
+			2.0f
+		)[SNew(SSpinBox<int32>)
+			  .MinValue(0)
+			  .MaxValue(1000)
+			  .MinSliderValue(0)
+			  .MaxSliderValue(1000)
+			  .ToolTipText(LOCTEXT("GraphFormatterHorizontalSpacingToolTip", "Horizontal execution-column spacing for K2 graphs and layer spacing for generic graphs."))
+			  .Value_Lambda([]() { return GetDefault<UFormatterSettings>()->K2HorizontalSpacing; })
+			  .MinDesiredWidth(80)
+			  .OnValueCommitted_Static(&SaveToolbarSpacing)]
+		+ SHorizontalBox::Slot().Padding(
+			2.0f
+		)[SNew(SComboBox<TSharedPtr<EGraphFormatterPositioningAlgorithm>>)
+			  .ContentPadding(FMargin(6.0f, 2.0f))
+			  .OptionsSource(&AlgorithmOptions)
+			  .ToolTipText(LOCTEXT(
+				  "GraphFormatterFallbackAlgorithmToolTip", "Generic/fallback positioning algorithm. K2 graphs use the semantic execution-first layout."
+			  ))
+			  .InitiallySelectedItem(FindSelectedAlgorithm())
+			  .OnSelectionChanged_Static(&SaveFallbackAlgorithm)
+			  .OnGenerateWidget_Static(&MakeAlgorithmWidget)[SNew(STextBlock)
+																 .Text_Lambda(
+																	 []()
+																	 {
+																		 return FText::Format(
+																			 LOCTEXT(
+																				 "GraphFormatterFallbackAlgorithmLabel",
+																				 "Fallback: {0}"
+																			 ),
+																			 GetAlgorithmName(
+																				 GetDefault<UFormatterSettings>()->PositioningAlgorithm
+																			 )
+																		 );
+																	 }
+																 )]]
+	);
+	ToolbarBuilder.AddToolBarButton(
+		Commands.StraightenConnections,
+		NAME_None,
+		TAttribute<FText>(),
+		TAttribute<FText>(),
+		FSlateIcon(FFormatterStyle::Get()->GetStyleSetName(), "GraphFormatter.StraightenIcon"),
+		TEXT("GraphFormatterStraighten")
+	);
+	ToolbarBuilder.EndSection();
+}
+
+bool ShouldExtendToolbar(const TArray<UObject*>& Objects)
+{
+	const UFormatterSettings* Settings = GetDefault<UFormatterSettings>();
+	if (Settings->DisableToolbar) { return false; }
+	if (Settings->AutoDetectGraphEditor) { return Objects.Num() > 0; }
+
+	for (const UObject* Object : Objects)
+	{
+		if (Object != nullptr && FFormatter::IsAssetSupported(Object)) { return true; }
+	}
+	return false;
+}
+
+TSharedRef<FExtender> CreateToolbarExtender(const TSharedRef<FUICommandList> CommandList, const TArray<UObject*> ContextSensitiveObjects)
+{
+	TSharedRef<FExtender> Extender = MakeShared<FExtender>();
+	if (!ShouldExtendToolbar(ContextSensitiveObjects)) { return Extender; }
+
+	TSharedRef<FFormatterCommandContext> Context = MakeShared<FFormatterCommandContext>();
+	for (UObject* Object : ContextSensitiveObjects)
+	{
+		if (Object != nullptr) { Context->Objects.Add(Object); }
+	}
+	const TSharedPtr<const FFormatterCommandContext> SharedContext = Context;
+
+	const FFormatterCommands& Commands = FFormatterCommands::Get();
+	CommandList->MapAction(
+		Commands.FormatGraph,
+		FExecuteAction::CreateStatic(&ExecuteFormatGraph, SharedContext, false),
+		FCanExecuteAction::CreateStatic(&CanExecuteGraphCommand, SharedContext)
+	);
+	CommandList->MapAction(
+		Commands.FormatGraphWithRouting,
+		FExecuteAction::CreateStatic(&ExecuteFormatGraph, SharedContext, true),
+		FCanExecuteAction::CreateStatic(&CanExecuteGraphCommand, SharedContext)
+	);
+	CommandList->MapAction(
+		Commands.PlaceBlock,
+		FExecuteAction::CreateStatic(&ExecutePlaceBlock, SharedContext),
+		FCanExecuteAction::CreateStatic(&CanExecuteGraphCommand, SharedContext)
+	);
+	CommandList->MapAction(
+		Commands.StraightenConnections,
+		FExecuteAction::CreateStatic(&ToggleStraightenConnections),
+		FCanExecuteAction(),
+		FIsActionChecked::CreateStatic(&IsStraightenConnectionsEnabled)
+	);
+	GetMappedCommandLists().AddUnique(TWeakPtr<FUICommandList>(CommandList));
+
+	Extender->AddToolBarExtension(
+		"Asset", EExtensionHook::After, CommandList, FToolBarExtensionDelegate::CreateStatic(&FillToolbar)
+	);
+	return Extender;
+}
+
+void HandleAssetEditorOpened(UObject* Object, IAssetEditorInstance*)
+{
+	if (Object == nullptr) { return; }
+	UE_LOG(LogGraphFormatter, Log, TEXT("AssetEditorOpened for: %s"), *Object->GetClass()->GetName());
+
+	const UFormatterSettings* Settings = GetDefault<UFormatterSettings>();
+	if (!Settings->AutoDetectGraphEditor || FFormatter::IsAssetSupported(Object)) { return; }
+
+	TSharedRef<FFormatterCommandContext> Context = MakeShared<FFormatterCommandContext>();
+	Context->Objects.Add(Object);
+	SGraphEditor* Editor = nullptr;
+	UObject* ResolvedObject = nullptr;
+	if (ResolveGraphTarget(Context, Editor, ResolvedObject)) { RecordDetectedGraphEditor(ResolvedObject); }
+}
+
+void UnmapCommands()
+{
+	if (!FFormatterCommands::IsRegistered())
+	{
+		GetMappedCommandLists().Reset();
+		return;
+	}
+
+	const FFormatterCommands& Commands = FFormatterCommands::Get();
+	for (const TWeakPtr<FUICommandList>& WeakCommandList : GetMappedCommandLists())
+	{
+		if (const TSharedPtr<FUICommandList> CommandList = WeakCommandList.Pin())
+		{
+			CommandList->UnmapAction(Commands.FormatGraph);
+			CommandList->UnmapAction(Commands.FormatGraphWithRouting);
+			CommandList->UnmapAction(Commands.PlaceBlock);
+			CommandList->UnmapAction(Commands.StraightenConnections);
+		}
+	}
+	GetMappedCommandLists().Reset();
+}
+} // namespace
+
+class FFormatterModule final : public IModuleInterface
 {
 public:
-    static inline TMap<UObject*, FAssetEditorInstance*> Instances;
-    FFormatterModule* Module;
-    IAssetEditorInstance* Instance;
-    UObject* Object;
-    void HandleEditorWidgetCreated(UObject* Object);
+	virtual void StartupModule() override;
+	virtual void ShutdownModule() override;
+
+private:
+	FDelegateHandle AssetOpenedDelegateHandle;
+	FDelegateHandle ToolbarExtenderDelegateHandle;
 };
 
 IMPLEMENT_MODULE(FFormatterModule, GraphFormatter)
 
 void FFormatterModule::StartupModule()
 {
-    FFormatterStyle::Initialize();
+	FFormatterStyle::Initialize();
+	FFormatterCommands::Register();
 
-    ISettingsModule* SettingsModule = FModuleManager::GetModulePtr<ISettingsModule>("Settings");
-    if (SettingsModule != nullptr)
-    {
-        ISettingsSectionPtr SettingsSection = SettingsModule->RegisterSettings(
-            "Editor",
-            "Plugins",
-            "GraphFormatter",
-            LOCTEXT("GraphFormatterSettingsName", "Graph Formatter"),
-            LOCTEXT("GraphFormatterSettingsDescription", "Configure the Graph Formatter plug-in."),
-            GetMutableDefault<UFormatterSettings>()
-        );
-    }
+	if (ISettingsModule* SettingsModule = FModuleManager::GetModulePtr<ISettingsModule>("Settings"))
+	{
+		SettingsModule->RegisterSettings(
+			"Editor",
+			"Plugins",
+			"GraphFormatter",
+			LOCTEXT("GraphFormatterSettingsName", "Graph Formatter"),
+			LOCTEXT("GraphFormatterSettingsDescription", "Configure the Graph Formatter plug-in."),
+			GetMutableDefault<UFormatterSettings>()
+		);
+	}
 
-    FFormatterCommands::Register();
-    if(GEditor)
-    {
-        GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OnAssetOpenedInEditor().AddRaw(this, &FFormatterModule::HandleAssetEditorOpened);
-    }
-    AlgorithmOptions.Add(MakeShareable(new EGraphFormatterPositioningAlgorithm(EGraphFormatterPositioningAlgorithm::EEvenlyInLayer)));
-    AlgorithmOptions.Add(MakeShareable(new EGraphFormatterPositioningAlgorithm(EGraphFormatterPositioningAlgorithm::EFastAndSimpleMethodTop)));
-    AlgorithmOptions.Add(MakeShareable(new EGraphFormatterPositioningAlgorithm(EGraphFormatterPositioningAlgorithm::EFastAndSimpleMethodMedian)));
-    AlgorithmOptions.Add(MakeShareable(new EGraphFormatterPositioningAlgorithm(EGraphFormatterPositioningAlgorithm::ELayerSweep)));
-}
+	FAssetEditorExtender ToolbarDelegate = FAssetEditorExtender::CreateStatic(&CreateToolbarExtender);
+	ToolbarExtenderDelegateHandle = ToolbarDelegate.GetHandle();
+	FAssetEditorToolkit::GetSharedToolBarExtensibilityManager()->GetExtenderDelegates().Add(MoveTemp(ToolbarDelegate));
 
-void FFormatterModule::ExtendToolBar(IAssetEditorInstance* Instance)
-{
-    const UFormatterSettings* Settings = GetDefault<UFormatterSettings>();
-
-    if (!Settings->DisableToolbar)
-    {
-        FAssetEditorToolkit* AssetEditorToolkit = StaticCast<FAssetEditorToolkit*>(Instance);
-        TSharedRef<FUICommandList> ToolkitCommands = AssetEditorToolkit->GetToolkitCommands();
-        if (!ToolbarExtender.IsValid())
-        {
-            ToolbarExtender = MakeShareable(new FExtender);
-            ToolbarExtender->AddToolBarExtension(
-                "Asset",
-                EExtensionHook::After,
-                ToolkitCommands,
-                FToolBarExtensionDelegate::CreateRaw(this, &FFormatterModule::FillToolbar)
-            );
-        }
-        AssetEditorToolkit->AddToolbarExtender(ToolbarExtender);
-    }
-}
-
-void FFormatterModule::MapCommands(UObject* Object, IAssetEditorInstance* Instance)
-{
-    FAssetEditorToolkit* AssetEditorToolkit = StaticCast<FAssetEditorToolkit*>(Instance);
-
-    const FFormatterCommands& Commands = FFormatterCommands::Get();
-    TSharedRef<FUICommandList> ToolkitCommands = AssetEditorToolkit->GetToolkitCommands();
-    if (ToolkitCommands->IsActionMapped(Commands.FormatGraph))
-    {
-        return;
-    }
-    ToolkitCommands->MapAction(
-        Commands.FormatGraph,
-        FExecuteAction::CreateLambda([this, Object, Instance]
-        {
-            if (SGraphEditor* Editor = FindEditorForObject(Object))
-            {
-                const UFormatterSettings* Settings = GetDefault<UFormatterSettings>();
-                if (Settings->AutoDetectGraphEditor)
-                {
-                    OnGraphEditorDetected(Object, Instance);
-                }
-                FFormatter::Instance().SetCurrentEditor(Editor, Object);
-                FFormatter::Instance().Format();
-            }
-        }),
-        FCanExecuteAction()
-    );
-    ToolkitCommands->MapAction(
-        Commands.PlaceBlock,
-        FExecuteAction::CreateLambda([this, Object, Instance]
-        {
-            if (SGraphEditor* Editor = FindEditorForObject(Object))
-            {
-                const UFormatterSettings* Settings = GetDefault<UFormatterSettings>();
-                if (Settings->AutoDetectGraphEditor)
-                {
-                    OnGraphEditorDetected(Object, Instance);
-                }
-                FFormatter::Instance().SetCurrentEditor(Editor, Object);
-                FFormatter::Instance().PlaceBlock();
-            }
-        }),
-        FCanExecuteAction()
-    );
-    ToolkitCommands->MapAction(
-        Commands.StraightenConnections,
-        FExecuteAction::CreateRaw(this, &FFormatterModule::ToggleStraightenConnections),
-        FCanExecuteAction(),
-        FIsActionChecked::CreateRaw(this, &FFormatterModule::IsStraightenConnectionsEnabled)
-    );
-}
-
-void FFormatterModule::HandleAssetEditorOpened(UObject* Object, IAssetEditorInstance* Instance)
-{
-    UE_LOG(LogGraphFormatter, Log, TEXT("AssetEditorOpened for: %s"), *Object->GetClass()->GetName());
-    if (!GEditor)
-    {
-        return;
-    }
-    const UFormatterSettings* Settings = GetDefault<UFormatterSettings>();
-    if (FFormatter::Instance().IsAssetSupported(Object))
-    {
-        MapCommands(Object, Instance);
-        ExtendToolBar(Instance);
-    }
-    else
-    {
-        if (Settings->AutoDetectGraphEditor)
-        {
-            MapCommands(Object, Instance);
-            if (!FAssetEditorInstance::Instances.Contains(Object))
-            {
-                auto EditorInstance = new FAssetEditorInstance{this, Instance, Object};
-                GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OnAssetEditorOpened().AddRaw(EditorInstance, &FAssetEditorInstance::HandleEditorWidgetCreated);
-                FAssetEditorInstance::Instances.Add(Object, EditorInstance);
-            }
-            else
-            {
-                auto EditorInstance = FAssetEditorInstance::Instances[Object];
-                EditorInstance->Instance = Instance;
-            }
-        }
-    }
-}
-
-static FText GetEnumAsString(EGraphFormatterPositioningAlgorithm EnumValue)
-{
-    switch (EnumValue)
-    {
-    case EGraphFormatterPositioningAlgorithm::EEvenlyInLayer:
-        return FText::FromString("Place node evenly in layer");
-    case EGraphFormatterPositioningAlgorithm::EFastAndSimpleMethodTop:
-        return FText::FromString("FAS Top");
-    case EGraphFormatterPositioningAlgorithm::EFastAndSimpleMethodMedian:
-        return FText::FromString("FAS Median");
-    case EGraphFormatterPositioningAlgorithm::ELayerSweep:
-        return FText::FromString("Layer sweep");
-    default:
-        return FText::FromString("Invalid");
-    }
-}
-
-void FFormatterModule::FillToolbar(FToolBarBuilder& ToolbarBuilder)
-{
-    const UFormatterSettings* Settings = GetDefault<UFormatterSettings>();
-    UFormatterSettings* MutableSettings = GetMutableDefault<UFormatterSettings>();
-    const FFormatterCommands& Commands = FFormatterCommands::Get();
-    // clang-format off
-    ToolbarBuilder.BeginSection("GraphFormatter");
-    {
-        TSharedPtr<SComboBox<TSharedPtr<EGraphFormatterPositioningAlgorithm>>> AlgorithmComboBox;
-        int32 SelectedAlgorithmIndex = AlgorithmOptions.IndexOfByPredicate([Settings](const TSharedPtr<EGraphFormatterPositioningAlgorithm>& Option)
-        {
-            return *Option == Settings->PositioningAlgorithm;
-        });
-        ToolbarBuilder.AddToolBarButton(
-            Commands.FormatGraph,
-            NAME_None,
-            TAttribute<FText>(),
-            TAttribute<FText>(),
-            TAttribute<FSlateIcon>(FSlateIcon(FFormatterStyle::Get()->GetStyleSetName(), "GraphFormatter.ApplyIcon")),
-            FName(TEXT("GraphFormatter"))
-        );
-        auto HorizontalEditArea = SNew(SHorizontalBox) + SHorizontalBox::Slot().Padding(2.0f)
-        [
-            SNew(SSpinBox<int32>)
-            .MinValue(0)
-            .MaxValue(1000)
-            .MinSliderValue(0)
-            .MaxSliderValue(1000)
-            .ToolTipText(LOCTEXT("GraphFormatterHorizontalSpacingiToolTips", "Spacing between two layers."))
-            .Value(Settings->HorizontalSpacing)
-            .MinDesiredWidth(80)
-            .OnValueCommitted_Lambda([MutableSettings](int32 Number, ETextCommit::Type CommitInfo)
-            {
-                MutableSettings->HorizontalSpacing = Number; MutableSettings->PostEditChange(); MutableSettings->SaveConfig();
-            })
-        ]
-        +SHorizontalBox::Slot()
-        .Padding(2.0f)
-        [
-            SAssignNew(AlgorithmComboBox, SComboBox<TSharedPtr<EGraphFormatterPositioningAlgorithm>>)
-            .ContentPadding(FMargin(6.0f, 2.0f))
-            .OptionsSource(&AlgorithmOptions)
-            .ToolTipText_Lambda([]() { return FText::FromString("Positioning Algorithm"); })
-            .InitiallySelectedItem(AlgorithmOptions[SelectedAlgorithmIndex])
-            .OnSelectionChanged_Lambda([=](TSharedPtr<EGraphFormatterPositioningAlgorithm> NewOption, ESelectInfo::Type SelectInfo)
-            {
-                if (SelectInfo != ESelectInfo::Direct)
-                {
-                    MutableSettings->PositioningAlgorithm = *NewOption;
-                    MutableSettings->PostEditChange();
-                    MutableSettings->SaveConfig();
-                }
-            })
-            .OnGenerateWidget_Lambda([](TSharedPtr<EGraphFormatterPositioningAlgorithm> AlgorithmEnum)
-            {
-                return SNew(STextBlock).Text(GetEnumAsString(*AlgorithmEnum.Get()));
-            })
-            [
-                SNew(STextBlock)
-                .Text_Lambda([Settings]() { return GetEnumAsString(Settings->PositioningAlgorithm); })
-            ]
-        ];
-
-        auto VerticalEditArea = SNew(SVerticalBox)
-        + SVerticalBox::Slot()
-        .Padding(2.0f)
-        [
-            SNew(SSpinBox<int32>)
-            .MinValue(0)
-            .MaxValue(1000)
-            .MinSliderValue(0)
-            .MaxSliderValue(1000)
-            .ToolTipText(LOCTEXT("GraphFormatterHorizontalSpacingiToolTips", "Spacing between two layers."))
-            .Value(Settings->HorizontalSpacing)
-            .MinDesiredWidth(80)
-            .OnValueCommitted_Lambda([MutableSettings](int32 Number, ETextCommit::Type CommitInfo)
-            {
-                MutableSettings->HorizontalSpacing = Number;
-                MutableSettings->PostEditChange();
-                MutableSettings->SaveConfig();
-            })
-        ]
-        +SVerticalBox::Slot()
-        .Padding(2.0f)
-        [
-            SAssignNew(AlgorithmComboBox, SComboBox<TSharedPtr<EGraphFormatterPositioningAlgorithm>>)
-            .ContentPadding(FMargin(6.0f, 2.0f))
-            .OptionsSource(&AlgorithmOptions)
-            .ToolTipText_Lambda([]()
-            {
-                return FText::FromString("Positioning Algorithm");
-            })
-            .InitiallySelectedItem(AlgorithmOptions[SelectedAlgorithmIndex])
-            .OnSelectionChanged_Lambda([=](TSharedPtr<EGraphFormatterPositioningAlgorithm> NewOption, ESelectInfo::Type SelectInfo)
-            {
-                if (SelectInfo != ESelectInfo::Direct)
-                {
-                    MutableSettings->PositioningAlgorithm = *NewOption;
-                    MutableSettings->PostEditChange();
-                    MutableSettings->SaveConfig();
-                }
-            })
-            .OnGenerateWidget_Lambda([](TSharedPtr<EGraphFormatterPositioningAlgorithm> AlgorithmEnum)
-            {
-                return SNew(STextBlock).Text(GetEnumAsString(*AlgorithmEnum.Get()));
-            })
-            [
-                SNew(STextBlock)
-                .Text_Lambda([Settings]() { return GetEnumAsString(Settings->PositioningAlgorithm); })
-            ]
-        ];
-        ToolbarBuilder.AddWidget(HorizontalEditArea);
-        //ToolbarBuilder.AddWidget(VerticalEditArea);
-        ToolbarBuilder.AddToolBarButton(
-            Commands.StraightenConnections,
-            NAME_None,
-            TAttribute<FText>(),
-            TAttribute<FText>(),
-            TAttribute<FSlateIcon>(FSlateIcon(FFormatterStyle::Get()->GetStyleSetName(), "GraphFormatter.StraightenIcon")),
-            FName(TEXT("GraphFormatter"))
-        );
-    }
-    // clang-format on
-    ToolbarBuilder.EndSection();
-}
-
-void FFormatterModule::ToggleStraightenConnections()
-{
-    auto GraphEditorSettings = GetMutableDefault<UGraphEditorSettings>();
-
-    if (IsStraightenConnectionsEnabled())
-    {
-        const UFormatterSettings* Settings = GetDefault<UFormatterSettings>();
-        GraphEditorSettings->ForwardSplineTangentFromHorizontalDelta = Settings->ForwardSplineTangentFromHorizontalDelta;
-        GraphEditorSettings->ForwardSplineTangentFromVerticalDelta = Settings->ForwardSplineTangentFromVerticalDelta;
-        GraphEditorSettings->BackwardSplineTangentFromHorizontalDelta = Settings->BackwardSplineTangentFromHorizontalDelta;
-        GraphEditorSettings->BackwardSplineTangentFromVerticalDelta = Settings->BackwardSplineTangentFromVerticalDelta;
-        GraphEditorSettings->PostEditChange();
-        GraphEditorSettings->SaveConfig();
-    }
-    else
-    {
-        UFormatterSettings* Settings = GetMutableDefault<UFormatterSettings>();
-        Settings->ForwardSplineTangentFromHorizontalDelta = GraphEditorSettings->ForwardSplineTangentFromHorizontalDelta;
-        Settings->ForwardSplineTangentFromVerticalDelta = GraphEditorSettings->ForwardSplineTangentFromVerticalDelta;
-        Settings->BackwardSplineTangentFromHorizontalDelta = GraphEditorSettings->BackwardSplineTangentFromHorizontalDelta;
-        Settings->BackwardSplineTangentFromVerticalDelta = GraphEditorSettings->BackwardSplineTangentFromVerticalDelta;
-        Settings->PostEditChange();
-        Settings->SaveConfig();
-        GraphEditorSettings->ForwardSplineTangentFromHorizontalDelta = FVector2D(0, 0);
-        GraphEditorSettings->ForwardSplineTangentFromVerticalDelta = FVector2D(0, 0);
-        GraphEditorSettings->BackwardSplineTangentFromHorizontalDelta = FVector2D(0, 0);
-        GraphEditorSettings->BackwardSplineTangentFromVerticalDelta = FVector2D(0, 0);
-        GraphEditorSettings->PostEditChange();
-        GraphEditorSettings->SaveConfig();
-    }
-}
-
-bool FFormatterModule::IsStraightenConnectionsEnabled() const
-{
-    auto GraphEditorSettings = GetDefault<UGraphEditorSettings>();
-    if (GraphEditorSettings->ForwardSplineTangentFromHorizontalDelta == FVector2D(0, 0) &&
-        GraphEditorSettings->ForwardSplineTangentFromVerticalDelta == FVector2D(0, 0) &&
-        GraphEditorSettings->BackwardSplineTangentFromHorizontalDelta == FVector2D(0, 0) &&
-        GraphEditorSettings->BackwardSplineTangentFromVerticalDelta == FVector2D(0, 0))
-    {
-        return true;
-    }
-    return false;
-}
-
-SGraphEditor* FFormatterModule::FindEditorForObject(UObject* Object) const
-{
-    SGraphEditor* Editor = FFormatter::Instance().FindGraphEditorByCursor();
-    if (!Editor)
-    {
-        return FFormatter::Instance().FindGraphEditorForTopLevelWindow();
-    }
-    return Editor;
-}
-
-void FFormatterModule::OnGraphEditorDetected(UObject* Object, IAssetEditorInstance* Instance)
-{
-    UFormatterSettings* MutableSettings = GetMutableDefault<UFormatterSettings>();
-    if(!MutableSettings->SupportedAssetTypes.Contains(Object->GetClass()->GetName()))
-    {
-        MutableSettings->SupportedAssetTypes.Add(Object->GetClass()->GetName(), true);
-        MutableSettings->PostEditChange();
-        MutableSettings->SaveConfig();
-        FAssetEditorToolkit* AssetEditorToolkit = StaticCast<FAssetEditorToolkit*>(Instance);
-        ExtendToolBar(Instance);
-        AssetEditorToolkit->RegenerateMenusAndToolbars();
-    }
-}
-
-void FAssetEditorInstance::HandleEditorWidgetCreated(UObject* InObject)
-{
-    const UFormatterSettings* Settings = GetDefault<UFormatterSettings>();
-    if (Settings->AutoDetectGraphEditor)
-    {
-        if (auto Editor = FFormatter::Instance().FindGraphEditorForTopLevelWindow())
-        {
-            Module->MapCommands(Object, Instance);
-            Module->OnGraphEditorDetected(Object, Instance);
-        }
-    }
-    if (GEditor)
-    {
-        GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OnAssetEditorOpened().RemoveAll(this);
-    }
-    Instances.Remove(Object);
-    delete this;
+	if (GEditor)
+	{
+		AssetOpenedDelegateHandle =
+			GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OnAssetOpenedInEditor().AddStatic(&HandleAssetEditorOpened);
+	}
 }
 
 void FFormatterModule::ShutdownModule()
 {
-    ISettingsModule* SettingsModule = FModuleManager::GetModulePtr<ISettingsModule>("Settings");
-    if (SettingsModule != nullptr)
-    {
-        SettingsModule->UnregisterSettings("Editor", "Plugins", "GraphFormatter");
-    }
-    if (GEditor)
-    {
-        GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OnAssetOpenedInEditor().RemoveAll(this);
-    }
-    FFormatterStyle::Shutdown();
-}
+	FFormatter::Instance().CancelPendingFormat();
 
-void FFormatterModule::FormatGraphAutomated(const TObjectPtr<UObject> Object)
-{
-	const auto AssetEditor = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>();
-	
-	AssetEditor->OpenEditorForAsset(Object);
-
-	const auto EditorInstance = AssetEditor->FindEditorForAsset(Object.Get(), false);
-	
-	if(!EditorInstance)
+	if (GEditor && AssetOpenedDelegateHandle.IsValid())
 	{
-		return;
+		GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OnAssetOpenedInEditor().Remove(AssetOpenedDelegateHandle);
+		AssetOpenedDelegateHandle.Reset();
 	}
 
-	if (SGraphEditor* Editor = FindEditorForObject(Object.Get()))
+	if (ToolbarExtenderDelegateHandle.IsValid())
 	{
-		Editor->GetGraphPanel()->Update();
-
-		FFormatter::Instance().SetCurrentEditor(Editor, Object.Get());
-		FFormatter::Instance().Format();
+		TArray<FAssetEditorExtender>& Delegates =
+			FAssetEditorToolkit::GetSharedToolBarExtensibilityManager()->GetExtenderDelegates();
+		Delegates.RemoveAll([this](const FAssetEditorExtender& Delegate)
+							{ return Delegate.GetHandle() == ToolbarExtenderDelegateHandle; });
+		ToolbarExtenderDelegateHandle.Reset();
 	}
 
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3 
-	EditorInstance->CloseWindow(EAssetEditorCloseReason::AssetEditorHostClosed);
-#else
-    EditorInstance->CloseWindow();
-#endif
-    
+	UnmapCommands();
+	if (ISettingsModule* SettingsModule = FModuleManager::GetModulePtr<ISettingsModule>("Settings"))
+	{
+		SettingsModule->UnregisterSettings("Editor", "Plugins", "GraphFormatter");
+	}
+	FFormatterCommands::Unregister();
+	FFormatterStyle::Shutdown();
 }
 
 #undef LOCTEXT_NAMESPACE

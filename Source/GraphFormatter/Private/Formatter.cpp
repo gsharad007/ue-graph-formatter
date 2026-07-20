@@ -7,650 +7,647 @@
 #include "FormatterCommands.h"
 #include "FormatterGraph.h"
 #include "FormatterSettings.h"
+#include "K2/GraphGeometrySnapshot.h"
+#include "K2/K2GraphFormatter.h"
 #include "UEGraphAdapter.h"
 #include "FormatterLog.h"
 
 #include "BehaviorTree/BehaviorTree.h"
+#include "EdGraph/EdGraph.h"
+#include "EdGraph/EdGraphPin.h"
 #include "EdGraphNode_Comment.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Framework/Notifications/NotificationManager.h"
+#include "GraphEditor.h"
+#include "Kismet2/BlueprintEditorUtils.h"
 #include "Math/Ray.h"
+#include "Modules/ModuleManager.h"
 #include "SGraphNodeComment.h"
 #include "SGraphPanel.h"
+#include "ScopedTransaction.h"
+#include "Widgets/Notifications/SNotificationList.h"
 
-#include "graph_layout/graph_layout.h"
-using namespace graph_layout;
+#define LOCTEXT_NAMESPACE "GraphFormatter"
 
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >=  6
-typedef FVector2f FCompatibleVector2;
-typedef FDeprecateSlateVector2D FCompatibleDeprecateSlateVector2D;
-#else
-typedef FVector2D FCompatibleVector2;
-typedef FVector2D FCompatibleDeprecateSlateVector2D;
-#endif
-static inline FCompatibleVector2 CompatibleVector2(FVector2D const& V)
+struct FFormatter::FPendingK2Format
 {
-	return FCompatibleVector2((float)V.X, (float)V.Y);
-}
-#define GRAPH_FORMATTER_HACK
-
-/** Hack start. Access to private member legally. */
-#ifdef GRAPH_FORMATTER_HACK
-#include "PrivateAccessor.h"
-
-DECLARE_PRIVATE_MEMBER_ACCESSOR(FAccess_SGraphPanel_ZoomLevels, SNodePanel, TUniquePtr<FZoomLevelsContainer>, ZoomLevels)
-DECLARE_PRIVATE_MEMBER_ACCESSOR(FAccess_SGraphNodeResizable_UserSize, SGraphNodeResizable, FCompatibleDeprecateSlateVector2D, UserSize);
-DECLARE_PRIVATE_MEMBER_ACCESSOR(FAccess_SNodePanel_CurrentLOD, SNodePanel, EGraphRenderingLOD::Type, CurrentLOD);
-
-static TUniquePtr<FZoomLevelsContainer> TopZoomLevels;
-static TUniquePtr<FZoomLevelsContainer> TempZoomLevels;
-static EGraphRenderingLOD::Type OldLOD;
-
-class FTopZoomLevelContainer : public FZoomLevelsContainer
-{
-public:
-    virtual float GetZoomAmount(int32 InZoomLevel) const override { return 1.0f; }
-    virtual int32 GetNearestZoomLevel(float InZoomAmount) const override { return 0; }
-    virtual FText GetZoomText(int32 InZoomLevel) const override { return FText::FromString(TEXT("1:1")); }
-    virtual int32 GetNumZoomLevels() const override { return 1; }
-    virtual int32 GetDefaultZoomLevel() const override { return 0; }
-    virtual EGraphRenderingLOD::Type GetLOD(int32 InZoomLevel) const override { return EGraphRenderingLOD::DefaultDetail; }
+	TWeakPtr<SGraphEditor> Editor;
+	TWeakObjectPtr<UEdGraph> Graph;
+	TArray<TWeakObjectPtr<UEdGraphNode>> Scope;
+	TSet<TWeakObjectPtr<UEdGraphNode>> ExplicitSelection;
+	bool bRouteWires = false;
+	bool bGraphChanged = false;
+	int32 RetryCount = 0;
 };
 
-// Tick all nodes manually
-static void TickWidgetRecursively(SWidget* Widget)
+static void ShowFormatterNotification(const FText& Text, const SNotificationItem::ECompletionState State)
 {
-    Widget->GetChildren();
-    if (auto Children = Widget->GetChildren())
-    {
-        for (int32 ChildIndex = 0; ChildIndex < Children->Num(); ++ChildIndex)
-        {
-            auto ChildWidget = &Children->GetChildAt(ChildIndex).Get();
-            TickWidgetRecursively(ChildWidget);
-        }
-    }
-    Widget->Tick(Widget->GetCachedGeometry(), FSlateApplication::Get().GetCurrentTime(), 0);
+	FNotificationInfo Info(Text);
+	Info.bFireAndForget = true;
+	Info.ExpireDuration = 4.0f;
+	if (TSharedPtr<SNotificationItem> Item = FSlateNotificationManager::Get().AddNotification(Info))
+	{
+		Item->SetCompletionState(State);
+	}
 }
-
-// Set the GraphPanel ZoomLevel to 1:1 before formatting the graph.
-// From 1:1 scale to -5 scale, the result will be consistent but
-// can see slight variation due to the round-off error of floating point number
-void FFormatter::SetZoomLevelTo11Scale() const
-{
-    if (!TopZoomLevels.IsValid())
-    {
-        TopZoomLevels = MakeUnique<FTopZoomLevelContainer>();
-    }
-    auto& ZoomLevels = CurrentPanel->*FPrivateAccessor<FAccess_SGraphPanel_ZoomLevels>::Member;
-    TempZoomLevels = MoveTemp(ZoomLevels);
-    ZoomLevels = MoveTemp(TopZoomLevels);
-    OldLOD = CurrentPanel->GetCurrentLOD();
-    CurrentPanel->*FPrivateAccessor<FAccess_SNodePanel_CurrentLOD>::Member = EGraphRenderingLOD::DefaultDetail;
-    auto Nodes = GetAllNodes();
-    for (auto Node : Nodes)
-    {
-        auto GraphNode = GetWidget(Node);
-        if (GraphNode != nullptr)
-        {
-            TickWidgetRecursively(GraphNode);
-        }
-    }
-    CurrentPanel->SlatePrepass();
-}
-
-void FFormatter::RestoreZoomLevel() const
-{
-    if (!TopZoomLevels.IsValid())
-    {
-        TopZoomLevels = MakeUnique<FTopZoomLevelContainer>();
-    }
-    auto& ZoomLevels = CurrentPanel->*FPrivateAccessor<FAccess_SGraphPanel_ZoomLevels>::Member;
-    ZoomLevels = MoveTemp(TempZoomLevels);
-    CurrentPanel->*FPrivateAccessor<FAccess_SNodePanel_CurrentLOD>::Member = OldLOD;
-}
-
-#endif
-/** Hack end  */
 
 void FFormatter::SetCurrentEditor(SGraphEditor* Editor, UObject* Object)
 {
-    CurrentEditor = Editor;
-    IsVerticalLayout = false;
-    IsBehaviorTree = false;
-    IsBlueprint = false;
-    if (Cast<UBehaviorTree>(Object))
-    {
-        IsVerticalLayout = true;
-        IsBehaviorTree = true;
-    }
-    if (Cast<UBlueprint>(Object))
-    {
-        IsBlueprint = true;
-    }
-    if (Object->GetClass()->GetName() == "NiagaraSystem")
-    {
-        IsVerticalLayout = true;
-    }
+	CurrentEditor = Editor;
+	IsVerticalLayout = false;
+	IsBehaviorTree = false;
+	IsBlueprint = false;
+	if (Cast<UBehaviorTree>(Object))
+	{
+		IsVerticalLayout = true;
+		IsBehaviorTree = true;
+	}
+	if (Cast<UBlueprint>(Object)) { IsBlueprint = true; }
+	if (Object->GetClass()->GetName() == "NiagaraSystem") { IsVerticalLayout = true; }
 }
 
 bool FFormatter::IsAssetSupported(const UObject* Object)
 {
-    const UFormatterSettings* Settings = GetDefault<UFormatterSettings>();
-    if (const bool* Enabled = Settings->SupportedAssetTypes.Find(Object->GetClass()->GetName()))
-    {
-        return Enabled != nullptr && *Enabled;
-    }
-    return false;
+	const UFormatterSettings* Settings = GetDefault<UFormatterSettings>();
+	if (const bool* Enabled = Settings->SupportedAssetTypes.Find(Object->GetClass()->GetName()))
+	{
+		return Enabled != nullptr && *Enabled;
+	}
+	return false;
 }
 
 /** Matches widgets by type */
 struct FWidgetTypeMatcher
 {
-    FWidgetTypeMatcher(const FName& InType)
-        : TypeName(InType)
-    {
-    }
+	FWidgetTypeMatcher(const FName& InType)
+		: TypeName(InType)
+	{
+	}
 
-    bool IsMatch(const TSharedRef<const SWidget>& InWidget) const
-    {
-        return TypeName == InWidget->GetType();
-    }
+	bool IsMatch(const TSharedRef<const SWidget>& InWidget) const { return TypeName == InWidget->GetType(); }
 
-    const FName& TypeName;
+	const FName& TypeName;
 };
 
 SGraphEditor* FFormatter::FindGraphEditorForTopLevelWindow() const
 {
-    FSlateApplication& Application = FSlateApplication::Get();
-    auto ActiveWindow = Application.GetActiveTopLevelWindow();
-    if (!ActiveWindow.IsValid())
-    {
-        return nullptr;
-    }
-    FGeometry InnerWindowGeometry = ActiveWindow->GetWindowGeometryInWindow();
-    FArrangedChildren JustWindow(EVisibility::Visible);
-    JustWindow.AddWidget(FArrangedWidget(ActiveWindow.ToSharedRef(), InnerWindowGeometry));
+	FSlateApplication& Application = FSlateApplication::Get();
+	auto ActiveWindow = Application.GetActiveTopLevelWindow();
+	if (!ActiveWindow.IsValid()) { return nullptr; }
+	FGeometry InnerWindowGeometry = ActiveWindow->GetWindowGeometryInWindow();
+	FArrangedChildren JustWindow(EVisibility::Visible);
+	JustWindow.AddWidget(FArrangedWidget(ActiveWindow.ToSharedRef(), InnerWindowGeometry));
 
-    FWidgetPath WidgetPath(ActiveWindow.ToSharedRef(), JustWindow);
-    if (WidgetPath.ExtendPathTo(FWidgetTypeMatcher("SGraphEditor"), EVisibility::Visible))
-    {
-        return StaticCast<SGraphEditor*>(&WidgetPath.GetLastWidget().Get());
-    }
-    return nullptr;
+	FWidgetPath WidgetPath(ActiveWindow.ToSharedRef(), JustWindow);
+	if (WidgetPath.ExtendPathTo(FWidgetTypeMatcher("SGraphEditor"), EVisibility::Visible))
+	{
+		return StaticCast<SGraphEditor*>(&WidgetPath.GetLastWidget().Get());
+	}
+	return nullptr;
 }
 
 SGraphEditor* FFormatter::FindGraphEditorByCursor() const
 {
-    FSlateApplication& Application = FSlateApplication::Get();
-    FWidgetPath WidgetPath = Application.LocateWindowUnderMouse(Application.GetCursorPos(), Application.GetInteractiveTopLevelWindows());
-    for (int i = WidgetPath.Widgets.Num() - 1; i >= 0; i--)
-    {
-        if (WidgetPath.Widgets[i].Widget->GetTypeAsString() == "SGraphEditor")
-        {
-            return StaticCast<SGraphEditor*>(&WidgetPath.Widgets[i].Widget.Get());
-        }
-    }
-    return nullptr;
+	FSlateApplication& Application = FSlateApplication::Get();
+	FWidgetPath WidgetPath =
+		Application.LocateWindowUnderMouse(Application.GetCursorPos(), Application.GetInteractiveTopLevelWindows());
+	for (int i = WidgetPath.Widgets.Num() - 1; i >= 0; i--)
+	{
+		if (WidgetPath.Widgets[i].Widget->GetTypeAsString() == "SGraphEditor")
+		{
+			return StaticCast<SGraphEditor*>(&WidgetPath.Widgets[i].Widget.Get());
+		}
+	}
+	return nullptr;
 }
 
-SGraphPanel* FFormatter::GetCurrentPanel() const
-{
-    return CurrentEditor->GetGraphPanel();
-}
+SGraphPanel* FFormatter::GetCurrentPanel() const { return CurrentEditor->GetGraphPanel(); }
 
 SGraphNode* FFormatter::GetWidget(const UEdGraphNode* Node) const
 {
-    SGraphPanel* GraphPanel = GetCurrentPanel();
-    if (GraphPanel != nullptr)
-    {
-        TSharedPtr<SGraphNode> NodeWidget = GraphPanel->GetNodeWidgetFromGuid(Node->NodeGuid);
-        return NodeWidget.Get();
-    }
-    return nullptr;
+	SGraphPanel* GraphPanel = GetCurrentPanel();
+	if (GraphPanel != nullptr)
+	{
+		TSharedPtr<SGraphNode> NodeWidget = GraphPanel->GetNodeWidgetFromGuid(Node->NodeGuid);
+		return NodeWidget.Get();
+	}
+	return nullptr;
 }
 
 TSet<UEdGraphNode*> FFormatter::GetAllNodes() const
 {
-    TSet<UEdGraphNode*> Nodes;
-    if (CurrentEditor)
-    {
-        for (UEdGraphNode* Node : CurrentEditor->GetCurrentGraph()->Nodes)
-        {
-            Nodes.Add(Node);
-        }
-    }
-    return Nodes;
+	TSet<UEdGraphNode*> Nodes;
+	if (CurrentEditor)
+	{
+		for (UEdGraphNode* Node : CurrentEditor->GetCurrentGraph()->Nodes)
+		{
+			Nodes.Add(Node);
+		}
+	}
+	return Nodes;
 }
 
 float FFormatter::GetCommentNodeTitleHeight(const UEdGraphNode* Node) const
 {
-    /** Titlebar Offset - taken from SGraphNodeComment.cpp */
-    static const FSlateRect TitleBarOffset(13, 8, -3, 0);
+	/** Titlebar Offset - taken from SGraphNodeComment.cpp */
+	static const FSlateRect TitleBarOffset(13, 8, -3, 0);
 
-    SGraphNode* CommentNode = GetWidget(Node);
-    if (CommentNode)
-    {
-        SGraphNodeComment* NodeWidget = StaticCast<SGraphNodeComment*>(CommentNode);
-        FSlateRect Rect = NodeWidget->GetTitleRect();
-        return Rect.GetSize().Y + TitleBarOffset.Top;
-    }
-    return 0;
+	SGraphNode* CommentNode = GetWidget(Node);
+	if (CommentNode)
+	{
+		SGraphNodeComment* NodeWidget = StaticCast<SGraphNodeComment*>(CommentNode);
+		FSlateRect Rect = NodeWidget->GetTitleRect();
+		return Rect.GetSize().Y + TitleBarOffset.Top;
+	}
+	return 0;
 }
 
 FVector2D FFormatter::GetNodeSize(const UEdGraphNode* Node) const
 {
-    auto GraphNode = GetWidget(Node);
-    if (GraphNode != nullptr)
-    {
-        return GraphNode->GetDesiredSize();
-    }
-    return FVector2D(Node->NodeWidth, Node->NodeHeight);
+	FVector2D Minimum;
+	FVector2D Maximum;
+	if (SGraphPanel* Panel = GetCurrentPanel(); Panel && Panel->GetBoundsForNode(Node, Minimum, Maximum))
+	{
+		const FVector2D Size = Maximum - Minimum;
+		if (Size.X > 0.0 && Size.Y > 0.0) { return Size; }
+	}
+	auto GraphNode = GetWidget(Node);
+	if (GraphNode != nullptr)
+	{
+		const FVector2D Size(GraphNode->GetDesiredSize());
+		if (Size.X > 0.0 && Size.Y > 0.0) { return Size; }
+	}
+	const double Width = Node->NodeWidth > 0 ? Node->NodeWidth : 160.0;
+	const double Height = Node->NodeHeight > 0 ? Node->NodeHeight : 80.0;
+	return FVector2D(Width, Height);
 }
 
 FVector2D FFormatter::GetNodePosition(const UEdGraphNode* Node) const
 {
-    auto GraphNode = GetWidget(Node);
-    if (GraphNode != nullptr)
-    {
-        return GraphNode->GetPosition();
-    }
-    return FVector2D();
+	auto GraphNode = GetWidget(Node);
+	if (GraphNode != nullptr) { return GraphNode->GetPosition(); }
+	return FVector2D(Node->NodePosX, Node->NodePosY);
 }
 
 FVector2D FFormatter::GetPinOffset(const UEdGraphPin* Pin) const
 {
-    auto GraphNode = GetWidget(Pin->GetOwningNodeUnchecked());
-    if (GraphNode != nullptr)
-    {
-        auto PinWidget = GraphNode->FindWidgetForPin(const_cast<UEdGraphPin*>(Pin));
-        if (PinWidget.IsValid())
-        {
-            auto Offset = PinWidget->GetNodeOffset();
-            return Offset;
-        }
-    }
-    return FVector2D::ZeroVector;
+	auto GraphNode = GetWidget(Pin->GetOwningNodeUnchecked());
+	if (GraphNode != nullptr)
+	{
+		auto PinWidget = GraphNode->FindWidgetForPin(const_cast<UEdGraphPin*>(Pin));
+		if (PinWidget.IsValid())
+		{
+			auto Offset = PinWidget->GetNodeOffset();
+			return Offset;
+		}
+	}
+	return FVector2D::ZeroVector;
 }
 
 FSlateRect FFormatter::GetNodesBound(const TSet<UEdGraphNode*> Nodes) const
 {
-    FSlateRect Bound;
-    for (auto Node : Nodes)
-    {
-        FVector2D Pos = GetNodePosition(Node);
-        FVector2D Size = GetNodeSize(Node);
-        FSlateRect NodeBound = FSlateRect::FromPointAndExtent(Pos, Size);
-        Bound = Bound.IsValid() ? Bound.Expand(NodeBound) : NodeBound;
-    }
-    return Bound;
+	FSlateRect Bound;
+	for (auto Node : Nodes)
+	{
+		FVector2D Pos = GetNodePosition(Node);
+		FVector2D Size = GetNodeSize(Node);
+		FSlateRect NodeBound = FSlateRect::FromPointAndExtent(Pos, Size);
+		Bound = Bound.IsValid() ? Bound.Expand(NodeBound) : NodeBound;
+	}
+	return Bound;
 }
 
 bool FFormatter::PreCommand()
 {
-    if (!CurrentEditor)
-    {
-        return false;
-    }
-    CurrentGraph = CurrentEditor->GetCurrentGraph();
-    if (!CurrentGraph)
-    {
-        return false;
-    }
-    CurrentPanel = GetCurrentPanel();
-    if (!CurrentPanel)
-    {
-        return false;
-    }
+	CancelPendingFormat();
+	if (!CurrentEditor) { return false; }
+	CurrentGraph = CurrentEditor->GetCurrentGraph();
+	if (!CurrentGraph) { return false; }
+	CurrentPanel = GetCurrentPanel();
+	if (!CurrentPanel) { return false; }
 
-#ifdef GRAPH_FORMATTER_HACK
-    SetZoomLevelTo11Scale();
-#endif
+	CurrentPanel->Update();
+	CurrentPanel->SlatePrepass();
 
-    const UFormatterSettings* Settings = GetDefault<UFormatterSettings>();
-    FFormatterGraph::HorizontalSpacing = Settings->HorizontalSpacing;
-    FFormatterGraph::VerticalSpacing = Settings->VerticalSpacing;
-    FFormatterGraph::SpacingFactorOfGroup = Settings->SpacingFactorOfParameterGroup;
-    FFormatterGraph::MaxLayerNodes = Settings->MaxLayerNodes;
-    FFormatterGraph::MaxOrderingIterations = Settings->MaxOrderingIterations;
-    FFormatterGraph::PositioningAlgorithm = Settings->PositioningAlgorithm;
-    return true;
+	const UFormatterSettings* Settings = GetDefault<UFormatterSettings>();
+	FFormatterGraph::HorizontalSpacing = Settings->HorizontalSpacing;
+	FFormatterGraph::VerticalSpacing = Settings->VerticalSpacing;
+	FFormatterGraph::SpacingFactorOfGroup = Settings->SpacingFactorOfParameterGroup;
+	FFormatterGraph::MaxLayerNodes = Settings->MaxLayerNodes;
+	FFormatterGraph::MaxOrderingIterations = Settings->MaxOrderingIterations;
+	FFormatterGraph::PositioningAlgorithm = Settings->PositioningAlgorithm;
+	return true;
 }
 
-void FFormatter::PostCommand()
-{
-#ifdef GRAPH_FORMATTER_HACK
-    RestoreZoomLevel();
-#endif
-}
+void FFormatter::PostCommand() { }
 
-void FFormatter::Translate(TSet<UEdGraphNode*> Nodes, FVector2D Offset) const
+bool FFormatter::Translate(const TSet<UEdGraphNode*>& Nodes, FVector2D Offset) const
 {
-    UEdGraph* Graph = CurrentEditor->GetCurrentGraph();
-    if (!Graph || !CurrentEditor)
-    {
-        return;
-    }
-    if (Offset.X == 0 && Offset.Y == 0)
-    {
-        return;
-    }
-    for (auto Node : Nodes)
-    {
-        auto WidgetNode = GetWidget(Node);
-        SGraphPanel::SNode::FNodeSet Filter;
-        WidgetNode->MoveTo(CompatibleVector2(WidgetNode->GetPosition() + Offset) , Filter, true);
-    }
+	if (!CurrentEditor) { return false; }
+	UEdGraph* Graph = CurrentEditor->GetCurrentGraph();
+	if (!Graph) { return false; }
+	if (Offset.X == 0 && Offset.Y == 0) { return false; }
+	bool bModified = false;
+	for (UEdGraphNode* Node : Nodes)
+	{
+		if (!Node) { continue; }
+		const int32 NewX = FMath::RoundToInt(static_cast<double>(Node->NodePosX) + Offset.X);
+		const int32 NewY = FMath::RoundToInt(static_cast<double>(Node->NodePosY) + Offset.Y);
+		if (Node->NodePosX != NewX || Node->NodePosY != NewY)
+		{
+			Node->Modify();
+			Node->NodePosX = NewX;
+			Node->NodePosY = NewY;
+			bModified = true;
+		}
+	}
+	return bModified;
 }
 
 static TSet<UEdGraphNode*> GetSelectedNodes(const SGraphEditor* GraphEditor)
 {
-    TSet<UEdGraphNode*> SelectedGraphNodes;
-    TSet<UObject*> SelectedNodes = GraphEditor->GetSelectedNodes();
-    for (UObject* Node : SelectedNodes)
-    {
-        UEdGraphNode* GraphNode = Cast<UEdGraphNode>(Node);
-        if (GraphNode)
-        {
-            SelectedGraphNodes.Add(GraphNode);
-        }
-    }
-    return SelectedGraphNodes;
+	TSet<UEdGraphNode*> SelectedGraphNodes;
+	TSet<UObject*> SelectedNodes = GraphEditor->GetSelectedNodes();
+	for (UObject* Node : SelectedNodes)
+	{
+		UEdGraphNode* GraphNode = Cast<UEdGraphNode>(Node);
+		if (GraphNode) { SelectedGraphNodes.Add(GraphNode); }
+	}
+	return SelectedGraphNodes;
 }
 
 static bool IsNodeUnderRect(const TSharedRef<SGraphNode> InNodeWidget, const FSlateRect& Rect)
 {
-    const FVector2D NodePosition = Rect.GetTopLeft();
-    const FVector2D NodeSize = Rect.GetSize();
-    const FSlateRect CommentRect(NodePosition.X, NodePosition.Y, NodePosition.X + NodeSize.X, NodePosition.Y + NodeSize.Y);
-
-    const FVector2D InNodePosition = InNodeWidget->GetPosition();
-    const FVector2D InNodeSize = InNodeWidget->GetDesiredSize();
-
-    const FSlateRect NodeGeometryGraphSpace(InNodePosition.X, InNodePosition.Y, InNodePosition.X + InNodeSize.X, InNodePosition.Y + InNodeSize.Y);
-    const FVector2D CommentRectSize = CommentRect.GetSize();
-    const FVector2D Center = NodeGeometryGraphSpace.GetCenter();
-    return CommentRect.ContainsPoint(Center) && CommentRectSize.X > InNodeSize.X && CommentRectSize.Y > InNodeSize.Y;
+	const FVector2D InNodePosition = InNodeWidget->GetPosition();
+	const FVector2D InNodeSize = InNodeWidget->GetDesiredSize();
+	const FSlateRect NodeGeometryGraphSpace(
+		InNodePosition.X, InNodePosition.Y, InNodePosition.X + InNodeSize.X, InNodePosition.Y + InNodeSize.Y
+	);
+	return FSlateRect::IsRectangleContained(Rect, NodeGeometryGraphSpace);
 }
 
 TSet<UEdGraphNode*> FFormatter::GetNodesUnderComment(const UEdGraphNode_Comment* CommentNode) const
 {
-    TSet<UEdGraphNode*> Result;
-    if (IsAutoSizeComment)
-    {
-        auto NodesUnderComment = CommentNode->GetNodesUnderComment();
-        for (auto Object : NodesUnderComment)
-        {
-            UEdGraphNode* Node = StaticCast<UEdGraphNode*>(Object);
-            Result.Add(Node);
-        }
-        return Result;
-    }
-    SGraphNode* CommentNodeWidget = GetWidget(CommentNode);
-    auto CommentSize = CommentNodeWidget->GetDesiredSize();
-    if (CommentSize.IsZero())
-    {
-        return TSet<UEdGraphNode*>();
-    }
-    SGraphPanel* Panel = GetCurrentPanel();
-    FChildren* PanelChildren = Panel->GetAllChildren();
-    int32 NumChildren = PanelChildren->Num();
-    FVector2D CommentNodePosition = CommentNodeWidget->GetPosition();
-    FSlateRect CommentRect = FSlateRect(CommentNodePosition, CommentNodePosition + CommentSize);
-    for (int32 NodeIndex = 0; NodeIndex < NumChildren; ++NodeIndex)
-    {
-        const TSharedRef<SGraphNode> SomeNodeWidget = StaticCastSharedRef<SGraphNode>(PanelChildren->GetChildAt(NodeIndex));
-        UObject* GraphObject = SomeNodeWidget->GetObjectBeingDisplayed();
-        if (GraphObject != CommentNode)
-        {
-            if (IsNodeUnderRect(SomeNodeWidget, CommentRect))
-            {
-                Result.Add(Cast<UEdGraphNode>(GraphObject));
-            }
-        }
-    }
-    return Result;
+	TSet<UEdGraphNode*> Result;
+	if (IsAutoSizeComment)
+	{
+		const FCommentNodeSet& NodesUnderComment = CommentNode->GetNodesUnderComment();
+		for (UObject* Object : NodesUnderComment)
+		{
+			if (UEdGraphNode* Node = Cast<UEdGraphNode>(Object)) { Result.Add(Node); }
+		}
+		return Result;
+	}
+	SGraphNode* CommentNodeWidget = GetWidget(CommentNode);
+	if (!CommentNodeWidget) { return Result; }
+	auto CommentSize = CommentNodeWidget->GetDesiredSize();
+	if (CommentSize.IsZero()) { return TSet<UEdGraphNode*>(); }
+	SGraphPanel* Panel = GetCurrentPanel();
+	FChildren* PanelChildren = Panel->GetAllChildren();
+	int32 NumChildren = PanelChildren->Num();
+	FVector2D CommentNodePosition = CommentNodeWidget->GetPosition();
+	FSlateRect CommentRect = FSlateRect(CommentNodePosition, CommentNodePosition + CommentSize);
+	for (int32 NodeIndex = 0; NodeIndex < NumChildren; ++NodeIndex)
+	{
+		const TSharedRef<SGraphNode> SomeNodeWidget = StaticCastSharedRef<SGraphNode>(PanelChildren->GetChildAt(NodeIndex));
+		UObject* GraphObject = SomeNodeWidget->GetObjectBeingDisplayed();
+		if (GraphObject != CommentNode)
+		{
+			if (IsNodeUnderRect(SomeNodeWidget, CommentRect)) { Result.Add(Cast<UEdGraphNode>(GraphObject)); }
+		}
+	}
+	return Result;
 }
 
-static TMap<UEdGraphNode*, UEdGraphNode_Comment*> NodeUnderCommentHash()
+static void AddCommentContentsRecursively(UEdGraphNode_Comment* Comment, TSet<UEdGraphNode*>& Nodes)
 {
-    TMap<UEdGraphNode*, UEdGraphNode_Comment*> Result;
-    TSet<UEdGraphNode*> Nodes = FFormatter::Instance().GetAllNodes();
-    while (true)
-    {
-        TArray<UEdGraphNode_Comment*> SortedCommentNodes = UEGraphAdapter::GetSortedCommentNodes(Nodes);
-        if (SortedCommentNodes.Num() != 0)
-        {
-            // Topmost comment node has smallest negative depth value
-            const int32 Depth = SortedCommentNodes[0]->CommentDepth;
+	if (!Comment) { return; }
 
-            // Collapse all topmost comment nodes into virtual nodes.
-            for (auto CommentNode : SortedCommentNodes)
-            {
-                if (CommentNode->CommentDepth == Depth)
-                {
-                    auto NodesUnderComment = FFormatter::Instance().GetNodesUnderComment(Cast<UEdGraphNode_Comment>(CommentNode));
-                    NodesUnderComment = Nodes.Intersect(NodesUnderComment);
-                    Nodes = Nodes.Difference(NodesUnderComment);
-                    Nodes.Remove(CommentNode);
-                    for (auto Node : NodesUnderComment)
-                    {
-                        Result.Add(Node, CommentNode);
-                    }
-                }
-                else
-                {
-                    break;
-                }
-            }
-        }
-        else
-        {
-            break;
-        }
-    }
-    return Result;
-}
-
-// Get all nodes connected to InNode, and if a node is under a Comment node, consider it connected to all nodes under that Comment node.
-static TSet<UEdGraphNode*> GetLinkedNodes(UEdGraphNode* InNode)
-{
-    auto NodeToCommentMap = NodeUnderCommentHash();
-
-    TSet<UEdGraphNode*> VisitedNodes;
-    TQueue<UEdGraphNode*> PendingNodes;
-    PendingNodes.Enqueue(InNode);
-    while (!PendingNodes.IsEmpty())
-    {
-        UEdGraphNode* Node;
-        PendingNodes.Dequeue(Node);
-        VisitedNodes.Add(Node);
-        for (const UEdGraphPin* Pin : Node->Pins)
-        {
-            for (UEdGraphPin* LinkedPin : Pin->LinkedTo)
-            {
-                UEdGraphNode* LinkedNode = LinkedPin->GetOwningNodeUnchecked();
-                if (!VisitedNodes.Contains(LinkedNode))
-                {
-                    if (NodeToCommentMap.Contains(LinkedNode))
-                    {
-                        UEdGraphNode_Comment* Comment = NodeToCommentMap[LinkedNode];
-                        if (!VisitedNodes.Contains(Comment))
-                        {
-                            VisitedNodes.Add(Comment);
-                            auto NodesUnderComment = FFormatter::Instance().GetNodesUnderComment(Comment);
-                            for (auto NodeUnderComment : NodesUnderComment)
-                            {
-                                if (!VisitedNodes.Contains(NodeUnderComment))
-                                {
-                                    PendingNodes.Enqueue(NodeUnderComment);
-                                }
-                            }
-                        }
-                    }
-                    else
-                    {
-                        PendingNodes.Enqueue(LinkedNode);
-                    }
-                }
-            }
-        }
-    }
-    return VisitedNodes;
-}
-
-static TSet<UEdGraphNode*> SingleNodeSelectionStrategy(UEdGraphNode* InNode)
-{
-    return GetLinkedNodes(InNode);
+	const TSet<UEdGraphNode*> Contents = FFormatter::Instance().GetNodesUnderComment(Comment);
+	for (UEdGraphNode* Node : Contents)
+	{
+		if (!Node || Nodes.Contains(Node)) { continue; }
+		Nodes.Add(Node);
+		AddCommentContentsRecursively(Cast<UEdGraphNode_Comment>(Node), Nodes);
+	}
 }
 
 static TSet<UEdGraphNode*> DoSelectionStrategy(UEdGraph* Graph, TSet<UEdGraphNode*> Selected)
 {
-    if (Selected.Num() != 0)
-    {
-        if (Selected.Num() == 1)
-        {
-            for (UEdGraphNode* GraphNode : Selected)
-            {
-                if (!GraphNode->IsA(UEdGraphNode_Comment::StaticClass()))
-                {
-                    return SingleNodeSelectionStrategy(GraphNode);
-                }
-            }
-        }
-        TSet<UEdGraphNode*> SelectedGraphNodes;
-        for (UEdGraphNode* GraphNode : Selected)
-        {
-            SelectedGraphNodes.Add(GraphNode);
-            if (GraphNode->IsA(UEdGraphNode_Comment::StaticClass()))
-            {
-                UEdGraphNode_Comment* CommentNode = Cast<UEdGraphNode_Comment>(GraphNode);
-                auto NodesInComment = FFormatter::Instance().GetNodesUnderComment(CommentNode);
-                for (UObject* ObjectInComment : NodesInComment)
-                {
-                    UEdGraphNode* NodeInComment = Cast<UEdGraphNode>(ObjectInComment);
-                    SelectedGraphNodes.Add(NodeInComment);
-                }
-            }
-        }
-        return SelectedGraphNodes;
-    }
-    TSet<UEdGraphNode*> SelectedGraphNodes;
-    for (UEdGraphNode* Node : Graph->Nodes)
-    {
-        SelectedGraphNodes.Add(Node);
-    }
-    return SelectedGraphNodes;
+	if (Selected.Num() != 0)
+	{
+		TSet<UEdGraphNode*> SelectedGraphNodes;
+		for (UEdGraphNode* GraphNode : Selected)
+		{
+			SelectedGraphNodes.Add(GraphNode);
+			if (GraphNode->IsA(UEdGraphNode_Comment::StaticClass()))
+			{
+				AddCommentContentsRecursively(Cast<UEdGraphNode_Comment>(GraphNode), SelectedGraphNodes);
+			}
+		}
+		return SelectedGraphNodes;
+	}
+	TSet<UEdGraphNode*> SelectedGraphNodes;
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		SelectedGraphNodes.Add(Node);
+	}
+	return SelectedGraphNodes;
 }
 
-void FFormatter::Format()
+void FFormatter::BeginK2Format(const TSet<UEdGraphNode*>& Nodes, const bool bRouteWires)
 {
-    if (!PreCommand())
-    {
-        return;
-    }
-    auto SelectedNodes = GetSelectedNodes(CurrentEditor);
-    SelectedNodes = DoSelectionStrategy(CurrentGraph, SelectedNodes);
-    for (const auto SelectedNode : SelectedNodes)
-    {
-        CurrentEditor->SetNodeSelection(SelectedNode, true);
-    }
-    auto Graph = UEGraphAdapter::Build(SelectedNodes, IsVerticalLayout);
-    if (IsBehaviorTree)
-    {
-        Graph->NodeComparer = [](const FFormatterNode& A, const FFormatterNode& B)
-        {
-            return A.GetPosition().X < B.GetPosition().X;
-        };
-    }
-    Graph->Format();
-    auto BoundMap = Graph->GetBoundMap();
-    delete Graph;
-    const FScopedTransaction Transaction(FFormatterCommands::Get().FormatGraph->GetLabel());
-    for (auto [Node, Rect] : BoundMap)
-    {
-        UEdGraphNode* UEdNode = static_cast<UEdGraphNode*>(Node);
-        auto WidgetNode = GetWidget(UEdNode);
-        SGraphPanel::SNode::FNodeSet Filter;
-        WidgetNode->MoveTo(CompatibleVector2(Rect.Min), Filter, true);
-        if (UEdNode->IsA(UEdGraphNode_Comment::StaticClass()))
-        {
-            auto CommentNode = Cast<UEdGraphNode_Comment>(UEdNode);
-            CommentNode->SetBounds(FSlateRect(Rect.Min, Rect.Max));
+	CancelPendingFormat();
+	if (!CurrentEditor || !CurrentGraph || !CurrentPanel || !FSlateApplication::IsInitialized()) { return; }
 
-#ifdef GRAPH_FORMATTER_HACK
-            if (auto NodeResizable = StaticCast<SGraphNodeResizable*>(WidgetNode))
-            {
-                NodeResizable->*FPrivateAccessor<FAccess_SGraphNodeResizable_UserSize>::Member = Rect.GetSize();
-            }
-#endif
-        }
-    }
-    PostCommand();
+	PendingK2Format = MakeUnique<FPendingK2Format>();
+	PendingK2Format->Editor = StaticCastSharedRef<SGraphEditor>(CurrentEditor->AsShared());
+	PendingK2Format->Graph = CurrentGraph;
+	PendingK2Format->bRouteWires = bRouteWires;
+	PendingK2Format->Scope.Reserve(Nodes.Num());
+	for (UEdGraphNode* Node : Nodes)
+	{
+		if (Node && Node->GetGraph() == CurrentGraph) { PendingK2Format->Scope.Add(Node); }
+	}
+	for (UEdGraphNode* Node : GetSelectedNodes(CurrentEditor))
+	{
+		PendingK2Format->ExplicitSelection.Add(Node);
+	}
+
+	K2GraphChangedHandle = CurrentGraph->AddOnGraphChangedHandler(
+		FOnGraphChanged::FDelegate::CreateRaw(this, &FFormatter::HandlePendingGraphChanged)
+	);
+	K2PostTickHandle = FSlateApplication::Get().OnPostTick().AddRaw(this, &FFormatter::HandleK2PostTick);
+}
+
+void FFormatter::HandlePendingGraphChanged(const FEdGraphEditAction& Action)
+{
+	if (PendingK2Format) { PendingK2Format->bGraphChanged = true; }
+}
+
+void FFormatter::HandleK2PostTick(float DeltaTime)
+{
+	if (!PendingK2Format)
+	{
+		CancelPendingFormat();
+		return;
+	}
+
+	const TSharedPtr<SGraphEditor> Editor = PendingK2Format->Editor.Pin();
+	UEdGraph* Graph = PendingK2Format->Graph.Get();
+	if (!Editor || !Graph || PendingK2Format->bGraphChanged || Editor->GetCurrentGraph() != Graph)
+	{
+		CancelPendingFormat();
+		return;
+	}
+
+	TSet<TWeakObjectPtr<UEdGraphNode>> CurrentSelection;
+	for (UEdGraphNode* Node : GetSelectedNodes(Editor.Get()))
+	{
+		CurrentSelection.Add(Node);
+	}
+	if (CurrentSelection.Num() != PendingK2Format->ExplicitSelection.Num()
+		|| !CurrentSelection.Includes(PendingK2Format->ExplicitSelection))
+	{
+		CancelPendingFormat();
+		return;
+	}
+
+	SGraphPanel* Panel = Editor->GetGraphPanel();
+	if (!Panel)
+	{
+		CancelPendingFormat();
+		return;
+	}
+
+	GraphFormatter::K2::FGraphGeometrySnapshot Geometry = GraphFormatter::K2::FGraphGeometrySnapshot::Capture(*Panel);
+	if (Geometry.ShouldRetry() && PendingK2Format->RetryCount++ == 0)
+	{
+		Panel->Update();
+		return;
+	}
+	if (!Geometry.IsReady())
+	{
+		for (const GraphFormatter::K2::FGraphGeometryDiagnostic& Diagnostic : Geometry.Diagnostics)
+		{
+			UE_LOG(LogGraphFormatter, Warning, TEXT("%s"), *Diagnostic.ToString());
+		}
+		const bool bShowNotification = GetDefault<UFormatterSettings>()->bShowLayoutNotifications;
+		CancelPendingFormat();
+		if (bShowNotification)
+		{
+			ShowFormatterNotification(
+				LOCTEXT("GeometryUnavailable", "Graph Formatter could not obtain reliable node geometry; no nodes were changed."),
+				SNotificationItem::CS_Fail
+			);
+		}
+		return;
+	}
+
+	TSet<UEdGraphNode*> Scope;
+	for (const TWeakObjectPtr<UEdGraphNode>& WeakNode : PendingK2Format->Scope)
+	{
+		if (UEdGraphNode* Node = WeakNode.Get(); Node && Node->GetGraph() == Graph) { Scope.Add(Node); }
+	}
+	const bool bRouteWires = PendingK2Format->bRouteWires;
+	CancelPendingFormat();
+
+	const UFormatterSettings& Settings = *GetDefault<UFormatterSettings>();
+	const GraphFormatter::K2::FK2FormatResult Result =
+		GraphFormatter::K2::FK2GraphFormatter::Format(*Editor, *Graph, Geometry, Scope, bRouteWires, Settings);
+	for (const FString& Diagnostic : Result.Diagnostics)
+	{
+		UE_LOG(LogGraphFormatter, Log, TEXT("%s"), *Diagnostic);
+	}
+	if (Settings.bShowLayoutNotifications && !Result.Message.IsEmpty())
+	{
+		const SNotificationItem::ECompletionState State = Result.Status == GraphFormatter::K2::EK2FormatStatus::Formatted
+															   || Result.Status
+																	  == GraphFormatter::K2::EK2FormatStatus::NoChanges
+															? SNotificationItem::CS_Success
+															: SNotificationItem::CS_Fail;
+		ShowFormatterNotification(FText::FromString(Result.Message), State);
+	}
+}
+
+void FFormatter::CancelPendingFormat()
+{
+	if (K2PostTickHandle.IsValid() && FSlateApplication::IsInitialized())
+	{
+		FSlateApplication::Get().OnPostTick().Remove(K2PostTickHandle);
+	}
+	K2PostTickHandle.Reset();
+
+	if (K2GraphChangedHandle.IsValid() && PendingK2Format)
+	{
+		if (UEdGraph* Graph = PendingK2Format->Graph.Get())
+		{
+			Graph->RemoveOnGraphChangedHandler(K2GraphChangedHandle);
+		}
+	}
+	K2GraphChangedHandle.Reset();
+	PendingK2Format.Reset();
+}
+
+void FFormatter::Format(const bool bRouteWires, const bool bAllowDeferredK2)
+{
+	if (!PreCommand()) { return; }
+	auto SelectedNodes = GetSelectedNodes(CurrentEditor);
+	SelectedNodes = DoSelectionStrategy(CurrentGraph, SelectedNodes);
+	const UFormatterSettings& Settings = *GetDefault<UFormatterSettings>();
+	if (bAllowDeferredK2 && Settings.bEnableK2Formatter
+		&& GraphFormatter::K2::FK2GraphFormatter::CanFormat(*CurrentGraph, SelectedNodes))
+	{
+		BeginK2Format(SelectedNodes, bRouteWires);
+		PostCommand();
+		return;
+	}
+	auto Graph = UEGraphAdapter::Build(SelectedNodes, IsVerticalLayout);
+	if (IsBehaviorTree)
+	{
+		Graph->NodeComparer = [](const FFormatterNode& A, const FFormatterNode& B)
+		{
+			const FVector2D APosition = A.GetPosition();
+			const FVector2D BPosition = B.GetPosition();
+			if (!FMath::IsNearlyEqual(APosition.X, BPosition.X)) { return APosition.X < BPosition.X; }
+			if (!FMath::IsNearlyEqual(APosition.Y, BPosition.Y)) { return APosition.Y < BPosition.Y; }
+			return A.Guid < B.Guid;
+		};
+	}
+	Graph->Format();
+	auto BoundMap = Graph->GetBoundMap();
+	delete Graph;
+	TArray<TPair<UEdGraphNode*, FBox2D>> ChangedNodes;
+	for (auto [Node, Rect] : BoundMap)
+	{
+		UEdGraphNode* UEdNode = static_cast<UEdGraphNode*>(Node);
+		if (!UEdNode) { continue; }
+		const FVector2D RectMinimum = Rect.Min;
+		const bool bPositionChanged = UEdNode->NodePosX != FMath::RoundToInt(RectMinimum.X)
+								   || UEdNode->NodePosY != FMath::RoundToInt(RectMinimum.Y);
+		bool bBoundsChanged = false;
+		if (UEdNode->IsA(UEdGraphNode_Comment::StaticClass()))
+		{
+			const FVector2D CurrentSize(UEdNode->NodeWidth, UEdNode->NodeHeight);
+			bBoundsChanged = !CurrentSize.Equals(Rect.GetSize(), 0.5);
+		}
+		if (bPositionChanged || bBoundsChanged) { ChangedNodes.Emplace(UEdNode, Rect); }
+	}
+	if (!ChangedNodes.IsEmpty())
+	{
+		const FScopedTransaction Transaction(FFormatterCommands::Get().FormatGraph->GetLabel());
+		CurrentGraph->Modify();
+		for (const TPair<UEdGraphNode*, FBox2D>& Change : ChangedNodes)
+		{
+			UEdGraphNode* Node = Change.Key;
+			const FBox2D& Rect = Change.Value;
+			Node->Modify();
+			const FVector2D RectMinimum = Rect.Min;
+			const FVector2D RectMaximum = Rect.Max;
+			Node->NodePosX = FMath::RoundToInt(RectMinimum.X);
+			Node->NodePosY = FMath::RoundToInt(RectMinimum.Y);
+			if (UEdGraphNode_Comment* CommentNode = Cast<UEdGraphNode_Comment>(Node))
+			{
+				CommentNode->SetBounds(FSlateRect(RectMinimum, RectMaximum));
+			}
+		}
+		if (UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForGraph(CurrentGraph))
+		{
+			FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+		}
+		CurrentGraph->NotifyGraphChanged();
+	}
+	if (bRouteWires)
+	{
+		UE_LOG(LogGraphFormatter, Warning, TEXT("Wire routing is available only through the semantic K2 formatter."));
+	}
+	PostCommand();
 }
 
 void FFormatter::PlaceBlock()
 {
-    if (!PreCommand())
-    {
-        return;
-    }
-    auto SelectedNodes = GetSelectedNodes(CurrentEditor);
-    auto ConnectedNodesLeft = UEGraphAdapter::GetNodesConnected(SelectedNodes, EFormatterPinDirection::In);
-    FVector2D ConnectCenter;
-    const UFormatterSettings& Settings = *GetDefault<UFormatterSettings>();
-    const FScopedTransaction Transaction(FFormatterCommands::Get().PlaceBlock->GetLabel());
-    if (UEGraphAdapter::GetNodesConnectCenter(SelectedNodes, ConnectCenter, EFormatterPinDirection::In))
-    {
-        auto Center = FVector(ConnectCenter.X, ConnectCenter.Y, 0);
-        auto Direction = IsVerticalLayout ? FVector(0, 1, 0) : FVector(1, 0, 0);
-        auto RightRay = FRay(Center, Direction, true);
-        FSlateRect Bound = GetNodesBound(ConnectedNodesLeft);
-        auto RightBound = IsVerticalLayout ? FVector(0, Bound.Bottom, 0) : FVector(Bound.Right, 0, 0);
-        auto LinkedCenter3D = RightRay.PointAt(RightRay.GetParameter(RightBound));
-        auto LinkedCenterTo = FVector2D(LinkedCenter3D) + (IsVerticalLayout ? FVector2D(0, Settings.HorizontalSpacing) : FVector2D(Settings.HorizontalSpacing, 0));
-        UEGraphAdapter::GetNodesConnectCenter(SelectedNodes, ConnectCenter, EFormatterPinDirection::In, true);
-        Center = FVector(ConnectCenter.X, ConnectCenter.Y, 0);
-        Direction = IsVerticalLayout ? FVector(0, -1, 0) : FVector(-1, 0, 0);
-        auto LeftRay = FRay(Center, Direction, true);
-        Bound = GetNodesBound(SelectedNodes);
-        auto LeftBound = IsVerticalLayout ? FVector(0, Bound.Top, 0) : FVector(Bound.Left, 0, 0);
-        LinkedCenter3D = LeftRay.PointAt(LeftRay.GetParameter(LeftBound));
-        auto LinkedCenterFrom = FVector2D(LinkedCenter3D);
-        FVector2D Offset = LinkedCenterTo - LinkedCenterFrom;
-        Translate(SelectedNodes, Offset);
-    }
-    auto ConnectedNodesRight = UEGraphAdapter::GetNodesConnected(SelectedNodes, EFormatterPinDirection::Out);
-    if (UEGraphAdapter::GetNodesConnectCenter(SelectedNodes, ConnectCenter, EFormatterPinDirection::Out))
-    {
-        auto Center = FVector(ConnectCenter.X, ConnectCenter.Y, 0);
-        auto Direction = IsVerticalLayout ? FVector(0, -1, 0) : FVector(-1, 0, 0);
-        auto LeftRay = FRay(Center, Direction, true);
-        FSlateRect Bound = GetNodesBound(ConnectedNodesRight);
-        auto LeftBound = IsVerticalLayout ? FVector(0, Bound.Top, 0) : FVector(Bound.Left, 0, 0);
-        auto LinkedCenter3D = LeftRay.PointAt(LeftRay.GetParameter(LeftBound));
-        auto LinkedCenterTo = FVector2D(LinkedCenter3D) - (IsVerticalLayout ? FVector2D(0, Settings.HorizontalSpacing) : FVector2D(Settings.HorizontalSpacing, 0));
-        UEGraphAdapter::GetNodesConnectCenter(SelectedNodes, ConnectCenter, EFormatterPinDirection::Out, true);
-        Center = FVector(ConnectCenter.X, ConnectCenter.Y, 0);
-        Direction = IsVerticalLayout ? FVector(0, 1, 0) : FVector(1, 0, 0);
-        auto RightRay = FRay(Center, Direction, true);
-        Bound = GetNodesBound(SelectedNodes);
-        auto RightBound = IsVerticalLayout ? FVector(0, Bound.Bottom, 0) : FVector(Bound.Right, 0, 0);
-        LinkedCenter3D = RightRay.PointAt(RightRay.GetParameter(RightBound));
-        auto LinkedCenterFrom = FVector2D(LinkedCenter3D);
-        FVector2D Offset = LinkedCenterFrom - LinkedCenterTo;
-        Translate(ConnectedNodesRight, Offset);
-    }
-    PostCommand();
+	if (!PreCommand()) { return; }
+	auto SelectedNodes = GetSelectedNodes(CurrentEditor);
+	auto ConnectedNodesLeft = UEGraphAdapter::GetNodesConnected(SelectedNodes, EFormatterPinDirection::In);
+	FVector2D ConnectCenter;
+	const UFormatterSettings& Settings = *GetDefault<UFormatterSettings>();
+	FScopedTransaction Transaction(FFormatterCommands::Get().PlaceBlock->GetLabel());
+	bool bModified = false;
+	if (UEGraphAdapter::GetNodesConnectCenter(SelectedNodes, ConnectCenter, EFormatterPinDirection::In))
+	{
+		auto Center = FVector(ConnectCenter.X, ConnectCenter.Y, 0);
+		auto Direction = IsVerticalLayout ? FVector(0, 1, 0) : FVector(1, 0, 0);
+		auto RightRay = FRay(Center, Direction, true);
+		FSlateRect Bound = GetNodesBound(ConnectedNodesLeft);
+		auto RightBound = IsVerticalLayout ? FVector(0, Bound.Bottom, 0) : FVector(Bound.Right, 0, 0);
+		auto LinkedCenter3D = RightRay.PointAt(RightRay.GetParameter(RightBound));
+		auto LinkedCenterTo =
+			FVector2D(LinkedCenter3D)
+			+ (IsVerticalLayout ? FVector2D(0, Settings.HorizontalSpacing) : FVector2D(Settings.HorizontalSpacing, 0));
+		UEGraphAdapter::GetNodesConnectCenter(SelectedNodes, ConnectCenter, EFormatterPinDirection::In, true);
+		Center = FVector(ConnectCenter.X, ConnectCenter.Y, 0);
+		Direction = IsVerticalLayout ? FVector(0, -1, 0) : FVector(-1, 0, 0);
+		auto LeftRay = FRay(Center, Direction, true);
+		Bound = GetNodesBound(SelectedNodes);
+		auto LeftBound = IsVerticalLayout ? FVector(0, Bound.Top, 0) : FVector(Bound.Left, 0, 0);
+		LinkedCenter3D = LeftRay.PointAt(LeftRay.GetParameter(LeftBound));
+		auto LinkedCenterFrom = FVector2D(LinkedCenter3D);
+		FVector2D Offset = LinkedCenterTo - LinkedCenterFrom;
+		bModified |= Translate(SelectedNodes, Offset);
+	}
+	auto ConnectedNodesRight = UEGraphAdapter::GetNodesConnected(SelectedNodes, EFormatterPinDirection::Out);
+	if (UEGraphAdapter::GetNodesConnectCenter(SelectedNodes, ConnectCenter, EFormatterPinDirection::Out))
+	{
+		auto Center = FVector(ConnectCenter.X, ConnectCenter.Y, 0);
+		auto Direction = IsVerticalLayout ? FVector(0, -1, 0) : FVector(-1, 0, 0);
+		auto LeftRay = FRay(Center, Direction, true);
+		FSlateRect Bound = GetNodesBound(ConnectedNodesRight);
+		auto LeftBound = IsVerticalLayout ? FVector(0, Bound.Top, 0) : FVector(Bound.Left, 0, 0);
+		auto LinkedCenter3D = LeftRay.PointAt(LeftRay.GetParameter(LeftBound));
+		auto LinkedCenterTo =
+			FVector2D(LinkedCenter3D)
+			- (IsVerticalLayout ? FVector2D(0, Settings.HorizontalSpacing) : FVector2D(Settings.HorizontalSpacing, 0));
+		UEGraphAdapter::GetNodesConnectCenter(SelectedNodes, ConnectCenter, EFormatterPinDirection::Out, true);
+		Center = FVector(ConnectCenter.X, ConnectCenter.Y, 0);
+		Direction = IsVerticalLayout ? FVector(0, 1, 0) : FVector(1, 0, 0);
+		auto RightRay = FRay(Center, Direction, true);
+		Bound = GetNodesBound(SelectedNodes);
+		auto RightBound = IsVerticalLayout ? FVector(0, Bound.Bottom, 0) : FVector(Bound.Right, 0, 0);
+		LinkedCenter3D = RightRay.PointAt(RightRay.GetParameter(RightBound));
+		auto LinkedCenterFrom = FVector2D(LinkedCenter3D);
+		FVector2D Offset = LinkedCenterFrom - LinkedCenterTo;
+		bModified |= Translate(ConnectedNodesRight, Offset);
+	}
+	if (bModified)
+	{
+		if (UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForGraph(CurrentGraph))
+		{
+			FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+		}
+		else
+		{
+			CurrentGraph->MarkPackageDirty();
+		}
+		CurrentGraph->NotifyGraphChanged();
+	}
+	else
+	{
+		Transaction.Cancel();
+	}
+	PostCommand();
 }
 
 FFormatter& FFormatter::Instance()
 {
-    static FFormatter Context;
-    return Context;
+	static FFormatter Context;
+	return Context;
 }
 
 FFormatter::FFormatter()
 {
-    if (FModuleManager::Get().GetModule(FName("AutoSizeComments")))
-    {
-        IsAutoSizeComment = true;
-    }
+	if (FModuleManager::Get().GetModule(FName("AutoSizeComments"))) { IsAutoSizeComment = true; }
 }
+
+FFormatter::~FFormatter() { CancelPendingFormat(); }
+
+#undef LOCTEXT_NAMESPACE

@@ -1,9 +1,9 @@
 {
 	"FileVersion": 3,
-	"Version": 4,
-	"VersionName": "2.3.1",
+	"Version": 5,
+	"VersionName": "3.0.0",
 	"FriendlyName": "GraphFormatter",
-	"Description": "Auto arrange graph nodes.",
+	"Description": "Deterministic, execution-first graph layout with readable data grouping, grid alignment, and opt-in K2 reroute generation.",
 	"Category": "Tools",
 	"CreatedBy": "Howaajin",
 	"CreatedByURL": "https://github.com/howaajin/graphformatter",

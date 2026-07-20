@@ -12,13 +12,19 @@
 class FFormatterCommands : public TCommands<FFormatterCommands>
 {
 public:
-    FFormatterCommands() :
-        TCommands<FFormatterCommands>("GraphFormatterEditor", NSLOCTEXT("Contexts", "GraphFormatterEditor", "Grap Formatter Editor"), NAME_None, FFormatterStyle::Get()->GetStyleSetName())
-    {
-    }
+	FFormatterCommands()
+		: TCommands<FFormatterCommands>(
+			  "GraphFormatterEditor",
+			  NSLOCTEXT("Contexts", "GraphFormatterEditor", "Grap Formatter Editor"),
+			  NAME_None,
+			  FFormatterStyle::Get()->GetStyleSetName()
+		  )
+	{
+	}
 
-    TSharedPtr<FUICommandInfo> FormatGraph;
-    TSharedPtr<FUICommandInfo> StraightenConnections;
-    TSharedPtr<FUICommandInfo> PlaceBlock;
-    virtual void RegisterCommands() override;
+	TSharedPtr<FUICommandInfo> FormatGraph;
+	TSharedPtr<FUICommandInfo> FormatGraphWithRouting;
+	TSharedPtr<FUICommandInfo> StraightenConnections;
+	TSharedPtr<FUICommandInfo> PlaceBlock;
+	virtual void RegisterCommands() override;
 };
