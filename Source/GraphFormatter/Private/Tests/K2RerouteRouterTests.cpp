@@ -11,6 +11,7 @@
 #include "EdGraph/EdGraphPin.h"
 #include "EdGraphSchema_K2.h"
 #include "Engine/Blueprint.h"
+#include "K2Node_DeadClass.h"
 #include "K2Node_Knot.h"
 #include "Misc/AutomationTest.h"
 #include "UObject/MetaData.h"
@@ -52,6 +53,16 @@ UK2Node_Knot* AddKnot(UEdGraph& Graph, const FVector2D Position)
 	Knot->NodePosY = FMath::RoundToInt(Position.Y);
 	NodeCreator.Finalize();
 	return Knot;
+}
+
+UK2Node_DeadClass* AddPlainK2Node(UEdGraph& Graph, const FVector2D Position)
+{
+	FGraphNodeCreator<UK2Node_DeadClass> NodeCreator(Graph);
+	UK2Node_DeadClass* Node = NodeCreator.CreateNode(false);
+	Node->NodePosX = FMath::RoundToInt(Position.X);
+	Node->NodePosY = FMath::RoundToInt(Position.Y);
+	NodeCreator.Finalize();
+	return Node;
 }
 
 bool Connect(const UEdGraph& Graph, UK2Node_Knot& Source, UK2Node_Knot& Destination)
@@ -310,8 +321,9 @@ FDenseRouteFixture MakeDenseRouteFixture(const bool bReverseInputOrder)
 		FRerouteEdge Edge;
 		Edge.OutputPin = Source->GetOutputPin();
 		Edge.InputPin = Destination->GetInputPin();
-		Edge.OutputAnchor = FVector2D(0.0, Y);
-		Edge.InputAnchor = FVector2D(400.0, Y);
+		// Make every logical edge backward so even the first sorted edge must enter bounded route search.
+		Edge.OutputAnchor = FVector2D(400.0, Y);
+		Edge.InputAnchor = FVector2D(0.0, Y);
 		Edge.StableKey = FString::Printf(TEXT("Dense.%02d"), Index);
 		Edge.bExecution = true;
 		if (bReverseInputOrder) { Fixture.Edges.Insert(MoveTemp(Edge), 0); }
@@ -364,6 +376,82 @@ bool FK2RerouteBackwardObstacleTopologyTest::RunTest(const FString& Parameters)
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FK2ReroutePlanApplySeparationTest,
+	"Project.Unit Tests.GraphFormatter.K2Routing.PlanIsNonMutatingUntilApplied",
+	EAutomationTestFlags::ProductFilter | EAutomationTestFlags::EditorContext
+)
+
+bool FK2ReroutePlanApplySeparationTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	FRouteFixture Fixture = MakeBackwardFixture();
+	const FRerouteEdge Edge = MakeEdge(Fixture, TEXT("PlanApply.LogicalEdge"));
+	const TSet<UEdGraphNode*> Scope = { Fixture.Source, Fixture.Destination };
+	const int32 OriginalNodeCount = Fixture.Graph->Nodes.Num();
+	Fixture.Graph->GetOutermost()->SetDirtyFlag(false);
+
+	const FReroutePlan Plan = FK2RerouteRouter::Plan(
+		MakeArrayView(&Edge, 1), TConstArrayView<FRerouteObstacle>(), Scope, FRerouteSettings(), 16.0
+	);
+	TestEqual(TEXT("one required route is planned"), Plan.Routes.Num(), 1);
+	TestEqual(TEXT("planning does not add graph nodes"), Fixture.Graph->Nodes.Num(), OriginalNodeCount);
+	TestTrue(TEXT("planning preserves the original direct link"), HasDirectLink(*Fixture.Source, *Fixture.Destination));
+	TestFalse(TEXT("planning leaves the package clean"), Fixture.Graph->GetOutermost()->IsDirty());
+
+	const FRerouteResult Result = FK2RerouteRouter::ApplyPlan(*Fixture.Graph, Plan);
+	TestEqual(TEXT("applying the plan routes one wire"), Result.RoutedWires, 1);
+	TestTrue(TEXT("applying the plan creates reroute nodes"), Result.CreatedKnots > 0);
+	TestFalse(TEXT("applying the plan removes the direct link"), HasDirectLink(*Fixture.Source, *Fixture.Destination));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FK2RerouteReconstructedPlannedPinsTest,
+	"Project.Unit Tests.GraphFormatter.K2Routing.PlannedPinReconstructionResolvesLiveEndpoints",
+	EAutomationTestFlags::ProductFilter | EAutomationTestFlags::EditorContext
+)
+
+bool FK2RerouteReconstructedPlannedPinsTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	FRouteFixture Fixture = MakeBackwardFixture();
+	const FRerouteEdge Edge = MakeEdge(Fixture, TEXT("PlanApply.ReconstructedPins"));
+	const TSet<UEdGraphNode*> Scope = { Fixture.Source, Fixture.Destination };
+	const FReroutePlan Plan = FK2RerouteRouter::Plan(
+		MakeArrayView(&Edge, 1), TConstArrayView<FRerouteObstacle>(), Scope, FRerouteSettings(), 16.0
+	);
+	TestEqual(TEXT("one route is planned before endpoint reconstruction"), Plan.Routes.Num(), 1);
+
+	UEdGraphPin* OldOutputPin = Fixture.Source->GetOutputPin();
+	UEdGraphPin* OldInputPin = Fixture.Destination->GetInputPin();
+	const FGuid OutputPinId = OldOutputPin->PinId;
+	const FGuid InputPinId = OldInputPin->PinId;
+	Fixture.Source->ReconstructNode();
+	Fixture.Destination->ReconstructNode();
+	TestTrue(TEXT("source reconstruction trashes the raw planned output pin"), OldOutputPin->WasTrashed());
+	TestTrue(TEXT("destination reconstruction trashes the raw planned input pin"), OldInputPin->WasTrashed());
+	TestEqual(TEXT("source reconstruction preserves the stable pin ID"), Fixture.Source->GetOutputPin()->PinId, OutputPinId);
+	TestEqual(
+		TEXT("destination reconstruction preserves the stable pin ID"), Fixture.Destination->GetInputPin()->PinId, InputPinId
+	);
+	TestTrue(
+		TEXT("endpoint reconstruction preserves the direct logical edge"),
+		HasDirectLink(*Fixture.Source, *Fixture.Destination)
+	);
+
+	const FRerouteResult Result = FK2RerouteRouter::ApplyPlan(*Fixture.Graph, Plan);
+	TestEqual(TEXT("the stale-pointer plan still routes one wire"), Result.RoutedWires, 1);
+	TestFalse(TEXT("stable endpoint resolution avoids a fatal topology error"), Result.HasFatalError());
+	TestTrue(TEXT("the applied route creates its generated knot chain"), Result.CreatedKnots > 0);
+	TestEqual(
+		TEXT("the generated chain reaches the reconstructed destination"),
+		CountGeneratedKnotsOnPath(*Fixture.Source, *Fixture.Destination),
+		Result.CreatedKnots
+	);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FK2RerouteSourceFanOutTest,
 	"Project.Unit Tests.GraphFormatter.K2Routing.SourceFanOutPreservesUnrelatedBranch",
 	EAutomationTestFlags::ProductFilter | EAutomationTestFlags::EditorContext
@@ -372,28 +460,53 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FK2RerouteSourceFanOutTest::RunTest(const FString& Parameters)
 {
 	(void)Parameters;
-	FRouteFixture Fixture = MakeBackwardFixture();
-	UK2Node_Knot* OtherDestination = AddKnot(*Fixture.Graph, FVector2D(100.0, 260.0));
+	UEdGraph* Graph = MakeGraph();
+	UK2Node_DeadClass* Source = AddPlainK2Node(*Graph, FVector2D(400.0, 100.0));
+	UK2Node_Knot* Destination = AddKnot(*Graph, FVector2D(100.0, 100.0));
+	UK2Node_Knot* OtherDestination = AddKnot(*Graph, FVector2D(100.0, 260.0));
+	UEdGraphPin* SourceOutput = Source->CreatePin(EGPD_Output, UEdGraphSchema_K2::PC_Wildcard, TEXT("Value"));
+	const UEdGraphSchema_K2* Schema = Cast<UEdGraphSchema_K2>(Graph->GetSchema());
+	TestNotNull(TEXT("the K2 schema is available"), Schema);
+	TestTrue(
+		TEXT("the source output connects to the branch selected for routing"),
+		Schema != nullptr && Schema->UEdGraphSchema::TryCreateConnection(SourceOutput, Destination->GetInputPin())
+	);
 	TestTrue(
 		TEXT("the source output accepts an unrelated fan-out branch"),
-		Connect(*Fixture.Graph, *Fixture.Source, *OtherDestination)
+		Schema != nullptr && Schema->UEdGraphSchema::TryCreateConnection(SourceOutput, OtherDestination->GetInputPin())
 	);
 	const FString StableKey = TEXT("FanOut.LogicalEdge");
-	const FRerouteResult Result = RouteEdge(Fixture, MakeEdge(Fixture, StableKey));
-	const TArray<UK2Node_Knot*> Generated = GetGeneratedKnotsForLogicalEdge(*Fixture.Graph, StableKey);
+	FRerouteEdge Edge;
+	Edge.OutputPin = SourceOutput;
+	Edge.InputPin = Destination->GetInputPin();
+	Edge.OutputAnchor = FVector2D(400.0, 100.0);
+	Edge.InputAnchor = FVector2D(100.0, 100.0);
+	Edge.StableKey = StableKey;
+	Edge.bExecution = true;
+	const TSet<UEdGraphNode*> Scope = { Source, Destination, OtherDestination };
+	const FRerouteResult Result = FK2RerouteRouter::Route(
+		*Graph, MakeArrayView(&Edge, 1), TConstArrayView<FRerouteObstacle>(), Scope, FRerouteSettings(), 16.0
+	);
+	const TArray<UK2Node_Knot*> Generated = GetGeneratedKnotsForLogicalEdge(*Graph, StableKey);
+	if (!Result.Diagnostics.IsEmpty())
+	{
+		AddInfo(TEXT("Fan-out route diagnostics: ") + FString::Join(Result.Diagnostics, TEXT(" | ")));
+	}
 
 	TestEqual(TEXT("one fan-out branch is routed"), Result.RoutedWires, 1);
-	TestTrue(TEXT("the unrelated source branch remains direct"), HasDirectLink(*Fixture.Source, *OtherDestination));
-	TestFalse(TEXT("the replaced branch is no longer direct"), HasDirectLink(*Fixture.Source, *Fixture.Destination));
+	TestTrue(
+		TEXT("the unrelated source branch remains direct"), SourceOutput->LinkedTo.Contains(OtherDestination->GetInputPin())
+	);
+	TestFalse(TEXT("the replaced branch is no longer direct"), SourceOutput->LinkedTo.Contains(Destination->GetInputPin()));
 	if (!Generated.IsEmpty())
 	{
 		TestTrue(
 			TEXT("the generated chain begins at the shared source output"),
-			Generated[0]->GetInputPin()->LinkedTo.Contains(Fixture.Source->GetOutputPin())
+			Generated[0]->GetInputPin()->LinkedTo.Contains(SourceOutput)
 		);
 		TestTrue(
 			TEXT("the generated chain ends at the intended destination input"),
-			Generated.Last()->GetOutputPin()->LinkedTo.Contains(Fixture.Destination->GetInputPin())
+			Generated.Last()->GetOutputPin()->LinkedTo.Contains(Destination->GetInputPin())
 		);
 	}
 	else
@@ -539,20 +652,54 @@ bool FK2RerouteNarrowForwardObstacleTest::RunTest(const FString& Parameters)
 	FRouteFixture Fixture = MakeBackwardFixture();
 	UK2Node_Knot* MiddleObstacle = AddKnot(*Fixture.Graph, FVector2D(20.0, 90.0));
 	FRerouteEdge Edge =
-		MakeEdge(Fixture, TEXT("Forward.Narrow.LogicalEdge"), FVector2D(0.0, 100.0), FVector2D(48.0, 100.0));
+		MakeEdge(Fixture, TEXT("Forward.Narrow.LogicalEdge"), FVector2D(0.0, 100.0), FVector2D(128.0, 100.0));
 	TArray<FRerouteObstacle> Obstacles = {
 		FRerouteObstacle{ Fixture.Source,      FBox2D(FVector2D(-100.0, 60.0), FVector2D(0.0,   140.0)) },
-		FRerouteObstacle{ Fixture.Destination, FBox2D(FVector2D(48.0,   60.0), FVector2D(148.0, 140.0)) },
-		FRerouteObstacle{ MiddleObstacle,      FBox2D(FVector2D(20.0,   88.0), FVector2D(28.0,  112.0)) },
+		FRerouteObstacle{ Fixture.Destination, FBox2D(FVector2D(128.0,  60.0), FVector2D(228.0, 140.0)) },
+		FRerouteObstacle{ MiddleObstacle,      FBox2D(FVector2D(60.0,   88.0), FVector2D(68.0,  112.0)) },
 	};
 	FRerouteSettings Settings;
 	Settings.ObstacleClearance = 8.0;
 	Settings.ChannelSpacing = 32.0;
 	const FRerouteResult Result = RouteEdge(Fixture, Edge, Obstacles, Settings);
+	if (!Result.Diagnostics.IsEmpty())
+	{
+		AddInfo(TEXT("Narrow-route diagnostics: ") + FString::Join(Result.Diagnostics, TEXT(" | ")));
+	}
 
 	TestEqual(TEXT("the obstructed narrow forward wire is routed"), Result.RoutedWires, 1);
 	TestFalse(TEXT("the narrow route preserves topology safety"), Result.HasFatalError());
 	TestTrue(TEXT("the narrow route reaches its destination"), GetGeneratedKnots(*Fixture.Graph).Num() >= 2);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FK2RerouteNarrowDataKnotCollisionTest,
+	"Project.Unit Tests.GraphFormatter.K2Routing.NarrowDataRouteSkipsOverlappingKnotPlan",
+	EAutomationTestFlags::ProductFilter | EAutomationTestFlags::EditorContext
+)
+
+bool FK2RerouteNarrowDataKnotCollisionTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	FRouteFixture Fixture = MakeBackwardFixture();
+	FRerouteEdge Edge = MakeEdge(Fixture, TEXT("Data.Narrow.KnotCollision"), FVector2D(0.0, 100.0), FVector2D(90.0, 200.0));
+	Edge.bExecution = false;
+	Edge.RankSpan = 3;
+	FRerouteSettings Settings;
+	Settings.bRouteDataWires = true;
+	Settings.LongDataWireRankThreshold = 3;
+	Settings.ChannelSpacing = 32.0;
+	Settings.MaxKnotsPerWire = 6;
+	Fixture.Graph->GetOutermost()->SetDirtyFlag(false);
+	const FRerouteResult Result = RouteEdge(Fixture, Edge, {}, Settings);
+
+	TestEqual(TEXT("a route whose knot rectangles overlap is rejected"), Result.RoutedWires, 0);
+	TestEqual(TEXT("the rejected route creates no knots"), Result.CreatedKnots, 0);
+	TestTrue(
+		TEXT("the rejected route preserves the original direct link"), HasDirectLink(*Fixture.Source, *Fixture.Destination)
+	);
+	TestFalse(TEXT("the rejected route leaves the package clean"), Fixture.Graph->GetOutermost()->IsDirty());
 	return true;
 }
 
@@ -1110,7 +1257,7 @@ bool FK2RerouteMalformedDestinationFanInTest::RunTest(const FString& Parameters)
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FK2RerouteBoundaryFailureRollbackTest,
-	"Project.Unit Tests.GraphFormatter.K2Routing.BoundaryFailureRestoresExactOriginalTopology",
+	"Project.Unit Tests.GraphFormatter.K2Routing.BoundaryFailureLeavesExactOriginalTopology",
 	EAutomationTestFlags::ProductFilter | EAutomationTestFlags::EditorContext
 )
 
@@ -1142,15 +1289,15 @@ bool FK2RerouteBoundaryFailureRollbackTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("schema-rejected boundary route is skipped"), Result.SkippedWires, 1);
 	TestEqual(TEXT("failed staging leaves no generated knots"), Result.CreatedKnots, 0);
 	TestEqual(TEXT("failed staging removes every staged graph node"), Graph->Nodes.Num(), NodeCountBefore);
-	TestFalse(TEXT("last-resort normalization restores topology without a fatal error"), Result.HasFatalError());
+	TestFalse(TEXT("preflight rejection preserves topology without a fatal error"), Result.HasFatalError());
 	TestFalse(TEXT("fully restored failure leaves a previously clean package clean"), Graph->GetOutermost()->IsDirty());
 	TestEqual(TEXT("first pin has exactly one restored reference"), FirstInput->LinkedTo.Num(), 1);
 	TestEqual(TEXT("second pin has exactly one restored reference"), SecondInput->LinkedTo.Num(), 1);
 	TestTrue(TEXT("first pin references the exact original peer"), FirstInput->LinkedTo.Contains(SecondInput));
 	TestTrue(TEXT("second pin reciprocally references the exact original peer"), SecondInput->LinkedTo.Contains(FirstInput));
 	TestTrue(
-		TEXT("rollback diagnostic claims restoration only after verification"),
-		Result.Diagnostics.Num() == 1 && Result.Diagnostics[0].Contains(TEXT("restored and verified"))
+		TEXT("diagnostic confirms the original link was never replaced"),
+		Result.Diagnostics.Num() == 1 && Result.Diagnostics[0].Contains(TEXT("never replaced"))
 	);
 	return true;
 }

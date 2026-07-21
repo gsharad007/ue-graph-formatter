@@ -53,6 +53,26 @@ struct FRerouteObstacle
 	FBox2D Bounds = FBox2D(EForceInit::ForceInit);
 };
 
+struct FPlannedReroute
+{
+	FRerouteEdge Edge;
+	TArray<FVector2D> Waypoints;
+	/** Stable endpoint identities captured while planning, before any route can reconstruct a K2 pin. */
+	TWeakObjectPtr<UEdGraphNode> OutputNode;
+	TWeakObjectPtr<UEdGraphNode> InputNode;
+	FGuid OutputPinId;
+	FGuid InputPinId;
+};
+
+/** A deterministic, non-mutating routing decision that can be inspected before graph changes are committed. */
+struct FReroutePlan
+{
+	TArray<FPlannedReroute> Routes;
+	int32 SkippedWires = 0;
+	bool bPlanningBudgetExhausted = false;
+	TArray<FString> Diagnostics;
+};
+
 struct FRerouteResult
 {
 	int32 RoutedWires = 0;
@@ -107,6 +127,18 @@ public:
 	static bool FindGeneratedRoute(
 		UEdGraph& Graph, FStringView LogicalEdgeKey, TArray<UEdGraphNode*>& OutKnots, TArray<FVector2D>& OutWaypoints
 	);
+
+	/** Plans every required route without modifying graph nodes, links, metadata, transactions, or package state. */
+	static FReroutePlan Plan(
+		TConstArrayView<FRerouteEdge> Edges,
+		TConstArrayView<FRerouteObstacle> Obstacles,
+		const TSet<UEdGraphNode*>& Scope,
+		const FRerouteSettings& Settings,
+		double GridSize
+	);
+
+	/** Applies a previously inspected plan. Each failed route restores its original direct link before continuing. */
+	static FRerouteResult ApplyPlan(UEdGraph& Graph, const FReroutePlan& Plan);
 
 	static FRerouteResult Route(
 		UEdGraph& Graph,

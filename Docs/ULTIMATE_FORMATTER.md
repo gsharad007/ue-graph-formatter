@@ -259,8 +259,10 @@ read as a local group, while the execution spine remains easy to scan.
 
 ### 10. Pack components and avoid fixed nodes
 
-Preservation mode retains each event paragraph's authored root anchor and top-to-bottom order, then moves
-only a later paragraph downward when it must clear the previous paragraph plus the configured gutter.
+Preservation mode retains each event paragraph's authored root anchor and top-to-bottom order. A candidate
+that shifts a root by more than half a coarse cell in either axis is rejected rather than silently moving
+an authored paragraph hundreds of units. Within that bound, a later paragraph may move downward when it
+must clear the previous paragraph plus the configured gutter.
 It never shelf-packs authored paragraphs horizontally. Full Reflow retains deterministic shelf packing.
 For a partial selection, unselected nodes and unrelated comments are fixed obstacles. A planned paragraph
 moves as a whole to a coarse-grid-aligned clear position; the formatter does not scatter individual nodes
@@ -273,9 +275,9 @@ are resolved inside-out. Bounds include stationary original members as well as m
 configured padding and snap outward to the grid. Plans that would capture an unrelated node or create a
 new ambiguous comment overlap are rejected before mutation.
 
-Generated presentation knots should not become semantic comment contents. Full editor-level
-idempotence around newly generated knots remains an important regression test even when the pure layout
-core is already idempotent.
+Generated presentation knots do not become semantic comment contents. The real-Blueprint corpus checks
+that newly generated knots reach a first-pass fixed point in deterministic headless geometry; live Slate,
+save/reload, and nested-comment fixed points remain complementary editor-level release tests.
 
 ### 12. Optionally plan wire routes
 
@@ -294,9 +296,10 @@ The route search is deterministic:
 
 1. Seed reservations for the current wire field and existing generated routes.
 2. Remove the candidate wire's own baseline while evaluating it.
-3. Reject candidates whose rendered spline intersects a node or itself, or whose endpoint side would
-   change a single-link manual knot's tangent direction. Preserve multi-link manual-knot endpoints when
-   replacing one neighbor would make their post-install neighbor-average tangent ambiguous.
+3. Reject candidates whose rendered spline intersects a node or itself; whose knot rectangles overlap a
+   node, another knot in the candidate, or a reserved knot; or whose endpoint side would change a
+   single-link manual knot's tangent direction. Preserve multi-link manual-knot endpoints when replacing
+   one neighbor would make their post-install neighbor-average tangent ambiguous.
 4. Collect the stable identities of every wire crossed by the current baseline. Reject any candidate
    that crosses an identity outside that set; sequential replacement therefore makes the graph-wide
    crossing-pair set monotonically non-increasing.
@@ -407,6 +410,8 @@ The pure layout core has a repeated-build invariant. At the adapter boundary:
 - validated generated knot chains collapse to their real logical edges before ranking;
 - those presentation knots do not create new ranks or components;
 - an existing generated chain is repositioned from its endpoint movement rather than extended;
+- existing waypoint centers are preserved exactly when endpoints do not move, rather than being
+  re-snapped on the second pass;
 - existing routes reserve their channels on the next pass;
 - a second routing pass does not append knots to a generated chain;
 - an unchanged plan cancels its transaction.
@@ -468,6 +473,7 @@ The K2 routing tests cover:
 - maximum-knot failure preserving the direct link;
 - clear forward-wire no-op and disabled data-routing no-op;
 - narrow-corridor routing without rendered self-intersection;
+- narrow data-route rejection when the only plan would overlap generated knot rectangles;
 - deterministic generated identity and metadata;
 - competing, future-baseline, and existing-route reservations;
 - deterministic direct/direct crossing triggers, execution-over-data priority, and shared-terminal
@@ -480,7 +486,8 @@ The K2 routing tests cover:
 - bounded, insertion-order-independent planning-budget exhaustion;
 - layout-core preferred waypoints and straight-hint no-op;
 - malformed destination fan-in rejection;
-- exact rollback after a boundary-connection failure.
+- exact rollback after a boundary-connection failure;
+- planned-pin reconstruction between planning and application, resolved through stable node/pin identity.
 
 From the Labrador repository root, run the focused automation filter through the project task wrapper:
 
@@ -491,10 +498,13 @@ python Tools\Analysis\task_cli.py test --filter "Project.Unit Tests.GraphFormatt
 Builds, tests, and editor validation should use the `labrador` MCP/task wrapper so an Unreal process that
 exits zero with failed automation is not reported as a pass.
 
-### Required visual regression corpus
+### Authored Blueprint and visual regression corpus
 
-Algorithm tests are necessary but cannot judge “looks human.” A release-quality corpus should include
-real saved Blueprints with:
+The implemented [authored Blueprint regression corpus](BLUEPRINT_CORPUS.md) formats transient copies of
+11 frequently/recently edited production Blueprints. It enforces exact topology, source immutability,
+bounded root/movement preservation, non-regressing readability metrics, routed logical endpoints, and
+second-pass stability. Algorithm and headless asset tests still cannot completely judge “looks human,”
+so the complementary screenshot/Slate-geometry corpus should cover:
 
 - a linear event flow with differently sized nodes;
 - `Branch`, `Sequence`, switch, gate, multi-gate, and loop motifs;
@@ -526,11 +536,11 @@ screenshot or geometry manifest proves the visual result.
 | Straight primary execution links | Track ratio and prevent corpus regressions. |
 | Backward execution/data links | Never introduce backward execution; reject material backward-data regressions. |
 | Authored horizontal spacing | Expand gaps required by configured gutters, propagate that expansion, and never consume a later generous adjacent-rank gap. |
-| Authored event roots | Limit X/upward drift to coarse-grid snap tolerance and never invert top-to-bottom order. |
+| Authored event roots | Limit drift in both axes to coarse-grid snap tolerance and never invert top-to-bottom order. |
 | Unrouted wire/node intersections | Reject newly introduced rendered-spline intersections before mutation; evaluate direct and generated routes with the same flattened Kismet curve model. |
 | Rendered wire crossings | The pre-mutation layout gate permits no new execution or data crossing-pair identity, including equal-count substitutions; every installed reroute is additionally crossing-pair monotonic against the complete reserved wire field. |
 | Wire/node intersections | Zero for accepted generated routes under the stock Kismet policy. |
-| Bends and generated knots | Minimize after safety/crossings; enforce configured per-wire cap. |
+| Bends and generated knots | Minimize after safety/crossings; enforce the per-wire cap and reject node/knot-box overlap. |
 | Determinism | Identical plan across snapshot insertion permutations. |
 | Idempotence | Second pass produces zero node/comment/knot changes once geometry is stable. |
 | Undo/redo | One operation restores/reapplies exact positions, bounds, and topology. |

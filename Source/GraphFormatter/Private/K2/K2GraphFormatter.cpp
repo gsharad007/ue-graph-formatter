@@ -125,7 +125,7 @@ struct FReadabilityMetrics
 	TSet<FString> ExecutionWireCrossings;
 	TSet<FString> DataWireCrossings;
 	double MaximumExecutionRootHorizontalDrift = 0.0;
-	double MaximumExecutionRootUpwardDrift = 0.0;
+	double MaximumExecutionRootVerticalDrift = 0.0;
 	int32 ExecutionRootOrderInversionCount = 0;
 	bool bWorkBudgetExhausted = false;
 };
@@ -482,13 +482,11 @@ void MeasureWireReadability(
 
 		TArray<FVector2D> LogicalPoints;
 		LogicalPoints.Add(OutputAnchor);
-		if (Edge.bExistingGeneratedRoute)
+		if (bUsePlannedRoutes && !Edge.PlannedRouteWaypoints.IsEmpty())
 		{
-			const TArray<FVector2D>& RouteWaypoints = bUsePlannedRoutes && !Edge.PlannedRouteWaypoints.IsEmpty()
-														? Edge.PlannedRouteWaypoints
-														: Edge.ExistingRouteWaypoints;
-			LogicalPoints.Append(RouteWaypoints);
+			LogicalPoints.Append(Edge.PlannedRouteWaypoints);
 		}
+		else if (Edge.bExistingGeneratedRoute) { LogicalPoints.Append(Edge.ExistingRouteWaypoints); }
 		LogicalPoints.Add(InputAnchor);
 		FMeasuredWirePath& Path = WirePaths.AddDefaulted_GetRef();
 		Path.Key = Edge.Key;
@@ -671,8 +669,9 @@ void MeasureExecutionRootMovement(
 		OutMetrics.MaximumExecutionRootHorizontalDrift = FMath::Max(
 			OutMetrics.MaximumExecutionRootHorizontalDrift, FMath::Abs(OriginalPosition->X - CandidatePosition->X)
 		);
-		OutMetrics.MaximumExecutionRootUpwardDrift =
-			FMath::Max(OutMetrics.MaximumExecutionRootUpwardDrift, OriginalPosition->Y - CandidatePosition->Y);
+		OutMetrics.MaximumExecutionRootVerticalDrift = FMath::Max(
+			OutMetrics.MaximumExecutionRootVerticalDrift, FMath::Abs(OriginalPosition->Y - CandidatePosition->Y)
+		);
 	}
 
 	const TArray<UEdGraphNode*> OrderedExecutionRoots = ExecutionRoots.Array();
@@ -755,9 +754,10 @@ FString FindHardReadabilityRegression(
 [[nodiscard]]
 FString FindWireThroughNodeRegression(const FReadabilityMetrics& Original, const FReadabilityMetrics& Candidate)
 {
-	if (ContainsNewKey(Candidate.WiresThroughNodes, Original.WiresThroughNodes))
+	const int32 AllowedIncrease = FMath::Max(1, Original.WiresThroughNodes.Num() / 4);
+	if (Candidate.WiresThroughNodes.Num() > Original.WiresThroughNodes.Num() + AllowedIncrease)
 	{
-		return TEXT("the candidate introduces a wire that passes through another node");
+		return TEXT("the candidate makes materially more wires pass through nodes");
 	}
 	return FString();
 }
@@ -779,9 +779,10 @@ FString FindBackwardDataRegression(const FReadabilityMetrics& Original, const FR
 [[nodiscard]]
 FString FindDataCrossingRegression(const FReadabilityMetrics& Original, const FReadabilityMetrics& Candidate)
 {
-	if (ContainsNewKey(Candidate.DataWireCrossings, Original.DataWireCrossings))
+	const int32 AllowedIncrease = FMath::Max(1, Original.DataWireCrossings.Num() / 4);
+	if (Candidate.DataWireCrossings.Num() > Original.DataWireCrossings.Num() + AllowedIncrease)
 	{
-		return TEXT("the candidate introduces a new data-wire crossing pair");
+		return TEXT("the candidate introduces materially more data-wire crossings");
 	}
 	return FString();
 }
@@ -794,13 +795,72 @@ FString FindRootPreservationRegression(const FReadabilityMetrics& Candidate, con
 	{
 		return TEXT("the candidate moves an execution graph start horizontally beyond coarse-grid snapping");
 	}
-	if (Candidate.MaximumExecutionRootUpwardDrift > SnapTolerance)
+	if (Candidate.MaximumExecutionRootVerticalDrift > SnapTolerance)
 	{
-		return TEXT("the candidate moves an execution graph start upward beyond coarse-grid snapping");
+		return TEXT("the candidate moves an execution graph start vertically beyond coarse-grid snapping");
 	}
 	if (Candidate.ExecutionRootOrderInversionCount > 0)
 	{
 		return TEXT("the candidate changes the authored top-to-bottom order of execution graph starts");
+	}
+	return FString();
+}
+
+[[nodiscard]]
+bool HasMaterialReadabilityImprovement(
+	const FReadabilityMetrics& Original, const FReadabilityMetrics& Candidate, const double LayoutCellSize
+)
+{
+	return Candidate.OverlapPairCount < Original.OverlapPairCount
+		|| Candidate.BackwardExecutionEdgeCount < Original.BackwardExecutionEdgeCount
+		|| Candidate.BackwardExecutionDistance + LayoutCellSize < Original.BackwardExecutionDistance
+		|| Candidate.NonStraightPreferredExecutionEdgeCount < Original.NonStraightPreferredExecutionEdgeCount
+		|| Candidate.PreferredExecutionVerticalError + LayoutCellSize < Original.PreferredExecutionVerticalError
+		|| Candidate.BackwardDataEdgeCount < Original.BackwardDataEdgeCount
+		|| Candidate.BackwardDataDistance + LayoutCellSize < Original.BackwardDataDistance
+		|| Candidate.WiresThroughNodes.Num() < Original.WiresThroughNodes.Num()
+		|| Candidate.ExecutionWireCrossings.Num() < Original.ExecutionWireCrossings.Num()
+		|| Candidate.DataWireCrossings.Num() < Original.DataWireCrossings.Num();
+}
+
+[[nodiscard]]
+FString FindAuthoredMovementRegression(
+	TConstArrayView<FAdapterNodeRecord> Nodes,
+	const TMap<UEdGraphNode*, FVector2D>& CandidatePositions,
+	const FReadabilityMetrics& OriginalReadability,
+	const FReadabilityMetrics& CandidateReadability,
+	const double LayoutCellSize
+)
+{
+	int32 LargeMovementCount = 0;
+	for (const FAdapterNodeRecord& Node : Nodes)
+	{
+		const FVector2D* CandidatePosition = CandidatePositions.Find(Node.Node);
+		if (CandidatePosition != nullptr
+			&& FVector2D::Distance(Node.OriginalPosition, *CandidatePosition) > LayoutCellSize + ReadabilityEpsilon)
+		{
+			++LargeMovementCount;
+		}
+	}
+	if (LargeMovementCount == 0) { return FString(); }
+
+	const bool bReadabilityImproved =
+		HasMaterialReadabilityImprovement(OriginalReadability, CandidateReadability, LayoutCellSize);
+	// Preserve mode is deliberately conservative. A small graph may move up to three helper nodes
+	// when that straightens execution or removes a concrete readability defect. Larger authored
+	// paragraphs must retain most of their mental map; a broad canonical redraw belongs to Reflow.
+	const int32 AllowedLargeMovementCount = bReadabilityImproved
+											  ? FMath::Max(3, FMath::FloorToInt(static_cast<double>(Nodes.Num()) * 0.65))
+											  : FMath::Max(1, FMath::FloorToInt(static_cast<double>(Nodes.Num()) * 0.35));
+	if (LargeMovementCount > AllowedLargeMovementCount)
+	{
+		return FString::Printf(
+			TEXT("the candidate moves %d of %d authored nodes beyond one %.0f-unit layout cell%s"),
+			LargeMovementCount,
+			Nodes.Num(),
+			LayoutCellSize,
+			bReadabilityImproved ? TEXT(" despite its readability gain") : TEXT(" without a material readability gain")
+		);
 	}
 	return FString();
 }
@@ -982,6 +1042,25 @@ FK2FormatResult FK2GraphFormatter::Format(
 	const bool bRouteWires,
 	const UFormatterSettings& Settings
 )
+{ return FormatInternal(&GraphEditor, Graph, Geometry, Scope, bRouteWires, Settings); }
+
+FK2FormatResult FK2GraphFormatter::Format(
+	UEdGraph& Graph,
+	const FGraphGeometrySnapshot& Geometry,
+	const TSet<UEdGraphNode*>& Scope,
+	const bool bRouteWires,
+	const UFormatterSettings& Settings
+)
+{ return FormatInternal(nullptr, Graph, Geometry, Scope, bRouteWires, Settings); }
+
+FK2FormatResult FK2GraphFormatter::FormatInternal(
+	SGraphEditor* GraphEditor,
+	UEdGraph& Graph,
+	const FGraphGeometrySnapshot& Geometry,
+	const TSet<UEdGraphNode*>& Scope,
+	const bool bRouteWires,
+	const UFormatterSettings& Settings
+)
 {
 	FK2FormatResult Result;
 	if (!CanFormat(Graph, Scope))
@@ -1005,9 +1084,15 @@ FK2FormatResult FK2GraphFormatter::Format(
 	}
 
 	TSet<UEdGraphNode*> OriginalSelection;
-	for (UObject* SelectedObject : GraphEditor.GetSelectedNodes())
+	if (GraphEditor != nullptr)
 	{
-		if (UEdGraphNode* SelectedNode = Cast<UEdGraphNode>(SelectedObject)) { OriginalSelection.Add(SelectedNode); }
+		for (UObject* SelectedObject : GraphEditor->GetSelectedNodes())
+		{
+			if (UEdGraphNode* SelectedNode = Cast<UEdGraphNode>(SelectedObject))
+			{
+				OriginalSelection.Add(SelectedNode);
+			}
+		}
 	}
 
 	// Treat generated reroutes as presentation artifacts only after validating the complete maximal
@@ -1849,9 +1934,14 @@ FK2FormatResult FK2GraphFormatter::Format(
 			const FVector2D CenterOffset = Edge.ExistingRouteWaypoints[KnotIndex] - OriginalKnotTopLeft;
 			const double Alpha = static_cast<double>(KnotIndex + 1)
 							   / static_cast<double>(Edge.ExistingGeneratedKnots.Num() + 1);
-			FVector2D PlannedCenter = Edge.ExistingRouteWaypoints[KnotIndex] + FMath::Lerp(OutputDelta, InputDelta, Alpha);
-			PlannedCenter.X = FMath::GridSnap(PlannedCenter.X, GridSize);
-			PlannedCenter.Y = FMath::GridSnap(PlannedCenter.Y, GridSize);
+			const FVector2D InterpolatedDelta = FMath::Lerp(OutputDelta, InputDelta, Alpha);
+			// Preserve the router's exact first-pass waypoint. Snapping the absolute center here can
+			// shift an already valid knot on pass two when an endpoint-aligned channel is intentionally
+			// off the editor's fine grid. Snap only the displacement caused by endpoint movement.
+			const FVector2D SnappedDelta(
+				FMath::GridSnap(InterpolatedDelta.X, GridSize), FMath::GridSnap(InterpolatedDelta.Y, GridSize)
+			);
+			const FVector2D PlannedCenter = Edge.ExistingRouteWaypoints[KnotIndex] + SnappedDelta;
 			const FVector2D UnroundedKnotTopLeft = PlannedCenter - CenterOffset;
 			const FVector2D PlannedKnotTopLeft{
 				static_cast<double>(FMath::RoundToInt(UnroundedKnotTopLeft.X)),
@@ -1926,9 +2016,16 @@ FK2FormatResult FK2GraphFormatter::Format(
 			ReadabilityNodeRecords, OriginalNodePositions, CandidateReadabilityPositions, CandidateReadability
 		);
 	}
-	const FString ReadabilityRegression =
+	FString ReadabilityRegression =
 		FindReadabilityRegression(OriginalReadability, CandidateReadability, LayoutCellSize, bPreserveHumanLayout);
-	if (!ReadabilityRegression.IsEmpty())
+	const FString AuthoredMovementRegression =
+		bPreserveHumanLayout
+			? FindAuthoredMovementRegression(
+				  NodeRecords, CandidateReadabilityPositions, OriginalReadability, CandidateReadability, LayoutCellSize
+			  )
+			: FString();
+	if (ReadabilityRegression.IsEmpty()) { ReadabilityRegression = AuthoredMovementRegression; }
+	if (!ReadabilityRegression.IsEmpty() && !bRouteWires)
 	{
 		Result.Status = EK2FormatStatus::NoChanges;
 		Result.Message = TEXT("The readability safety gate kept the authored graph unchanged.");
@@ -2142,6 +2239,7 @@ FK2FormatResult FK2GraphFormatter::Format(
 
 	TArray<FRerouteEdge> RerouteEdges;
 	TArray<FRerouteObstacle> RerouteObstacles;
+	FReroutePlan ReroutePlan;
 	if (bRouteWires)
 	{
 		// Seed routing with the complete graph-wide wire field used by the readability gate.
@@ -2283,6 +2381,55 @@ FK2FormatResult FK2GraphFormatter::Format(
 		}
 	}
 
+	if (bRouteWires)
+	{
+		FRerouteSettings RerouteSettings;
+		RerouteSettings.ObstacleClearance = static_cast<double>(Settings.K2ObstacleClearance);
+		RerouteSettings.ChannelSpacing = static_cast<double>(Settings.K2RoutingChannelSpacing);
+		RerouteSettings.MaxKnotsPerWire = Settings.K2MaxGeneratedKnots;
+		RerouteSettings.LongDataWireRankThreshold = Settings.K2LongDataWireRankThreshold;
+		RerouteSettings.PlanningWorkBudget = Settings.K2RoutingPlanningWorkBudget;
+		RerouteSettings.bRouteDataWires = Settings.bRouteDataWires;
+		ReroutePlan = FK2RerouteRouter::Plan(RerouteEdges, RerouteObstacles, Scope, RerouteSettings, GridSize);
+		for (const FPlannedReroute& PlannedRoute : ReroutePlan.Routes)
+		{
+			FAdapterEdgeRecord* ReadabilityEdge =
+				ReadabilityEdgeRecords.FindByPredicate([&PlannedRoute](const FAdapterEdgeRecord& Edge)
+													   { return Edge.Key == PlannedRoute.Edge.StableKey; });
+			if (ReadabilityEdge != nullptr) { ReadabilityEdge->PlannedRouteWaypoints = PlannedRoute.Waypoints; }
+		}
+
+		CandidateReadability = MeasureReadability(
+			ReadabilityNodeRecords,
+			ReadabilityEdgeRecords,
+			PinRecords,
+			CandidateReadabilityPositions,
+			Settings.K2RoutingPlanningWorkBudget,
+			true
+		);
+		if (!OriginalReadability.bWorkBudgetExhausted && !CandidateReadability.bWorkBudgetExhausted)
+		{
+			MeasureExecutionRootMovement(
+				ReadabilityNodeRecords, OriginalNodePositions, CandidateReadabilityPositions, CandidateReadability
+			);
+		}
+		ReadabilityRegression =
+			FindReadabilityRegression(OriginalReadability, CandidateReadability, LayoutCellSize, bPreserveHumanLayout);
+		// Routing may improve a wire without justifying a broad redraw of the authored node layout.
+		// Keep the movement decision made against the node-layout candidate independent of the later
+		// best-effort reroute plan.
+		if (ReadabilityRegression.IsEmpty()) { ReadabilityRegression = AuthoredMovementRegression; }
+		if (!ReadabilityRegression.IsEmpty())
+		{
+			Result.Status = EK2FormatStatus::NoChanges;
+			Result.Message =
+				TEXT("The readability safety gate kept the authored graph unchanged after routing was planned.");
+			Result.Diagnostics.Append(ReroutePlan.Diagnostics);
+			Result.Diagnostics.Add(FString::Printf(TEXT("Rejected routed layout because %s."), *ReadabilityRegression));
+			return Result;
+		}
+	}
+
 	if (NodeChanges.IsEmpty() && CommentChanges.IsEmpty() && !bRouteWires)
 	{
 		Result.Status = EK2FormatStatus::NoChanges;
@@ -2317,14 +2464,7 @@ FK2FormatResult FK2GraphFormatter::Format(
 	FRerouteResult RerouteResult;
 	if (bRouteWires)
 	{
-		FRerouteSettings RerouteSettings;
-		RerouteSettings.ObstacleClearance = static_cast<double>(Settings.K2ObstacleClearance);
-		RerouteSettings.ChannelSpacing = static_cast<double>(Settings.K2RoutingChannelSpacing);
-		RerouteSettings.MaxKnotsPerWire = Settings.K2MaxGeneratedKnots;
-		RerouteSettings.LongDataWireRankThreshold = Settings.K2LongDataWireRankThreshold;
-		RerouteSettings.PlanningWorkBudget = Settings.K2RoutingPlanningWorkBudget;
-		RerouteSettings.bRouteDataWires = Settings.bRouteDataWires;
-		RerouteResult = FK2RerouteRouter::Route(Graph, RerouteEdges, RerouteObstacles, Scope, RerouteSettings, GridSize);
+		RerouteResult = FK2RerouteRouter::ApplyPlan(Graph, ReroutePlan);
 		Result.RoutedWireCount = RerouteResult.RoutedWires;
 		Result.CreatedKnotCount = RerouteResult.CreatedKnots;
 		Result.SkippedRerouteWireCount = RerouteResult.SkippedWires;
@@ -2340,7 +2480,7 @@ FK2FormatResult FK2GraphFormatter::Format(
 		Result.Status = EK2FormatStatus::NoChanges;
 		Result.Message = bRouteWires ? TEXT("The graph is already formatted and no wires required safe rerouting.")
 									 : TEXT("The graph is already formatted.");
-		RestoreSelection(GraphEditor, OriginalSelection);
+		if (GraphEditor != nullptr) { RestoreSelection(*GraphEditor, OriginalSelection); }
 		return Result;
 	}
 
@@ -2353,7 +2493,7 @@ FK2FormatResult FK2GraphFormatter::Format(
 		Graph.MarkPackageDirty();
 	}
 	Graph.NotifyGraphChanged();
-	RestoreSelection(GraphEditor, OriginalSelection);
+	if (GraphEditor != nullptr) { RestoreSelection(*GraphEditor, OriginalSelection); }
 	if (RerouteResult.HasFatalError())
 	{
 		// Keep the outer transaction: if Unreal ever rejects both schema restoration and the

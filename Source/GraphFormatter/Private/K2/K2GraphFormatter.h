@@ -57,5 +57,30 @@ public:
 		bool bRouteWires,
 		const UFormatterSettings& Settings
 	);
+
+	/**
+	 * Formats a graph without an attached Slate editor. This is intended for commandlets and
+	 * transient automation-test copies; it performs the same atomic layout work but has no
+	 * editor selection to preserve.
+	 */
+	[[nodiscard]]
+	static FK2FormatResult Format(
+		UEdGraph& Graph,
+		const FGraphGeometrySnapshot& Geometry,
+		const TSet<UEdGraphNode*>& Scope,
+		bool bRouteWires,
+		const UFormatterSettings& Settings
+	);
+
+private:
+	[[nodiscard]]
+	static FK2FormatResult FormatInternal(
+		SGraphEditor* GraphEditor,
+		UEdGraph& Graph,
+		const FGraphGeometrySnapshot& Geometry,
+		const TSet<UEdGraphNode*>& Scope,
+		bool bRouteWires,
+		const UFormatterSettings& Settings
+	);
 };
 } // namespace GraphFormatter::K2

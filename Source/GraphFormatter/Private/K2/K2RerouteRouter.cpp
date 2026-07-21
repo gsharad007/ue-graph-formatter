@@ -190,6 +190,12 @@ FBox2D MakeKnotBounds(const FVector2D& Center)
 	return FBox2D(Center - Extent, Center + Extent);
 }
 
+bool BoxesOverlapWithPositiveArea(const FBox2D& First, const FBox2D& Second)
+{
+	return First.bIsValid && Second.bIsValid && First.Min.X < Second.Max.X && Second.Min.X < First.Max.X
+		&& First.Min.Y < Second.Max.Y && Second.Min.Y < First.Max.Y;
+}
+
 double Cross2D(const FVector2D& Left, const FVector2D& Right) { return Left.X * Right.Y - Left.Y * Right.X; }
 
 FSegmentInteraction GetSegmentInteraction(
@@ -430,6 +436,44 @@ FReservedRoute MakeReservation(const FRerouteEdge& Edge, TConstArrayView<FVector
 	Reservation.KnotBounds = MoveTemp(Geometry.KnotBounds);
 	Reservation.Bounds = Geometry.RenderedBounds;
 	return Reservation;
+}
+
+bool CandidateKnotBoundsCollide(
+	const FRouteGeometry& Candidate,
+	TConstArrayView<FRerouteObstacle> Obstacles,
+	TConstArrayView<FReservedRoute> ReservedRoutes,
+	FRoutePlanningBudget& Budget
+)
+{
+	for (int32 FirstIndex = 0; FirstIndex < Candidate.KnotBounds.Num(); ++FirstIndex)
+	{
+		for (int32 SecondIndex = FirstIndex + 1; SecondIndex < Candidate.KnotBounds.Num(); ++SecondIndex)
+		{
+			if (!Budget.TryConsume()) { return false; }
+			if (BoxesOverlapWithPositiveArea(Candidate.KnotBounds[FirstIndex], Candidate.KnotBounds[SecondIndex]))
+			{
+				return true;
+			}
+		}
+	}
+
+	for (const FBox2D& CandidateKnot : Candidate.KnotBounds)
+	{
+		for (const FRerouteObstacle& Obstacle : Obstacles)
+		{
+			if (!Budget.TryConsume()) { return false; }
+			if (BoxesOverlapWithPositiveArea(CandidateKnot, Obstacle.Bounds)) { return true; }
+		}
+		for (const FReservedRoute& Reserved : ReservedRoutes)
+		{
+			for (const FBox2D& ReservedKnot : Reserved.KnotBounds)
+			{
+				if (!Budget.TryConsume()) { return false; }
+				if (BoxesOverlapWithPositiveArea(CandidateKnot, ReservedKnot)) { return true; }
+			}
+		}
+	}
+	return false;
 }
 
 bool RenderedPolylineIntersectsAnyObstacle(
@@ -783,6 +827,7 @@ TArray<FVector2D> BuildRoute(
 		const FRouteGeometry CandidateGeometry =
 			MakeRouteGeometry(Candidate, Edge.bReverseOutputTangent, Edge.bReverseInputTangent);
 		if (RenderedPolylineSelfIntersects(CandidateGeometry, Budget) || Budget.bExhausted
+			|| CandidateKnotBoundsCollide(CandidateGeometry, Obstacles, ReservedRoutes, Budget) || Budget.bExhausted
 			|| RenderedPolylineIntersectsAnyObstacle(
 				CandidateGeometry,
 				Candidate,
@@ -913,6 +958,7 @@ FGuid MakeDeterministicGuid(const FString& StableKey, const int32 WaypointIndex,
 
 bool HasExactMutualLink(const UEdGraphPin& First, const UEdGraphPin& Second)
 {
+	if (First.WasTrashed() || Second.WasTrashed()) { return false; }
 	int32 ForwardReferences = 0;
 	for (const UEdGraphPin* LinkedPin : First.LinkedTo)
 	{
@@ -924,6 +970,34 @@ bool HasExactMutualLink(const UEdGraphPin& First, const UEdGraphPin& Second)
 		if (LinkedPin == &First) { ++ReverseReferences; }
 	}
 	return ForwardReferences == 1 && ReverseReferences == 1;
+}
+
+UEdGraphPin* ResolveLivePin(const TWeakObjectPtr<UEdGraphNode>& Node, const FGuid& PinId)
+{
+	UEdGraphNode* LiveNode = Node.Get();
+	if (LiveNode == nullptr || !PinId.IsValid()) { return nullptr; }
+	for (UEdGraphPin* Pin : LiveNode->Pins)
+	{
+		if (Pin != nullptr && !Pin->WasTrashed() && Pin->GetOwningNodeUnchecked() == LiveNode && Pin->PinId == PinId)
+		{
+			return Pin;
+		}
+	}
+	return nullptr;
+}
+
+bool CanStageDirectConnection(
+	const UEdGraphSchema_K2& Schema,
+	UEdGraphPin& First,
+	UEdGraphPin& Second,
+	const bool bMayReplaceSecondPinLink,
+	ECanCreateConnectionResponse* OutResponse = nullptr
+)
+{
+	const FPinConnectionResponse Response = Schema.CanCreateConnection(&First, &Second);
+	if (OutResponse != nullptr) { *OutResponse = Response.Response.GetValue(); }
+	return Response.Response == CONNECT_RESPONSE_MAKE
+		|| (bMayReplaceSecondPinLink && Response.Response == CONNECT_RESPONSE_BREAK_OTHERS_B);
 }
 
 void RemoveFailedKnots(UEdGraph& Graph, TArray<UK2Node_Knot*>& Knots)
@@ -939,23 +1013,28 @@ void RemoveFailedKnots(UEdGraph& Graph, TArray<UK2Node_Knot*>& Knots)
 }
 
 bool RestoreOriginalDirectLink(
-	UEdGraph& Graph, const UEdGraphSchema_K2& Schema, UEdGraphPin& OutputPin, UEdGraphPin& InputPin, TArray<UK2Node_Knot*>& FailedKnots
+	UEdGraph& Graph,
+	const TWeakObjectPtr<UEdGraphNode>& OutputNode,
+	const FGuid& OutputPinId,
+	const TWeakObjectPtr<UEdGraphNode>& InputNode,
+	const FGuid& InputPinId,
+	TArray<UK2Node_Knot*>& FailedKnots
 )
 {
 	RemoveFailedKnots(Graph, FailedKnots);
-	if (HasExactMutualLink(OutputPin, InputPin)) { return true; }
-
-	Schema.UEdGraphSchema::TryCreateConnection(&OutputPin, &InputPin);
-	if (HasExactMutualLink(OutputPin, InputPin)) { return true; }
+	UEdGraphPin* OutputPin = ResolveLivePin(OutputNode, OutputPinId);
+	UEdGraphPin* InputPin = ResolveLivePin(InputNode, InputPinId);
+	if (OutputPin == nullptr || InputPin == nullptr) { return false; }
+	if (HasExactMutualLink(*OutputPin, *InputPin)) { return true; }
 
 	// This exact relationship was valid immediately before replacement. Normalize any asymmetric
 	// residue as a last resort rather than leaving a Blueprint with silently corrupted topology.
-	OutputPin.Modify(false);
-	InputPin.Modify(false);
-	OutputPin.LinkedTo.Remove(&InputPin);
-	InputPin.LinkedTo.Remove(&OutputPin);
-	OutputPin.MakeLinkTo(&InputPin, false);
-	return HasExactMutualLink(OutputPin, InputPin);
+	OutputPin->Modify(false);
+	InputPin->Modify(false);
+	OutputPin->LinkedTo.Remove(InputPin);
+	InputPin->LinkedTo.Remove(OutputPin);
+	OutputPin->MakeLinkTo(InputPin, false);
+	return HasExactMutualLink(*OutputPin, *InputPin);
 }
 
 UK2Node_Knot* CreateTransactionNeutralKnot(UEdGraph& Graph, const FVector2D& TopLeft)
@@ -976,25 +1055,30 @@ UK2Node_Knot* CreateTransactionNeutralKnot(UEdGraph& Graph, const FVector2D& Top
 bool InstallRoute(
 	UEdGraph& Graph,
 	const UEdGraphSchema_K2& Schema,
-	const FRerouteEdge& Edge,
-	TConstArrayView<FVector2D> Waypoints,
+	const FPlannedReroute& PlannedRoute,
 	TArray<UK2Node_Knot*>& OutKnots,
 	FString& OutFailure,
 	bool& bOutTopologyRestorationFailed
 )
 {
+	const FRerouteEdge& Edge = PlannedRoute.Edge;
+	const TConstArrayView<FVector2D> Waypoints = PlannedRoute.Waypoints;
 	bOutTopologyRestorationFailed = false;
 	const bool bPackageWasDirty = Graph.GetOutermost()->IsDirty();
 	const auto RestoreCleanPackageAfterFailure = [&Graph, bPackageWasDirty]()
 	{
 		if (!bPackageWasDirty) { Graph.GetOutermost()->SetDirtyFlag(false); }
 	};
-	if (!Edge.OutputPin || !Edge.InputPin || Edge.InputPin->LinkedTo.Num() != 1
-		|| !HasExactMutualLink(*Edge.OutputPin, *Edge.InputPin))
+	UEdGraphPin* OutputPin = ResolveLivePin(PlannedRoute.OutputNode, PlannedRoute.OutputPinId);
+	UEdGraphPin* InputPin = ResolveLivePin(PlannedRoute.InputNode, PlannedRoute.InputPinId);
+	if (OutputPin == nullptr || InputPin == nullptr || InputPin->LinkedTo.Num() != 1
+		|| !HasExactMutualLink(*OutputPin, *InputPin))
 	{
 		OutFailure = TEXT("The original exclusive-input, exact reciprocal direct link no longer exists.");
 		return false;
 	}
+	const FEdGraphPinType RoutePinType =
+		OutputPin->PinType.PinCategory != UEdGraphSchema_K2::PC_Wildcard ? OutputPin->PinType : InputPin->PinType;
 
 	OutKnots.Reserve(Waypoints.Num());
 	for (int32 Index = 0; Index < Waypoints.Num(); ++Index)
@@ -1009,39 +1093,109 @@ bool InstallRoute(
 			return false;
 		}
 		Knot->NodeGuid = MakeDeterministicGuid(Edge.StableKey, Index, Graph);
+		Knot->GetInputPin()->PinType = RoutePinType;
+		Knot->GetOutputPin()->PinType = RoutePinType;
 		OutKnots.Add(Knot);
 	}
 
+	ECanCreateConnectionResponse SourceResponse = CONNECT_RESPONSE_DISALLOW;
+	ECanCreateConnectionResponse DestinationResponse = CONNECT_RESPONSE_DISALLOW;
+	const bool bCanStageSource =
+		CanStageDirectConnection(Schema, *OutputPin, *OutKnots[0]->GetInputPin(), false, &SourceResponse);
+	const bool bCanStageDestination =
+		CanStageDirectConnection(Schema, *OutKnots.Last()->GetOutputPin(), *InputPin, true, &DestinationResponse);
+	if (!bCanStageSource || !bCanStageDestination)
+	{
+		OutFailure = FString::Printf(
+			TEXT(
+				"The K2 schema rejected a staged boundary connection (source response %d, destination response %d); "
+				"the exact original direct link was never replaced."
+			),
+			static_cast<int32>(SourceResponse),
+			static_cast<int32>(DestinationResponse)
+		);
+		RemoveFailedKnots(Graph, OutKnots);
+		RestoreCleanPackageAfterFailure();
+		return false;
+	}
 	for (int32 Index = 1; Index < OutKnots.Num(); ++Index)
 	{
-		if (!Schema.UEdGraphSchema::TryCreateConnection(OutKnots[Index - 1]->GetOutputPin(), OutKnots[Index]->GetInputPin()))
+		ECanCreateConnectionResponse InternalResponse = CONNECT_RESPONSE_DISALLOW;
+		if (!CanStageDirectConnection(
+				Schema, *OutKnots[Index - 1]->GetOutputPin(), *OutKnots[Index]->GetInputPin(), false, &InternalResponse
+			))
 		{
-			OutFailure = TEXT("The K2 schema rejected an internal knot connection.");
+			OutFailure = FString::Printf(
+				TEXT("The K2 schema rejected staged internal knot connection %d (response %d); the original link was never replaced."),
+				Index - 1,
+				static_cast<int32>(InternalResponse)
+			);
 			RemoveFailedKnots(Graph, OutKnots);
 			RestoreCleanPackageAfterFailure();
 			return false;
 		}
 	}
 
-	Schema.UEdGraphSchema::BreakSinglePinLink(Edge.OutputPin, Edge.InputPin);
-	const bool bSourceConnected = Schema.UEdGraphSchema::TryCreateConnection(Edge.OutputPin, OutKnots[0]->GetInputPin());
-	const bool bDestinationConnected =
-		bSourceConnected && Schema.UEdGraphSchema::TryCreateConnection(OutKnots.Last()->GetOutputPin(), Edge.InputPin);
-	if (!bDestinationConnected)
+	// Replace the direct link as one complete topology edit. Broadcasting a temporary disconnect here
+	// can reconstruct wildcard/dynamic K2 pins before the replacement chain exists.
+	OutputPin->BreakLinkTo(InputPin, false);
+	OutputPin->MakeLinkTo(OutKnots[0]->GetInputPin(), false);
+	for (int32 Index = 1; Index < OutKnots.Num(); ++Index)
 	{
-		const bool bRestored = RestoreOriginalDirectLink(Graph, Schema, *Edge.OutputPin, *Edge.InputPin, OutKnots);
-		bOutTopologyRestorationFailed = !bRestored;
-		OutFailure =
-			bRestored
-				? TEXT("The K2 schema rejected a boundary knot connection; the exact original direct link was restored and verified.")
-				: TEXT("FATAL topology-safety failure: the K2 schema rejected a boundary knot connection and the exact original direct link could not be restored.");
-		if (bRestored) { RestoreCleanPackageAfterFailure(); }
-		return false;
+		OutKnots[Index - 1]->GetOutputPin()->MakeLinkTo(OutKnots[Index]->GetInputPin(), false);
 	}
+	OutKnots.Last()->GetOutputPin()->MakeLinkTo(InputPin, false);
 
 	for (UK2Node_Knot* Knot : OutKnots)
 	{
 		Knot->PostReconstructNode();
+	}
+	if (UEdGraphPin* LiveOutputPin = ResolveLivePin(PlannedRoute.OutputNode, PlannedRoute.OutputPinId))
+	{
+		LiveOutputPin->GetOwningNode()->PinConnectionListChanged(LiveOutputPin);
+	}
+	if (UEdGraphPin* LiveInputPin = ResolveLivePin(PlannedRoute.InputNode, PlannedRoute.InputPinId))
+	{
+		LiveInputPin->GetOwningNode()->PinConnectionListChanged(LiveInputPin);
+	}
+
+	OutputPin = ResolveLivePin(PlannedRoute.OutputNode, PlannedRoute.OutputPinId);
+	InputPin = ResolveLivePin(PlannedRoute.InputNode, PlannedRoute.InputPinId);
+	bool bInternalChainInstalled = true;
+	for (int32 Index = 1; Index < OutKnots.Num(); ++Index)
+	{
+		bInternalChainInstalled &=
+			HasExactMutualLink(*OutKnots[Index - 1]->GetOutputPin(), *OutKnots[Index]->GetInputPin());
+	}
+	const bool bInstalled = OutputPin != nullptr && InputPin != nullptr
+						 && HasExactMutualLink(*OutputPin, *OutKnots[0]->GetInputPin()) && bInternalChainInstalled
+						 && HasExactMutualLink(*OutKnots.Last()->GetOutputPin(), *InputPin)
+						 && InputPin->LinkedTo.Num() == 1;
+	if (!bInstalled)
+	{
+		const FString VerificationFailure = FString::Printf(
+			TEXT("live-output=%d live-input=%d internal-chain=%d input-link-count=%d"),
+			OutputPin != nullptr,
+			InputPin != nullptr,
+			bInternalChainInstalled,
+			InputPin != nullptr ? InputPin->LinkedTo.Num() : INDEX_NONE
+		);
+		const bool bRestored = RestoreOriginalDirectLink(
+			Graph, PlannedRoute.OutputNode, PlannedRoute.OutputPinId, PlannedRoute.InputNode, PlannedRoute.InputPinId, OutKnots
+		);
+		bOutTopologyRestorationFailed = !bRestored;
+		OutFailure =
+			bRestored
+				? FString::Printf(
+					  TEXT("A K2 node reconstructed a route endpoint (%s); the exact original direct link was restored and verified."),
+					  *VerificationFailure
+				  )
+				: FString::Printf(
+					  TEXT("FATAL topology-safety failure: a K2 node reconstructed a route endpoint (%s) and the exact original direct link could not be restored."),
+					  *VerificationFailure
+				  );
+		if (bRestored) { RestoreCleanPackageAfterFailure(); }
+		return false;
 	}
 	for (int32 Index = 0; Index < OutKnots.Num(); ++Index)
 	{
@@ -1170,8 +1324,7 @@ bool FK2RerouteRouter::FindGeneratedRoute(
 	return !OutWaypoints.IsEmpty();
 }
 
-FRerouteResult FK2RerouteRouter::Route(
-	UEdGraph& Graph,
+FReroutePlan FK2RerouteRouter::Plan(
 	TConstArrayView<FRerouteEdge> Edges,
 	TConstArrayView<FRerouteObstacle> Obstacles,
 	const TSet<UEdGraphNode*>& Scope,
@@ -1179,13 +1332,7 @@ FRerouteResult FK2RerouteRouter::Route(
 	const double GridSize
 )
 {
-	FRerouteResult Result;
-	const UEdGraphSchema_K2* Schema = Cast<UEdGraphSchema_K2>(Graph.GetSchema());
-	if (!Schema)
-	{
-		Result.Diagnostics.Add(TEXT("Reroute generation is available only for K2 graphs."));
-		return Result;
-	}
+	FReroutePlan Result;
 	FRoutePlanningBudget PlanningBudget(Settings.PlanningWorkBudget);
 
 	TArray<FRerouteEdge> SortedEdges;
@@ -1284,24 +1431,59 @@ FRerouteResult FK2RerouteRouter::Route(
 			continue;
 		}
 
-		TArray<UK2Node_Knot*> Knots;
-		FString Failure;
-		bool bTopologyRestorationFailed = false;
-		if (InstallRoute(Graph, *Schema, Edge, Waypoints, Knots, Failure, bTopologyRestorationFailed))
-		{
-			++Result.RoutedWires;
-			Result.CreatedKnots += Knots.Num();
-			ReservedRoutes.Add(MakeReservation(Edge, Waypoints));
-		}
-		else
-		{
-			++Result.SkippedWires;
-			Result.bTopologyRestorationFailed |= bTopologyRestorationFailed;
-			Result.Diagnostics.Add(FString::Printf(TEXT("%s: %s"), *Edge.StableKey, *Failure));
-			if (bTopologyRestorationFailed) { break; }
-			ReservedRoutes.Add(MakeReservation(Edge, TConstArrayView<FVector2D>()));
-		}
+		FPlannedReroute& PlannedRoute = Result.Routes.AddDefaulted_GetRef();
+		PlannedRoute.Edge = Edge;
+		PlannedRoute.Waypoints = MoveTemp(Waypoints);
+		PlannedRoute.OutputNode = OutputNode;
+		PlannedRoute.InputNode = InputNode;
+		PlannedRoute.OutputPinId = Edge.OutputPin->PinId;
+		PlannedRoute.InputPinId = Edge.InputPin->PinId;
+		ReservedRoutes.Add(MakeReservation(Edge, PlannedRoute.Waypoints));
 	}
 	return Result;
 }
+
+FRerouteResult FK2RerouteRouter::ApplyPlan(UEdGraph& Graph, const FReroutePlan& Plan)
+{
+	FRerouteResult Result;
+	Result.SkippedWires = Plan.SkippedWires;
+	Result.bPlanningBudgetExhausted = Plan.bPlanningBudgetExhausted;
+	Result.Diagnostics = Plan.Diagnostics;
+	const UEdGraphSchema_K2* Schema = Cast<UEdGraphSchema_K2>(Graph.GetSchema());
+	if (!Schema)
+	{
+		Result.SkippedWires += Plan.Routes.Num();
+		Result.Diagnostics.Add(TEXT("Reroute generation is available only for K2 graphs."));
+		return Result;
+	}
+
+	for (const FPlannedReroute& PlannedRoute : Plan.Routes)
+	{
+		TArray<UK2Node_Knot*> Knots;
+		FString Failure;
+		bool bTopologyRestorationFailed = false;
+		if (InstallRoute(Graph, *Schema, PlannedRoute, Knots, Failure, bTopologyRestorationFailed))
+		{
+			++Result.RoutedWires;
+			Result.CreatedKnots += Knots.Num();
+			continue;
+		}
+
+		++Result.SkippedWires;
+		Result.bTopologyRestorationFailed |= bTopologyRestorationFailed;
+		Result.Diagnostics.Add(FString::Printf(TEXT("%s: %s"), *PlannedRoute.Edge.StableKey, *Failure));
+		if (bTopologyRestorationFailed) { break; }
+	}
+	return Result;
+}
+
+FRerouteResult FK2RerouteRouter::Route(
+	UEdGraph& Graph,
+	TConstArrayView<FRerouteEdge> Edges,
+	TConstArrayView<FRerouteObstacle> Obstacles,
+	const TSet<UEdGraphNode*>& Scope,
+	const FRerouteSettings& Settings,
+	const double GridSize
+)
+{ return ApplyPlan(Graph, Plan(Edges, Obstacles, Scope, Settings, GridSize)); }
 } // namespace GraphFormatter::K2
