@@ -111,6 +111,9 @@ struct FNodeSnapshot
 	};
 	TArray<FPortSnapshot> Ports;
 	bool bIsPure{ false };
+	/** Authored graph-space position. Ignored unless bHasOriginalPosition is true. */
+	FVector2D OriginalPosition{ FVector2D::ZeroVector };
+	bool bHasOriginalPosition{ false };
 };
 
 struct FPortReference
@@ -152,6 +155,14 @@ enum class EGridPolicy : uint8
 	HybridExecution,
 };
 
+enum class ELayoutMode : uint8
+{
+	/** Improve an authored layout while retaining event-paragraph anchors and reading order. */
+	PreserveAuthored,
+	/** Reconstruct and shelf-pack the graph without authored-position constraints. */
+	Reflow,
+};
+
 struct FLayoutSettings
 {
 	double HorizontalSpacing{ 192.0 };
@@ -168,11 +179,14 @@ struct FLayoutSettings
 	FVector2D GridSize{
 		FVector2D{ 16.0, 16.0 }
 	};
+	/** Coarse Blueprint canvas cell used for paragraph bands, statement columns, and minimum gutters. */
+	double LayoutCellSize{ 50.0 };
 	int32 OrderingSweeps{ 12 };
 	int32 AdjacentSwapPasses{ 4 };
 	/** Deterministic cap on expensive local crossing evaluations for interactive editor latency. */
 	int32 AdjacentSwapEvaluationBudget{ 2048 };
 	EGridPolicy GridPolicy{ EGridPolicy::HybridExecution };
+	ELayoutMode LayoutMode{ ELayoutMode::PreserveAuthored };
 };
 
 enum class EDiagnosticSeverity : uint8
@@ -232,6 +246,8 @@ struct FLayoutStatistics
 	int32 VirtualNodeCount{ 0 };
 	int64 InitialExecutionCrossings{ 0 };
 	int64 FinalExecutionCrossings{ 0 };
+	int32 AuthoredComponentCount{ 0 };
+	double TotalNodeDisplacement{ 0.0 };
 };
 
 struct FLayoutPlan

@@ -13,6 +13,9 @@ class UEdGraphPin;
 
 namespace GraphFormatter::K2
 {
+inline constexpr double RerouteKnotWidth = 42.0;
+inline constexpr double RerouteKnotHeight = 24.0;
+
 struct FRerouteSettings
 {
 	double ObstacleClearance = 48.0;
@@ -35,8 +38,13 @@ struct FRerouteEdge
 	TArray<FVector2D> PreferredWaypoints;
 	int32 RankSpan = 0;
 	bool bExecution = false;
+	/** Stock Kismet reverses endpoint tangents when a user knot points back toward its input side. */
+	bool bReverseOutputTangent = false;
+	bool bReverseInputTangent = false;
 	/** A previously generated logical chain supplied only to reserve its existing polyline. */
 	bool bExistingGeneratedRoute = false;
+	/** An ordinary stationary wire supplied as routing context; reserve it without reporting a skip. */
+	bool bReservationOnly = false;
 };
 
 struct FRerouteObstacle
@@ -69,6 +77,27 @@ struct FRerouteResult
 class FK2RerouteRouter
 {
 public:
+	/**
+	 * Reproduces the stock Kismet spline approximation used by routing from pin anchors and
+	 * optional logical knot centers. Readability validation uses the same geometry so accepted
+	 * layouts cannot disagree with the router about a wire passing through a node.
+	 */
+	static TArray<FVector2D> BuildRenderedPolyline(
+		TConstArrayView<FVector2D> LogicalPoints, bool bReverseFirstTangent = false, bool bReverseLastTangent = false
+	);
+	/** Returns true when two already-rendered polyline approximations touch, overlap, or cross. */
+	static bool RenderedPolylinesIntersect(TConstArrayView<FVector2D> FirstPolyline, TConstArrayView<FVector2D> SecondPolyline);
+	/**
+	 * As above, but ignores a non-overlapping touch only when it occurs at an explicitly supplied
+	 * point that is also a terminal of both polylines. This mirrors the Kismet router's shared-pin
+	 * exception without hiding a later recrossing or a shared initial/final segment.
+	 */
+	static bool RenderedPolylinesIntersectExceptAtSharedTerminals(
+		TConstArrayView<FVector2D> FirstPolyline,
+		TConstArrayView<FVector2D> SecondPolyline,
+		TConstArrayView<FVector2D> IgnoredSharedTerminals
+	);
+
 	/** Returns true only for reroute nodes created and tagged by this formatter. */
 	static bool IsGeneratedRerouteNode(const UEdGraphNode* Node);
 	/** Reads the non-empty logical-edge identity from a tagged generated reroute node. */

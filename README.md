@@ -21,13 +21,17 @@ Configure the formatter under **Editor Preferences > Plugins > Graph Formatter**
 
 The K2 formatter separates execution flow from data dependencies instead of treating every pin equally:
 
+- **Preserve Human Layout** is the default: authored event islands retain their start column, vertical reading order, and local mental map. **Full Reflow** remains available as an explicit aggressive rebuild.
+- Event-rooted execution islands are discovered from execution wiring only. Delegate and data links may cross between islands without flattening them into one layout paragraph.
 - Execution strongly determines left-to-right ranks.
 - The primary execution path is pin-aligned so wires stay visually straight where integer node positions permit it.
+- Execution-pin alignment has priority over node-top Y snapping. Columns, event anchors, and provider satellites use a configurable coarse layout cell (50 units by default).
+- Every execution column begins after the widest node or pure-input compound in the previous column, with at least one complete layout cell of empty horizontal space. Preserve mode expands cramped authored gaps but propagates that expansion forward instead of compacting any later generous rank-to-rank gap.
 - Branch output order is a hard ordering constraint; alternating median/barycenter sweeps and adjacent swaps reduce crossings around it.
 - Long execution edges use virtual layout vertices, avoiding rank compression and arbitrary layer wrapping.
 - Cycles are condensed deterministically and laid out with a stable fallback.
-- Pure data providers are placed upstream and grouped near the consumer inputs they feed.
-- Disconnected components are packed with generous spacing.
+- Pure data providers are placed in consumer-local, pin-ordered columns. Their authored above/below side is stable, collision stacks grow outward from the consumer, and the widest provider defines the shared column. Impure upstream sources constrain pure chains to remain forward-running.
+- Event islands are stacked in authored top-to-bottom order with generous configurable gutters; preserve mode never shelf-packs them horizontally. Nearby event roots authored as one start column share one coarse-grid X anchor, while roots a full cell apart remain distinct.
 - Hybrid grid snapping snaps columns and alignment blocks while preserving execution-pin alignment.
 - Fixed, unselected nodes are obstacles. Formatted components move clear of them rather than overlapping them.
 - Selected comments include their contents recursively. Nested comments and unselected ancestors affected by moved nodes are resized inside-out without dropping stationary contents.
@@ -36,9 +40,9 @@ The formatter captures public Slate geometry after a normal editor tick. Persist
 
 ## Wire routing
 
-`Format + Route Wires` uses deterministic rectilinear logical channels and only materializes a route after every waypoint is known to be safe under an approximation of Unreal's rendered Kismet spline. Accepted routes reserve their rendered curves and knot boxes, so later routed wires avoid coincident segments and prefer lower-crossing alternatives. Long execution edges can reuse the layout core's virtual-rank waypoints. Each wire is replaced transactionally; if Unreal's K2 schema rejects any part of a knot chain, the chain is removed and the original direct connection is restored and verified.
+`Format + Route Wires` uses deterministic rectilinear logical channels and only materializes a route after every waypoint is known to be safe under an approximation of Unreal's rendered Kismet spline. The complete graph-wide wire field—including stationary wires outside a partial selection—reserves its rendered curves, and accepted routes additionally reserve their knot boxes. A candidate may intersect only wire identities that its current baseline already intersects, so sequential rerouting can preserve or remove crossing pairs but cannot introduce a new pair after the layout safety gate. Long execution edges can reuse the layout core's virtual-rank waypoints. Each wire is replaced transactionally; if Unreal's K2 schema rejects any part of a knot chain, the chain is removed and the original direct connection is restored and verified.
 
-Generated knots are tagged as Graph Formatter routes. Later layout passes validate and collapse those chains back to their real logical endpoints and exclude the generated presentation nodes from ranking. The engine-independent core has repeated-build coverage, and repeated routing does not extend a validated generated chain. Knot creation and pin rewiring bypass Unreal's nested user-action transactions and per-link Blueprint dirtying; the entire operation is one undo step and the Blueprint is marked once. Direct-wire crossings are routing triggers: execution wires keep priority over data wires, and equal-priority wires yield in stable order. Routing remains best effort—a wire stays unchanged when no safe candidate fits the knot cap or when the deterministic planning budget is exhausted. This is not a global minimum-crossing solver.
+Generated knots are tagged as Graph Formatter routes. Later layout passes validate and collapse those chains back to their real logical endpoints and exclude the generated presentation nodes from ranking. The engine-independent core has repeated-build coverage, and repeated routing does not extend a validated generated chain. Knot creation and pin rewiring bypass Unreal's nested user-action transactions and per-link Blueprint dirtying; the entire operation is one undo step and the Blueprint is marked once. Direct-wire crossings are routing triggers: execution wires keep priority over data wires, and equal-priority wires yield in stable order. Reverse-facing manual-knot endpoints retain their rendered side; multi-link manual-knot junctions stay authored when replacing one neighbor could change Unreal's average-based tangent direction. Routing remains best effort—a wire stays unchanged when no safe candidate fits the knot cap or when the deterministic planning budget is exhausted. This is not a global minimum-crossing solver.
 
 ## K2 settings
 
@@ -46,9 +50,10 @@ Generated knots are tagged as Graph Formatter routes. Later layout passes valida
 |---|---|
 | `bEnableK2Formatter` | Enables the semantic K2 path. Unsupported graphs automatically use the generic formatter. |
 | `bEnableHybridGridSnap` | Uses alignment-preserving grid snapping; when disabled, nodes use conventional grid snapping. |
-| `bPreserveComponentAnchor` | Keeps the formatted scope near its authored top-left while snapping that anchor to the graph grid. |
+| `K2LayoutMode` | Selects default **Preserve Human Layout** or explicit **Full Reflow**. The legacy whole-scope `bPreserveComponentAnchor` value is retained only for config compatibility. |
+| `K2LayoutCellSize` | Coarse visual cell for event anchors, statement columns, provider rows, and minimum gutters; defaults to 50 units. |
 | `K2OrderingSweeps` | Controls deterministic crossing-reduction effort. |
-| `K2RoutingPlanningWorkBudget` | Caps primitive routing-geometry comparisons per operation; the constructor default is 1,000,000. |
+| `K2RoutingPlanningWorkBudget` | Caps primitive geometry work independently for each graph-wide readability pass and for routing; the constructor default is 1,000,000. Exhaustion conservatively leaves the layout or remaining wires unchanged. |
 | `K2HorizontalSpacing`, `K2VerticalSpacing`, `K2BranchSpacing` | Control execution-column and branch-lane clearance. |
 | `K2ComponentSpacing` | Controls separation between disconnected components. |
 | `K2PureHorizontalSpacing`, `K2PureVerticalSpacing` | Control pure-provider grouping. |
@@ -60,7 +65,7 @@ Generated knots are tagged as Graph Formatter routes. Later layout passes valida
 | `bRouteDataWires` | Allows crossing, backward, long, or obstructed data wires to be routed. |
 | `bShowLayoutNotifications` | Shows success and safe-abort notifications. |
 
-The constructor defaults favor readability over compactness: 160 units between execution columns, 96 units of node and branch clearance, 256 units between components, and 64 units of comment padding.
+The constructor defaults favor readability over compactness: preservation mode, a 50-unit coarse cell, 160 units between execution columns, 96 units of node and branch clearance, 256 units between event paragraphs, and 64 units of comment padding. Spacing values smaller than one layout cell are promoted to one complete cell.
 
 ## Safety and determinism
 
@@ -71,6 +76,7 @@ The constructor defaults favor readability over compactness: 160 units between e
 - Node moves, comment bounds, and generated knots share one transaction.
 - Selection and graph view are preserved.
 - Stable node, pin, and edge identifiers—not pointer or container order—break layout ties.
+- Before mutation, the adapter compares authored and proposed readability across all graph nodes and wires. It uses the same flattened Kismet spline geometry as routing, including reverse-facing user reroute tangents, and rejects candidates that introduce overlaps (including moved generated knots), backward execution, a bend in a preferred straight execution link (including links crossing a partial-selection boundary), materially worse backward data wiring, new wire-under-node paths, or any new execution/data crossing-pair identity—even when another crossing disappeared and the total count stayed equal. It also limits event-start drift and preserves authored event order. Existing generated routes are compared using their exact planned waypoint curves; intentional downstream X expansion is not misclassified as damage. The check is deterministically budgeted and fails closed.
 - The Blueprint is marked modified and the graph is notified once after a successful format.
 
 ## Other graph editors

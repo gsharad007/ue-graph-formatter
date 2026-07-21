@@ -9,6 +9,15 @@
 #include "FormatterGraph.h"
 #include "FormatterSettings.generated.h"
 
+UENUM()
+enum class EGraphFormatterK2LayoutMode : uint8
+{
+	/** Improve an authored layout in place while preserving event-island position and reading order. */
+	PreserveHumanLayout UMETA(DisplayName = "Preserve Human Layout"),
+	/** Rebuild the selected graph as a fresh deterministic layered drawing. */
+	FullReflow UMETA(DisplayName = "Full Reflow"),
+};
+
 UCLASS(config = EditorPerProjectUserSettings)
 class GRAPHFORMATTER_API UFormatterSettings : public UObject
 {
@@ -81,15 +90,26 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "K2 Layout")
 	bool bEnableHybridGridSnap;
 
-	/** Keep the formatted scope near its authored top-left, snapped to the graph grid. */
+	/** Preserve authored event islands and local node groupings, or explicitly rebuild the layout. */
 	UPROPERTY(config, EditAnywhere, Category = "K2 Layout")
+	EGraphFormatterK2LayoutMode K2LayoutMode;
+
+	/** Legacy config value. Per-island preservation is selected through K2LayoutMode. */
+	UPROPERTY(
+		config,
+		meta = (DeprecatedProperty, DeprecationMessage = "Use K2LayoutMode. Whole-scope anchor translation has been replaced by per-island preservation.")
+	)
 	bool bPreserveComponentAnchor;
+
+	/** Coarse visual grid unit used for execution columns and event-island gutters. */
+	UPROPERTY(config, EditAnywhere, Category = "K2 Layout|Spacing", meta = (ClampMin = 1, ClampMax = 1024))
+	int32 K2LayoutCellSize;
 
 	/** Number of deterministic alternating crossing-reduction sweeps. */
 	UPROPERTY(config, EditAnywhere, Category = "K2 Layout|Performance", meta = (ClampMin = 1, ClampMax = 32))
 	int32 K2OrderingSweeps;
 
-	/** Deterministic upper bound on routing candidate work per format operation. */
+	/** Deterministic upper bound for each graph-wide readability and routing geometry pass. */
 	UPROPERTY(config, EditAnywhere, Category = "K2 Layout|Performance", meta = (ClampMin = 1000, ClampMax = 10000000))
 	int32 K2RoutingPlanningWorkBudget;
 

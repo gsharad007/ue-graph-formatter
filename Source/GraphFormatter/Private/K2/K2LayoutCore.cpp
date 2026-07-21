@@ -120,7 +120,9 @@ struct FVertexState
 	int32 Order{ INDEX_NONE };
 	int32 AlignmentBlock{ INDEX_NONE };
 	double RelativeY{ 0.0 };
+	FVector2D OriginalPosition{ FVector2D::ZeroVector };
 	bool bVirtual{ false };
+	bool bHasOriginalPosition{ false };
 };
 
 struct FSegmentState
@@ -165,6 +167,15 @@ struct FComponentState
 	TArray<int32> Vertices;
 	TArray<TArray<int32>> Layers;
 	FVector2D PackedOffset{ FVector2D::ZeroVector };
+	int32 AnchorNode{ INDEX_NONE };
+	FVector2D AuthoredAnchor{ FVector2D::ZeroVector };
+	bool bHasAuthoredAnchor{ false };
+};
+
+enum class EProviderSide : uint8
+{
+	Above,
+	Below,
 };
 
 struct FRect
@@ -192,6 +203,8 @@ private:
 	void BuildNodes();
 	void BuildEdges();
 	void BuildComponents();
+	void BuildReflowComponents();
+	void BuildPreservedComponents();
 	void BuildExecutionSccs();
 	void RankExecutionSccs();
 	void BuildExecutionVertices();
@@ -236,11 +249,24 @@ private:
 	void OrderAlignmentBlocks(FComponentState& Component, TArray<FAlignmentBlock>& Blocks);
 	void PositionAlignmentBlocks(FComponentState& Component, TArray<FAlignmentBlock>& Blocks);
 	void PositionRankColumns(FComponentState& Component);
+	[[nodiscard]]
+	double MeasurePureInputCorridor(int32 NodeIndex, TSet<int32>& Visiting) const;
 	void PlacePureWave(FComponentState& Component, TArray<int32>& RemainingPureNodes);
 	void PlaceDataOnlyAnchors(FComponentState& Component, TArray<int32>& RemainingPureNodes);
-	void PlacePureNode(int32 NodeIndex, const TArray<int32>& PlacedTargets, TArray<FRect>& Obstacles);
+	void PlacePureNode(
+		int32 NodeIndex,
+		const TArray<int32>& PlacedTargets,
+		int32 PrimaryTarget,
+		EProviderSide ProviderSide,
+		double ProviderColumnWidth,
+		TArray<FRect>& Obstacles
+	);
 	[[nodiscard]]
 	double FindCollisionFreeY(const FNodeState& Node, double X, double DesiredY, const TArray<FRect>& Obstacles) const;
+	[[nodiscard]]
+	double FindCollisionFreeProviderY(
+		const FNodeState& Node, double X, double DesiredY, EProviderSide ProviderSide, const TArray<FRect>& Obstacles
+	) const;
 	[[nodiscard]]
 	FRect CalculateComponentBounds(const FComponentState& Component) const;
 	void OffsetComponent(FComponentState& Component, const FVector2D& Offset);
@@ -255,6 +281,14 @@ private:
 	bool IsGridEnabled() const;
 	[[nodiscard]]
 	bool IsHybridGrid() const;
+	[[nodiscard]]
+	bool IsPreserveMode() const;
+	[[nodiscard]]
+	bool AuthoredNodeLess(int32 A, int32 B) const;
+	[[nodiscard]]
+	bool AuthoredVertexLess(int32 A, int32 B) const;
+	[[nodiscard]]
+	double LayoutCell() const;
 	[[nodiscard]]
 	double GridX() const;
 	[[nodiscard]]
@@ -274,6 +308,7 @@ private:
 	TMap<FNodeKey, int32> NodeByKey;
 	TSet<FEdgeKey> ReportedDuplicateEdgeKeys;
 	bool bReportedContradictoryBranchOrder{ false };
+	bool bHasAuthoredLayout{ false };
 };
 
 void FLayoutBuilder::AddDiagnostic(
@@ -296,6 +331,7 @@ void FLayoutBuilder::SanitizeSettings()
 	Settings.ComponentRowWidth = NonNegativeFinite(Settings.ComponentRowWidth);
 	Settings.GridSize.X = NonNegativeFinite(Settings.GridSize.X);
 	Settings.GridSize.Y = NonNegativeFinite(Settings.GridSize.Y);
+	Settings.LayoutCellSize = NonNegativeFinite(Settings.LayoutCellSize);
 	Settings.OrderingSweeps = FMath::Clamp(Settings.OrderingSweeps, 0, 64);
 	Settings.AdjacentSwapPasses = FMath::Clamp(Settings.AdjacentSwapPasses, 0, 32);
 	Settings.AdjacentSwapEvaluationBudget = FMath::Clamp(Settings.AdjacentSwapEvaluationBudget, 0, 100000);
@@ -305,9 +341,52 @@ bool FLayoutBuilder::IsGridEnabled() const { return Settings.GridPolicy != EGrid
 
 bool FLayoutBuilder::IsHybridGrid() const { return Settings.GridPolicy == EGridPolicy::HybridExecution; }
 
+bool FLayoutBuilder::IsPreserveMode() const
+{ return Settings.LayoutMode == ELayoutMode::PreserveAuthored && bHasAuthoredLayout; }
+
+double FLayoutBuilder::LayoutCell() const { return IsPreserveMode() ? Settings.LayoutCellSize : 0.0; }
+
 double FLayoutBuilder::GridX() const { return IsGridEnabled() ? Settings.GridSize.X : 0.0; }
 
 double FLayoutBuilder::GridY() const { return IsGridEnabled() ? Settings.GridSize.Y : 0.0; }
+
+bool FLayoutBuilder::AuthoredNodeLess(const int32 A, const int32 B) const
+{
+	const FNodeSnapshot& Left = Nodes[A].Snapshot;
+	const FNodeSnapshot& Right = Nodes[B].Snapshot;
+	if (Left.bHasOriginalPosition != Right.bHasOriginalPosition) { return Left.bHasOriginalPosition; }
+	if (Left.bHasOriginalPosition)
+	{
+		if (Left.OriginalPosition.Y != Right.OriginalPosition.Y)
+		{
+			return Left.OriginalPosition.Y < Right.OriginalPosition.Y;
+		}
+		if (Left.OriginalPosition.X != Right.OriginalPosition.X)
+		{
+			return Left.OriginalPosition.X < Right.OriginalPosition.X;
+		}
+	}
+	return StableLess(Left.Key.Value, Right.Key.Value);
+}
+
+bool FLayoutBuilder::AuthoredVertexLess(const int32 A, const int32 B) const
+{
+	const FVertexState& Left = Vertices[A];
+	const FVertexState& Right = Vertices[B];
+	if (Left.bHasOriginalPosition != Right.bHasOriginalPosition) { return Left.bHasOriginalPosition; }
+	if (Left.bHasOriginalPosition)
+	{
+		if (Left.OriginalPosition.Y != Right.OriginalPosition.Y)
+		{
+			return Left.OriginalPosition.Y < Right.OriginalPosition.Y;
+		}
+		if (Left.OriginalPosition.X != Right.OriginalPosition.X)
+		{
+			return Left.OriginalPosition.X < Right.OriginalPosition.X;
+		}
+	}
+	return StableLess(Left.StableKey, Right.StableKey);
+}
 
 const FPortState& FLayoutBuilder::GetPort(const int32 NodeIndex, const int32 PortIndex) const
 { return Nodes[NodeIndex].Ports[PortIndex]; }
@@ -449,9 +528,23 @@ void FLayoutBuilder::BuildNodes()
 					TEXT("Non-finite or non-positive node dimensions were clamped to one layout unit.")
 				);
 			}
+			if (Node.Snapshot.bHasOriginalPosition
+				&& (!FMath::IsFinite(Node.Snapshot.OriginalPosition.X)
+					|| !FMath::IsFinite(Node.Snapshot.OriginalPosition.Y)))
+			{
+				Node.Snapshot.OriginalPosition = FVector2D::ZeroVector;
+				Node.Snapshot.bHasOriginalPosition = false;
+				AddDiagnostic(
+					EDiagnosticSeverity::Warning,
+					EDiagnosticCode::InvalidNodeGeometry,
+					SourceNode.Key.Value,
+					TEXT("A non-finite authored position was ignored.")
+				);
+			}
 			BuildPorts(Node, SourceNode);
 			const int32 NodeIndex = Nodes.Add(MoveTemp(Node));
 			NodeByKey.Add(SourceNode.Key, NodeIndex);
+			bHasAuthoredLayout |= Nodes[NodeIndex].Snapshot.bHasOriginalPosition;
 		}
 		Cursor = End;
 	}
@@ -714,6 +807,16 @@ void FLayoutBuilder::BuildEdges()
 
 void FLayoutBuilder::BuildComponents()
 {
+	if (IsPreserveMode())
+	{
+		BuildPreservedComponents();
+		return;
+	}
+	BuildReflowComponents();
+}
+
+void FLayoutBuilder::BuildReflowComponents()
+{
 	TArray<TArray<int32>> Neighbours;
 	Neighbours.SetNum(Nodes.Num());
 	const auto Connect = [&Neighbours](const int32 A, const int32 B)
@@ -764,6 +867,246 @@ void FLayoutBuilder::BuildComponents()
 		}
 		Component.Nodes.Sort([this](const int32 A, const int32 B)
 							 { return StableLess(Nodes[A].Snapshot.Key.Value, Nodes[B].Snapshot.Key.Value); });
+	}
+}
+
+void FLayoutBuilder::BuildPreservedComponents()
+{
+	TArray<TArray<int32>> ExecutionNeighbours;
+	TArray<TArray<int32>> DataNeighbours;
+	ExecutionNeighbours.SetNum(Nodes.Num());
+	DataNeighbours.SetNum(Nodes.Num());
+	const auto Connect = [](TArray<TArray<int32>>& Neighbours, const int32 A, const int32 B)
+	{
+		Neighbours[A].AddUnique(B);
+		Neighbours[B].AddUnique(A);
+	};
+	for (const FExecutionEdgeState& Edge : ExecutionEdges)
+	{
+		Connect(ExecutionNeighbours, Edge.SourceNode, Edge.TargetNode);
+	}
+	for (const FDataEdgeState& Edge : DataEdges)
+	{
+		Connect(DataNeighbours, Edge.SourceNode, Edge.TargetNode);
+	}
+	for (TArray<int32>& Neighbours : ExecutionNeighbours)
+	{
+		Neighbours.Sort([this](const int32 A, const int32 B) { return AuthoredNodeLess(A, B); });
+	}
+	for (TArray<int32>& Neighbours : DataNeighbours)
+	{
+		Neighbours.Sort([this](const int32 A, const int32 B) { return AuthoredNodeLess(A, B); });
+	}
+
+	TArray<int32> AuthoredOrder;
+	for (int32 NodeIndex = 0; NodeIndex < Nodes.Num(); ++NodeIndex)
+	{
+		AuthoredOrder.Add(NodeIndex);
+	}
+	AuthoredOrder.Sort([this](const int32 A, const int32 B) { return AuthoredNodeLess(A, B); });
+
+	for (const int32 StartNode : AuthoredOrder)
+	{
+		if (!IsExecutionParticipant(Nodes[StartNode]) || Nodes[StartNode].Component != INDEX_NONE) { continue; }
+		const int32 ComponentIndex = Components.AddDefaulted();
+		TArray<int32> Queue{ StartNode };
+		Nodes[StartNode].Component = ComponentIndex;
+		for (int32 Head = 0; Head < Queue.Num(); ++Head)
+		{
+			const int32 NodeIndex = Queue[Head];
+			Components[ComponentIndex].Nodes.Add(NodeIndex);
+			for (const int32 Neighbour : ExecutionNeighbours[NodeIndex])
+			{
+				if (Nodes[Neighbour].Component == INDEX_NONE)
+				{
+					Nodes[Neighbour].Component = ComponentIndex;
+					Queue.Add(Neighbour);
+				}
+			}
+		}
+	}
+
+	bool bAttachedProvider = true;
+	while (bAttachedProvider)
+	{
+		bAttachedProvider = false;
+		for (const int32 NodeIndex : AuthoredOrder)
+		{
+			if (Nodes[NodeIndex].Component != INDEX_NONE) { continue; }
+			TArray<int32> PlacedTargets;
+			for (const int32 EdgeIndex : Nodes[NodeIndex].DataOut)
+			{
+				const int32 TargetNode = DataEdges[EdgeIndex].TargetNode;
+				if (Nodes[TargetNode].Component != INDEX_NONE) { PlacedTargets.AddUnique(TargetNode); }
+			}
+			if (PlacedTargets.IsEmpty()) { continue; }
+			PlacedTargets.Sort(
+				[this, NodeIndex](const int32 A, const int32 B)
+				{
+					const FNodeSnapshot& Source = Nodes[NodeIndex].Snapshot;
+					const FNodeSnapshot& Left = Nodes[A].Snapshot;
+					const FNodeSnapshot& Right = Nodes[B].Snapshot;
+					if (Source.bHasOriginalPosition && Left.bHasOriginalPosition && Right.bHasOriginalPosition)
+					{
+						const double LeftDistance = FVector2D::DistSquared(Source.OriginalPosition, Left.OriginalPosition);
+						const double RightDistance =
+							FVector2D::DistSquared(Source.OriginalPosition, Right.OriginalPosition);
+						if (LeftDistance != RightDistance) { return LeftDistance < RightDistance; }
+					}
+					return AuthoredNodeLess(A, B);
+				}
+			);
+			const int32 ComponentIndex = Nodes[PlacedTargets[0]].Component;
+			Nodes[NodeIndex].Component = ComponentIndex;
+			Components[ComponentIndex].Nodes.Add(NodeIndex);
+			bAttachedProvider = true;
+		}
+	}
+
+	for (const int32 StartNode : AuthoredOrder)
+	{
+		if (Nodes[StartNode].Component != INDEX_NONE) { continue; }
+		const int32 ComponentIndex = Components.AddDefaulted();
+		TArray<int32> Queue{ StartNode };
+		Nodes[StartNode].Component = ComponentIndex;
+		for (int32 Head = 0; Head < Queue.Num(); ++Head)
+		{
+			const int32 NodeIndex = Queue[Head];
+			Components[ComponentIndex].Nodes.Add(NodeIndex);
+			for (const int32 Neighbour : DataNeighbours[NodeIndex])
+			{
+				if (Nodes[Neighbour].Component == INDEX_NONE)
+				{
+					Nodes[Neighbour].Component = ComponentIndex;
+					Queue.Add(Neighbour);
+				}
+			}
+		}
+	}
+
+	for (FComponentState& Component : Components)
+	{
+		Component.Nodes.Sort([this](const int32 A, const int32 B) { return AuthoredNodeLess(A, B); });
+		Component.StableKey = Nodes[Component.Nodes[0]].Snapshot.Key.Value;
+		for (const int32 NodeIndex : Component.Nodes)
+		{
+			const FString& NodeKey = Nodes[NodeIndex].Snapshot.Key.Value;
+			if (StableLess(NodeKey, Component.StableKey)) { Component.StableKey = NodeKey; }
+		}
+		TArray<int32> Roots;
+		for (const int32 NodeIndex : Component.Nodes)
+		{
+			if (!IsExecutionParticipant(Nodes[NodeIndex])) { continue; }
+			bool bHasComponentInput = false;
+			for (const int32 EdgeIndex : Nodes[NodeIndex].ExecutionIn)
+			{
+				bHasComponentInput |= Nodes[ExecutionEdges[EdgeIndex].SourceNode].Component == Nodes[NodeIndex].Component;
+			}
+			if (!bHasComponentInput) { Roots.Add(NodeIndex); }
+		}
+		Roots.Sort([this](const int32 A, const int32 B) { return AuthoredNodeLess(A, B); });
+		if (!Roots.IsEmpty()) { Component.AnchorNode = Roots[0]; }
+		else
+		{
+			Component.AnchorNode = Component.Nodes[0];
+			for (const int32 NodeIndex : Component.Nodes)
+			{
+				if (IsExecutionParticipant(Nodes[NodeIndex]))
+				{
+					Component.AnchorNode = NodeIndex;
+					break;
+				}
+			}
+		}
+		const FNodeSnapshot& Anchor = Nodes[Component.AnchorNode].Snapshot;
+		Component.bHasAuthoredAnchor = Anchor.bHasOriginalPosition;
+		Component.AuthoredAnchor = Anchor.OriginalPosition;
+	}
+
+	TArray<int32> ComponentOrder;
+	for (int32 ComponentIndex = 0; ComponentIndex < Components.Num(); ++ComponentIndex)
+	{
+		ComponentOrder.Add(ComponentIndex);
+	}
+	ComponentOrder.Sort(
+		[this](const int32 A, const int32 B)
+		{
+			const FComponentState& Left = Components[A];
+			const FComponentState& Right = Components[B];
+			if (Left.bHasAuthoredAnchor != Right.bHasAuthoredAnchor) { return Left.bHasAuthoredAnchor; }
+			if (Left.bHasAuthoredAnchor)
+			{
+				if (Left.AuthoredAnchor.Y != Right.AuthoredAnchor.Y)
+				{
+					return Left.AuthoredAnchor.Y < Right.AuthoredAnchor.Y;
+				}
+				if (Left.AuthoredAnchor.X != Right.AuthoredAnchor.X)
+				{
+					return Left.AuthoredAnchor.X < Right.AuthoredAnchor.X;
+				}
+			}
+			return StableLess(Left.StableKey, Right.StableKey);
+		}
+	);
+	TArray<FComponentState> AuthoredComponents;
+	AuthoredComponents.Reserve(Components.Num());
+	for (const int32 OldComponentIndex : ComponentOrder)
+	{
+		const int32 NewComponentIndex = AuthoredComponents.Num();
+		AuthoredComponents.Add(MoveTemp(Components[OldComponentIndex]));
+		for (const int32 NodeIndex : AuthoredComponents.Last().Nodes)
+		{
+			Nodes[NodeIndex].Component = NewComponentIndex;
+		}
+	}
+	Components = MoveTemp(AuthoredComponents);
+
+	// Event roots that were authored as one visual start column should not split merely
+	// because they straddle a coarse-cell rounding boundary. Cluster only nearby execution
+	// starts, then snap the cluster median once. Data-only islands and roots authored one full
+	// coarse cell apart remain independent.
+	TArray<int32> ComponentsByAnchorX;
+	for (int32 ComponentIndex = 0; ComponentIndex < Components.Num(); ++ComponentIndex)
+	{
+		const FComponentState& Component = Components[ComponentIndex];
+		if (!Component.bHasAuthoredAnchor || Component.AnchorNode == INDEX_NONE) { continue; }
+		bool bHasExecutionOutput = false;
+		for (const FPortState& Port : Nodes[Component.AnchorNode].Ports)
+		{
+			bHasExecutionOutput |= Port.Snapshot.Kind == EPortKind::Execution
+								&& Port.Snapshot.Direction == EPortDirection::Output;
+		}
+		if (bHasExecutionOutput) { ComponentsByAnchorX.Add(ComponentIndex); }
+	}
+	ComponentsByAnchorX.Sort(
+		[this](const int32 A, const int32 B)
+		{
+			const double LeftX = Components[A].AuthoredAnchor.X;
+			const double RightX = Components[B].AuthoredAnchor.X;
+			return LeftX == RightX ? StableLess(Components[A].StableKey, Components[B].StableKey) : LeftX < RightX;
+		}
+	);
+	for (int32 ClusterStart = 0; ClusterStart < ComponentsByAnchorX.Num();)
+	{
+		int32 ClusterEnd = ClusterStart + 1;
+		const double FirstX = Components[ComponentsByAnchorX[ClusterStart]].AuthoredAnchor.X;
+		while (ClusterEnd < ComponentsByAnchorX.Num()
+			   && Components[ComponentsByAnchorX[ClusterEnd]].AuthoredAnchor.X - FirstX < LayoutCell() * 0.5)
+		{
+			++ClusterEnd;
+		}
+		TArray<double> ClusterXs;
+		ClusterXs.Reserve(ClusterEnd - ClusterStart);
+		for (int32 ClusterIndex = ClusterStart; ClusterIndex < ClusterEnd; ++ClusterIndex)
+		{
+			ClusterXs.Add(Components[ComponentsByAnchorX[ClusterIndex]].AuthoredAnchor.X);
+		}
+		const double SharedAnchorX = SnapNearest(Median(MoveTemp(ClusterXs)), LayoutCell());
+		for (int32 ClusterIndex = ClusterStart; ClusterIndex < ClusterEnd; ++ClusterIndex)
+		{
+			Components[ComponentsByAnchorX[ClusterIndex]].AuthoredAnchor.X = SharedAnchorX;
+		}
+		ClusterStart = ClusterEnd;
 	}
 }
 
@@ -942,6 +1285,8 @@ void FLayoutBuilder::BuildExecutionVertices()
 		Vertex.Node = NodeIndex;
 		Vertex.Component = Node.Component;
 		Vertex.Rank = Node.Rank;
+		Vertex.OriginalPosition = Node.Snapshot.OriginalPosition;
+		Vertex.bHasOriginalPosition = Node.Snapshot.bHasOriginalPosition;
 		Node.Vertex = Vertices.Add(MoveTemp(Vertex));
 	}
 
@@ -960,6 +1305,15 @@ void FLayoutBuilder::BuildExecutionVertices()
 			Virtual.bVirtual = true;
 			Virtual.Component = Nodes[Edge.SourceNode].Component;
 			Virtual.Rank = Rank;
+			const FNodeSnapshot& SourceNode = Nodes[Edge.SourceNode].Snapshot;
+			const FNodeSnapshot& TargetNode = Nodes[Edge.TargetNode].Snapshot;
+			Virtual.bHasOriginalPosition = SourceNode.bHasOriginalPosition && TargetNode.bHasOriginalPosition;
+			if (Virtual.bHasOriginalPosition)
+			{
+				const double Alpha = static_cast<double>(Rank - SourceRank)
+								   / static_cast<double>(FMath::Max(1, TargetRank - SourceRank));
+				Virtual.OriginalPosition = FMath::Lerp(SourceNode.OriginalPosition, TargetNode.OriginalPosition, Alpha);
+			}
 			Edge.Chain.Add(Vertices.Add(MoveTemp(Virtual)));
 			++Plan.Statistics.VirtualNodeCount;
 		}
@@ -1009,8 +1363,13 @@ void FLayoutBuilder::BuildComponentLayers(FComponentState& Component)
 	}
 	for (TArray<int32>& Layer : Component.Layers)
 	{
-		Layer.Sort([this](const int32 A, const int32 B)
-				   { return StableLess(Vertices[A].StableKey, Vertices[B].StableKey); });
+		Layer.Sort(
+			[this](const int32 A, const int32 B)
+			{
+				return IsPreserveMode() ? AuthoredVertexLess(A, B)
+										: StableLess(Vertices[A].StableKey, Vertices[B].StableKey);
+			}
+		);
 		for (int32 Order = 0; Order < Layer.Num(); ++Order)
 		{
 			Vertices[Layer[Order]].Order = Order;
@@ -1623,24 +1982,74 @@ void FLayoutBuilder::OrderAlignmentBlocks(FComponentState& Component, TArray<FAl
 	}
 }
 
+double FLayoutBuilder::MeasurePureInputCorridor(const int32 NodeIndex, TSet<int32>& Visiting) const
+{
+	if (Visiting.Contains(NodeIndex)) { return 0.0; }
+	Visiting.Add(NodeIndex);
+	double Width = 0.0;
+	const double ProviderGap = IsPreserveMode() ? FMath::Max(Settings.PureNodeHorizontalSpacing, LayoutCell())
+												: Settings.PureNodeHorizontalSpacing;
+	for (const int32 EdgeIndex : Nodes[NodeIndex].DataIn)
+	{
+		const int32 ProviderIndex = DataEdges[EdgeIndex].SourceNode;
+		const FNodeState& Provider = Nodes[ProviderIndex];
+		if (Provider.Component != Nodes[NodeIndex].Component || IsExecutionParticipant(Provider)) { continue; }
+		const double Candidate = Provider.Snapshot.Size.X + ProviderGap + MeasurePureInputCorridor(ProviderIndex, Visiting);
+		Width = FMath::Max(Width, Candidate);
+	}
+	Visiting.Remove(NodeIndex);
+	return Width;
+}
+
 void FLayoutBuilder::PositionRankColumns(FComponentState& Component)
 {
 	TArray<double> RankWidths;
+	TArray<double> RankInputCorridors;
+	TArray<TArray<double>> AuthoredRankPositions;
 	RankWidths.Init(0.0, Component.Layers.Num());
+	RankInputCorridors.Init(0.0, Component.Layers.Num());
+	AuthoredRankPositions.SetNum(Component.Layers.Num());
 	for (int32 Rank = 0; Rank < Component.Layers.Num(); ++Rank)
 	{
 		for (const int32 VertexIndex : Component.Layers[Rank])
 		{
-			RankWidths[Rank] = FMath::Max(RankWidths[Rank], Vertices[VertexIndex].Size.X);
+			const FVertexState& Vertex = Vertices[VertexIndex];
+			RankWidths[Rank] = FMath::Max(RankWidths[Rank], Vertex.Size.X);
+			if (IsPreserveMode())
+			{
+				if (!Vertex.bVirtual)
+				{
+					TSet<int32> Visiting;
+					RankInputCorridors[Rank] =
+						FMath::Max(RankInputCorridors[Rank], MeasurePureInputCorridor(Vertex.Node, Visiting));
+				}
+				if (Component.bHasAuthoredAnchor && Vertex.bHasOriginalPosition)
+				{
+					AuthoredRankPositions[Rank].Add(Vertex.OriginalPosition.X);
+				}
+			}
 		}
 	}
 	double X = 0.0;
+	const double ColumnGrid = IsPreserveMode() ? LayoutCell() : GridX();
+	const double MinimumGap = FMath::Max(Settings.HorizontalSpacing, LayoutCell());
 	for (int32 Rank = 0; Rank < Component.Layers.Num(); ++Rank)
 	{
 		if (Rank > 0)
 		{
-			X += RankWidths[Rank - 1] + Settings.HorizontalSpacing;
-			X = SnapUp(X, GridX());
+			double ColumnDelta = RankWidths[Rank - 1] + MinimumGap + RankInputCorridors[Rank];
+			if (IsPreserveMode() && !AuthoredRankPositions[Rank - 1].IsEmpty() && !AuthoredRankPositions[Rank].IsEmpty())
+			{
+				// Preserve a generous authored statement column. A rank only moves right when
+				// the widest previous node, its provider corridor, or the configured gutter
+				// requires expansion; preservation mode never compacts a clean authored gap.
+				// Measure each adjacent authored delta independently so expanding an earlier
+				// cramped column propagates right without consuming a later generous gap. The
+				// absolute positions also keep root-column clustering from changing the delta.
+				const double AuthoredDelta = Median(AuthoredRankPositions[Rank]) - Median(AuthoredRankPositions[Rank - 1]);
+				ColumnDelta = FMath::Max(ColumnDelta, SnapUp(AuthoredDelta, LayoutCell()));
+			}
+			X = SnapUp(X + ColumnDelta, ColumnGrid);
 		}
 		for (const int32 VertexIndex : Component.Layers[Rank])
 		{
@@ -1662,9 +2071,22 @@ void FLayoutBuilder::PositionAlignmentBlocks(FComponentState& Component, TArray<
 	{
 		FAlignmentBlock& Block = Blocks[BlockIndex];
 		double BaseY = 0.0;
+		if (IsPreserveMode() && Component.bHasAuthoredAnchor)
+		{
+			TArray<double> AuthoredBases;
+			for (const int32 VertexIndex : Block.Vertices)
+			{
+				const FVertexState& Vertex = Vertices[VertexIndex];
+				if (Vertex.bHasOriginalPosition)
+				{
+					AuthoredBases.Add(Vertex.OriginalPosition.Y - Component.AuthoredAnchor.Y - Vertex.RelativeY);
+				}
+			}
+			if (!AuthoredBases.IsEmpty()) { BaseY = Median(MoveTemp(AuthoredBases)); }
+		}
 		for (const int32 VertexIndex : Block.Vertices)
 		{
-			BaseY = FMath::Max(BaseY, -Vertices[VertexIndex].RelativeY);
+			if (!IsPreserveMode()) { BaseY = FMath::Max(BaseY, -Vertices[VertexIndex].RelativeY); }
 			const int32 Rank = Vertices[VertexIndex].Rank;
 			const int32 Order = Vertices[VertexIndex].Order;
 			if (Order == 0) { continue; }
@@ -1691,7 +2113,8 @@ void FLayoutBuilder::PositionAlignmentBlocks(FComponentState& Component, TArray<
 					FMath::Max(BaseY, BeforeBottom + Clearance + Settings.BranchSpacing - Vertices[VertexIndex].RelativeY);
 			}
 		}
-		Block.BaseY = IsGridEnabled() ? SnapUp(BaseY, GridY()) : BaseY;
+		const double BlockGrid = IsPreserveMode() ? LayoutCell() : GridY();
+		Block.BaseY = IsGridEnabled() ? SnapUp(BaseY, BlockGrid) : BaseY;
 		for (const int32 VertexIndex : Block.Vertices)
 		{
 			double Y = Block.BaseY + Vertices[VertexIndex].RelativeY;
@@ -1719,7 +2142,7 @@ void FLayoutBuilder::PlaceExecutionLayers()
 		TArray<FAlignmentBlock> Blocks;
 		SelectAlignmentBlocks(Component, Blocks);
 		OrderAlignmentBlocks(Component, Blocks);
-		if (CountCrossings(Component) > CrossingOptimizedCount)
+		if (!IsPreserveMode() && CountCrossings(Component) > CrossingOptimizedCount)
 		{
 			// Alignment is a secondary objective. If block coalescing damages the saved crossing
 			// optimum, fall back to singleton blocks while preserving the exact layer order.
@@ -1772,15 +2195,16 @@ double FLayoutBuilder::FindCollisionFreeY(
 	const FNodeState& Node, const double X, const double DesiredY, const TArray<FRect>& Obstacles
 ) const
 {
-	TArray<double> Candidates{ IsGridEnabled() ? SnapNearest(DesiredY, GridY()) : DesiredY };
+	const double PlacementGrid = IsPreserveMode() ? LayoutCell() : GridY();
+	TArray<double> Candidates{ IsGridEnabled() ? SnapNearest(DesiredY, PlacementGrid) : DesiredY };
 	for (const FRect& Obstacle : Obstacles)
 	{
 		const bool bHorizontalOverlap = X < Obstacle.Right && X + Node.Snapshot.Size.X > Obstacle.Left;
 		if (bHorizontalOverlap)
 		{
-			Candidates.Add(IsGridEnabled() ? SnapUp(Obstacle.Bottom, GridY()) : Obstacle.Bottom);
+			Candidates.Add(IsGridEnabled() ? SnapUp(Obstacle.Bottom, PlacementGrid) : Obstacle.Bottom);
 			Candidates.Add(
-				IsGridEnabled() ? SnapDown(Obstacle.Top - Node.Snapshot.Size.Y, GridY())
+				IsGridEnabled() ? SnapDown(Obstacle.Top - Node.Snapshot.Size.Y, PlacementGrid)
 								: Obstacle.Top - Node.Snapshot.Size.Y
 			);
 		}
@@ -1807,7 +2231,59 @@ double FLayoutBuilder::FindCollisionFreeY(
 	return Candidates.IsEmpty() ? DesiredY : Candidates.Last();
 }
 
-void FLayoutBuilder::PlacePureNode(const int32 NodeIndex, const TArray<int32>& PlacedTargets, TArray<FRect>& Obstacles)
+double FLayoutBuilder::FindCollisionFreeProviderY(
+	const FNodeState& Node, const double X, const double DesiredY, const EProviderSide ProviderSide, const TArray<FRect>& Obstacles
+) const
+{
+	const double PlacementGrid = LayoutCell();
+	const bool bAbove = ProviderSide == EProviderSide::Above;
+	const double DirectionalStart =
+		IsGridEnabled() ? (bAbove ? SnapDown(DesiredY, PlacementGrid) : SnapUp(DesiredY, PlacementGrid)) : DesiredY;
+	TArray<double> Candidates{ DirectionalStart };
+	for (const FRect& Obstacle : Obstacles)
+	{
+		const bool bHorizontalOverlap = X < Obstacle.Right && X + Node.Snapshot.Size.X > Obstacle.Left;
+		if (!bHorizontalOverlap) { continue; }
+		const double Candidate = bAbove ? Obstacle.Top - Node.Snapshot.Size.Y : Obstacle.Bottom;
+		const double SnappedCandidate =
+			IsGridEnabled() ? (bAbove ? SnapDown(Candidate, PlacementGrid) : SnapUp(Candidate, PlacementGrid)) : Candidate;
+		if ((bAbove && SnappedCandidate <= DirectionalStart) || (!bAbove && SnappedCandidate >= DirectionalStart))
+		{
+			Candidates.Add(SnappedCandidate);
+		}
+	}
+	Candidates.Sort([bAbove](const double A, const double B) { return bAbove ? A > B : A < B; });
+
+	for (const double Candidate : Candidates)
+	{
+		const FRect CandidateRect{ X, Candidate, X + Node.Snapshot.Size.X, Candidate + Node.Snapshot.Size.Y };
+		bool bCollision = false;
+		for (const FRect& Obstacle : Obstacles)
+		{
+			bCollision |= RectsOverlap(CandidateRect, Obstacle);
+		}
+		if (!bCollision) { return Candidate; }
+	}
+
+	// A candidate immediately beyond the outermost horizontally relevant obstacle is always
+	// directionally valid. This fallback also keeps malformed or zero-sized snapshots deterministic.
+	double Extreme = DirectionalStart;
+	for (const FRect& Obstacle : Obstacles)
+	{
+		if (X >= Obstacle.Right || X + Node.Snapshot.Size.X <= Obstacle.Left) { continue; }
+		Extreme = bAbove ? FMath::Min(Extreme, Obstacle.Top - Node.Snapshot.Size.Y) : FMath::Max(Extreme, Obstacle.Bottom);
+	}
+	return IsGridEnabled() ? (bAbove ? SnapDown(Extreme, PlacementGrid) : SnapUp(Extreme, PlacementGrid)) : Extreme;
+}
+
+void FLayoutBuilder::PlacePureNode(
+	const int32 NodeIndex,
+	const TArray<int32>& PlacedTargets,
+	const int32 PrimaryTarget,
+	const EProviderSide ProviderSide,
+	const double ProviderColumnWidth,
+	TArray<FRect>& Obstacles
+)
 {
 	FNodeState& Node = Nodes[NodeIndex];
 	double DesiredX = 0.0;
@@ -1824,9 +2300,44 @@ void FLayoutBuilder::PlacePureNode(const int32 NodeIndex, const TArray<int32>& P
 		const double TargetPinY = Target.Position.Y + GetPort(Edge.TargetNode, Edge.TargetPort).Snapshot.Offset.Y;
 		DesiredPinYs.Add(TargetPinY - GetPort(Edge.SourceNode, Edge.SourcePort).Snapshot.Offset.Y);
 	}
-	DesiredX = IsGridEnabled() ? SnapDown(DesiredX, GridX()) : DesiredX;
-	const double DesiredY = Median(MoveTemp(DesiredPinYs));
-	const double PositionY = FindCollisionFreeY(Node, DesiredX, DesiredY, Obstacles);
+	if (IsPreserveMode() && PrimaryTarget != INDEX_NONE)
+	{
+		const double ProviderGap = FMath::Max(Settings.PureNodeHorizontalSpacing, LayoutCell());
+		DesiredX = Nodes[PrimaryTarget].Position.X - ProviderGap - ProviderColumnWidth;
+		bHasX = true;
+	}
+	const double ProviderGrid = IsPreserveMode() ? LayoutCell() : GridX();
+	DesiredX = IsGridEnabled() ? SnapDown(DesiredX, ProviderGrid) : DesiredX;
+	if (IsPreserveMode())
+	{
+		double MinimumX = 0.0;
+		bool bHasMinimumX = false;
+		for (const int32 EdgeIndex : Node.DataIn)
+		{
+			const FNodeState& Source = Nodes[DataEdges[EdgeIndex].SourceNode];
+			if (Source.bPlaced && IsExecutionParticipant(Source))
+			{
+				const double CandidateX = Source.Position.X + Source.Snapshot.Size.X + LayoutCell();
+				MinimumX = bHasMinimumX ? FMath::Max(MinimumX, CandidateX) : CandidateX;
+				bHasMinimumX = true;
+			}
+		}
+		if (bHasMinimumX) { DesiredX = SnapUp(FMath::Max(DesiredX, MinimumX), LayoutCell()); }
+	}
+	double DesiredY = Median(MoveTemp(DesiredPinYs));
+	if (IsPreserveMode() && PrimaryTarget != INDEX_NONE)
+	{
+		const FNodeState& Target = Nodes[PrimaryTarget];
+		const double VerticalGap = FMath::Max(Settings.PureNodeVerticalSpacing, LayoutCell());
+		if (ProviderSide == EProviderSide::Above) { DesiredY = Target.Position.Y - VerticalGap - Node.Snapshot.Size.Y; }
+		else
+		{
+			DesiredY = Target.Position.Y + Target.Snapshot.Size.Y + VerticalGap;
+		}
+	}
+	const double PositionY = IsPreserveMode()
+							   ? FindCollisionFreeProviderY(Node, DesiredX, DesiredY, ProviderSide, Obstacles)
+							   : FindCollisionFreeY(Node, DesiredX, DesiredY, Obstacles);
 	Node.Position = FVector2D{ DesiredX, PositionY };
 	Node.bPlaced = true;
 	const double VerticalClearance = FMath::Max(Settings.CollisionClearance, Settings.PureNodeVerticalSpacing);
@@ -1839,8 +2350,10 @@ void FLayoutBuilder::PlacePureWave(FComponentState& Component, TArray<int32>& Re
 	{
 		int32 Node{ INDEX_NONE };
 		TArray<int32> Targets;
-		FString PrimaryTargetKey;
+		int32 PrimaryTarget{ INDEX_NONE };
 		int32 TargetPortOrder{ 0 };
+		int64 ProviderColumnKey{ 0 };
+		EProviderSide ProviderSide{ EProviderSide::Above };
 	};
 	TArray<FCandidate> Candidates;
 	for (const int32 NodeIndex : RemainingPureNodes)
@@ -1854,19 +2367,47 @@ void FLayoutBuilder::PlacePureWave(FComponentState& Component, TArray<int32>& Re
 			if (Nodes[Edge.TargetNode].bPlaced && Nodes[Edge.TargetNode].Component == Nodes[NodeIndex].Component)
 			{
 				Candidate.Targets.AddUnique(Edge.TargetNode);
-				const FString& TargetKey = Nodes[Edge.TargetNode].Snapshot.Key.Value;
-				if (Candidate.PrimaryTargetKey.IsEmpty() || StableLess(TargetKey, Candidate.PrimaryTargetKey))
+				const int32 PortOrder = GetPort(Edge.TargetNode, Edge.TargetPort).Snapshot.SemanticOrder;
+				if (Candidate.PrimaryTarget == INDEX_NONE || PortOrder < Candidate.TargetPortOrder
+					|| (PortOrder == Candidate.TargetPortOrder
+						&& AuthoredNodeLess(Edge.TargetNode, Candidate.PrimaryTarget)))
 				{
-					Candidate.PrimaryTargetKey = TargetKey;
+					Candidate.PrimaryTarget = Edge.TargetNode;
+					Candidate.TargetPortOrder = PortOrder;
 				}
-				Candidate.TargetPortOrder =
-					FMath::Min(Candidate.TargetPortOrder, GetPort(Edge.TargetNode, Edge.TargetPort).Snapshot.SemanticOrder);
 			}
 		}
 		if (!Candidate.Targets.IsEmpty())
 		{
-			Candidate.Targets.Sort([this](const int32 A, const int32 B)
-								   { return StableLess(Nodes[A].Snapshot.Key.Value, Nodes[B].Snapshot.Key.Value); });
+			Candidate.Targets.Sort(
+				[this](const int32 A, const int32 B)
+				{
+					return IsPreserveMode() ? AuthoredNodeLess(A, B)
+											: StableLess(Nodes[A].Snapshot.Key.Value, Nodes[B].Snapshot.Key.Value);
+				}
+			);
+			if (IsPreserveMode())
+			{
+				const FNodeState& Provider = Nodes[Candidate.Node];
+				const FNodeState& PrimaryTarget = Nodes[Candidate.PrimaryTarget];
+				if (Provider.Snapshot.bHasOriginalPosition && PrimaryTarget.Snapshot.bHasOriginalPosition)
+				{
+					const double ProviderCenter = Provider.Snapshot.OriginalPosition.Y + Provider.Snapshot.Size.Y * 0.5;
+					const double TargetCenter = PrimaryTarget.Snapshot.OriginalPosition.Y
+											  + PrimaryTarget.Snapshot.Size.Y * 0.5;
+					Candidate.ProviderSide = ProviderCenter <= TargetCenter ? EProviderSide::Above : EProviderSide::Below;
+				}
+				else
+				{
+					Candidate.ProviderSide = Candidate.TargetPortOrder * 2 < PrimaryTarget.Ports.Num()
+											   ? EProviderSide::Above
+											   : EProviderSide::Below;
+				}
+			}
+			Candidate.ProviderColumnKey =
+				IsPreserveMode()
+					? FMath::RoundToInt64(Nodes[Candidate.PrimaryTarget].Position.X / FMath::Max(1.0, LayoutCell()))
+					: static_cast<int64>(Candidate.PrimaryTarget);
 			Candidates.Add(MoveTemp(Candidate));
 		}
 	}
@@ -1876,14 +2417,37 @@ void FLayoutBuilder::PlacePureWave(FComponentState& Component, TArray<int32>& Re
 			const bool bLeftShared = A.Targets.Num() > 1;
 			const bool bRightShared = B.Targets.Num() > 1;
 			if (bLeftShared != bRightShared) { return !bLeftShared; }
-			if (!StableEqual(A.PrimaryTargetKey, B.PrimaryTargetKey))
+			if (A.PrimaryTarget != B.PrimaryTarget)
 			{
-				return StableLess(A.PrimaryTargetKey, B.PrimaryTargetKey);
+				return IsPreserveMode()
+						 ? AuthoredNodeLess(A.PrimaryTarget, B.PrimaryTarget)
+						 : StableLess(Nodes[A.PrimaryTarget].Snapshot.Key.Value, Nodes[B.PrimaryTarget].Snapshot.Key.Value);
 			}
-			if (A.TargetPortOrder != B.TargetPortOrder) { return A.TargetPortOrder < B.TargetPortOrder; }
+			if (!IsPreserveMode())
+			{
+				if (A.TargetPortOrder != B.TargetPortOrder) { return A.TargetPortOrder < B.TargetPortOrder; }
+				return StableLess(Nodes[A.Node].Snapshot.Key.Value, Nodes[B.Node].Snapshot.Key.Value);
+			}
+			if (A.ProviderSide != B.ProviderSide) { return A.ProviderSide == EProviderSide::Above; }
+			if (A.TargetPortOrder != B.TargetPortOrder)
+			{
+				return A.ProviderSide == EProviderSide::Above ? A.TargetPortOrder > B.TargetPortOrder
+															  : A.TargetPortOrder < B.TargetPortOrder;
+			}
+			if (IsPreserveMode() && Nodes[A.Node].Snapshot.bHasOriginalPosition && Nodes[B.Node].Snapshot.bHasOriginalPosition
+				&& Nodes[A.Node].Snapshot.OriginalPosition.Y != Nodes[B.Node].Snapshot.OriginalPosition.Y)
+			{
+				return Nodes[A.Node].Snapshot.OriginalPosition.Y < Nodes[B.Node].Snapshot.OriginalPosition.Y;
+			}
 			return StableLess(Nodes[A.Node].Snapshot.Key.Value, Nodes[B.Node].Snapshot.Key.Value);
 		}
 	);
+	TMap<int64, double> ProviderColumnWidths;
+	for (const FCandidate& Candidate : Candidates)
+	{
+		double& Width = ProviderColumnWidths.FindOrAdd(Candidate.ProviderColumnKey);
+		Width = FMath::Max(Width, Nodes[Candidate.Node].Snapshot.Size.X);
+	}
 
 	TArray<FRect> Obstacles;
 	const double VerticalClearance = FMath::Max(Settings.CollisionClearance, Settings.PureNodeVerticalSpacing);
@@ -1895,7 +2459,14 @@ void FLayoutBuilder::PlacePureWave(FComponentState& Component, TArray<int32>& Re
 	TSet<int32> PlacedThisWave;
 	for (const FCandidate& Candidate : Candidates)
 	{
-		PlacePureNode(Candidate.Node, Candidate.Targets, Obstacles);
+		PlacePureNode(
+			Candidate.Node,
+			Candidate.Targets,
+			Candidate.PrimaryTarget,
+			Candidate.ProviderSide,
+			ProviderColumnWidths.FindChecked(Candidate.ProviderColumnKey),
+			Obstacles
+		);
 		PlacedThisWave.Add(Candidate.Node);
 	}
 	RemainingPureNodes.RemoveAll([&PlacedThisWave](const int32 NodeIndex) { return PlacedThisWave.Contains(NodeIndex); });
@@ -1923,6 +2494,10 @@ void FLayoutBuilder::PlaceDataOnlyAnchors(FComponentState& Component, TArray<int
 			TEXT("A pure-data cycle has no downstream anchor; its stable first node was used as the anchor.")
 		);
 	}
+	if (IsPreserveMode())
+	{
+		Sinks.Sort([this](const int32 A, const int32 B) { return AuthoredNodeLess(A, B); });
+	}
 	const double VerticalClearance = FMath::Max(Settings.CollisionClearance, Settings.PureNodeVerticalSpacing);
 	TArray<FRect> Obstacles;
 	for (const int32 NodeIndex : Component.Nodes)
@@ -1935,8 +2510,14 @@ void FLayoutBuilder::PlaceDataOnlyAnchors(FComponentState& Component, TArray<int
 	for (const int32 NodeIndex : Sinks)
 	{
 		FNodeState& Node = Nodes[NodeIndex];
-		const double PositionY = FindCollisionFreeY(Node, 0.0, DesiredY, Obstacles);
-		Node.Position = FVector2D{ 0.0, PositionY };
+		double PositionX = 0.0;
+		if (IsPreserveMode() && Component.bHasAuthoredAnchor && Node.Snapshot.bHasOriginalPosition)
+		{
+			PositionX = SnapNearest(Node.Snapshot.OriginalPosition.X - Component.AuthoredAnchor.X, LayoutCell());
+			DesiredY = SnapNearest(Node.Snapshot.OriginalPosition.Y - Component.AuthoredAnchor.Y, LayoutCell());
+		}
+		const double PositionY = FindCollisionFreeY(Node, PositionX, DesiredY, Obstacles);
+		Node.Position = FVector2D{ PositionX, PositionY };
 		Node.bPlaced = true;
 		Obstacles.Add(MakeNodeObstacle(Node, Settings.CollisionClearance, VerticalClearance));
 		DesiredY = Node.Position.Y + Node.Snapshot.Size.Y + Settings.PureNodeVerticalSpacing;
@@ -1963,8 +2544,13 @@ void FLayoutBuilder::PlacePureDataNodes()
 				RemainingPureNodes.Add(NodeIndex);
 			}
 		}
-		RemainingPureNodes.Sort([this](const int32 A, const int32 B)
-								{ return StableLess(Nodes[A].Snapshot.Key.Value, Nodes[B].Snapshot.Key.Value); });
+		RemainingPureNodes.Sort(
+			[this](const int32 A, const int32 B)
+			{
+				return IsPreserveMode() ? AuthoredNodeLess(A, B)
+										: StableLess(Nodes[A].Snapshot.Key.Value, Nodes[B].Snapshot.Key.Value);
+			}
+		);
 		if (!bHasPlacedNode) { PlaceDataOnlyAnchors(Component, RemainingPureNodes); }
 		while (!RemainingPureNodes.IsEmpty())
 		{
@@ -2045,6 +2631,41 @@ void FLayoutBuilder::OffsetComponent(FComponentState& Component, const FVector2D
 
 void FLayoutBuilder::PackComponents()
 {
+	if (IsPreserveMode())
+	{
+		const double BandGap = SnapUp(FMath::Max(Settings.ComponentSpacing.Y, LayoutCell()), LayoutCell());
+		double PreviousBandBottom = 0.0;
+		bool bHasPreviousBand = false;
+		for (FComponentState& Component : Components)
+		{
+			const FRect Bounds = CalculateComponentBounds(Component);
+			FVector2D Offset{ FVector2D::ZeroVector };
+			if (Component.bHasAuthoredAnchor && Component.AnchorNode != INDEX_NONE)
+			{
+				const FVector2D PlannedAnchor = Nodes[Component.AnchorNode].Position;
+				const FVector2D SnappedAnchor{
+					SnapNearest(Component.AuthoredAnchor.X, LayoutCell()),
+					SnapNearest(Component.AuthoredAnchor.Y, LayoutCell()),
+				};
+				Offset = SnappedAnchor - PlannedAnchor;
+			}
+			else
+			{
+				Offset.X = SnapNearest(Bounds.Left, LayoutCell()) - Bounds.Left;
+				Offset.Y = bHasPreviousBand ? PreviousBandBottom + BandGap - Bounds.Top : -Bounds.Top;
+			}
+			const double ShiftedTop = Bounds.Top + Offset.Y;
+			if (bHasPreviousBand && ShiftedTop < PreviousBandBottom + BandGap)
+			{
+				Offset.Y += SnapUp(PreviousBandBottom + BandGap - ShiftedTop, LayoutCell());
+			}
+			OffsetComponent(Component, Offset);
+			PreviousBandBottom = Bounds.Bottom + Offset.Y;
+			bHasPreviousBand = true;
+		}
+		return;
+	}
+
 	double CursorX = 0.0;
 	double CursorY = 0.0;
 	double RowHeight = 0.0;
@@ -2081,6 +2702,10 @@ void FLayoutBuilder::BuildResult()
 	for (const FNodeState& Node : Nodes)
 	{
 		Plan.Nodes.Add(FPlannedNodePosition{ Node.Snapshot.Key, Node.Position, Node.Component, Node.Rank, Node.Order });
+		if (Node.Snapshot.bHasOriginalPosition)
+		{
+			Plan.Statistics.TotalNodeDisplacement += (Node.Position - Node.Snapshot.OriginalPosition).Size();
+		}
 	}
 	for (const FExecutionEdgeState& Edge : ExecutionEdges)
 	{
@@ -2105,6 +2730,10 @@ void FLayoutBuilder::BuildResult()
 	Plan.Statistics.AcceptedExecutionEdgeCount = ExecutionEdges.Num();
 	Plan.Statistics.AcceptedDataEdgeCount = DataEdges.Num();
 	Plan.Statistics.ComponentCount = Components.Num();
+	for (const FComponentState& Component : Components)
+	{
+		Plan.Statistics.AuthoredComponentCount += Component.bHasAuthoredAnchor ? 1 : 0;
+	}
 }
 
 FLayoutPlan FLayoutBuilder::Build()

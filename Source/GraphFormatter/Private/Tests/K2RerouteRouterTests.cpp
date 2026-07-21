@@ -1154,6 +1154,349 @@ bool FK2RerouteBoundaryFailureRollbackTest::RunTest(const FString& Parameters)
 	);
 	return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FK2RerouteRenderedGeometryTest,
+	"Project.Unit Tests.GraphFormatter.K2Routing.RenderedGeometryPrimitives",
+	EAutomationTestFlags::ProductFilter | EAutomationTestFlags::EditorContext
+)
+
+bool FK2RerouteRenderedGeometryTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	const TArray<FVector2D> LogicalPoints = { FVector2D(0.0, 0.0), FVector2D(200.0, 100.0), FVector2D(400.0, 200.0) };
+	const TArray<FVector2D> RenderedPoints = FK2RerouteRouter::BuildRenderedPolyline(LogicalPoints);
+	TestTrue(
+		TEXT("the rendered spline retains its output anchor"),
+		RenderedPoints.Num() >= 3 && RenderedPoints[0] == LogicalPoints[0]
+	);
+	TestTrue(
+		TEXT("the rendered spline retains its input anchor"),
+		RenderedPoints.Num() >= 3 && RenderedPoints.Last() == LogicalPoints.Last()
+	);
+	TestTrue(TEXT("the logical reroute waypoint remains on the rendered path"), RenderedPoints.Contains(LogicalPoints[1]));
+	for (const FVector2D& Point : RenderedPoints)
+	{
+		TestTrue(TEXT("every rendered spline point is finite"), FMath::IsFinite(Point.X) && FMath::IsFinite(Point.Y));
+	}
+
+	const TArray<FVector2D> Rising = { FVector2D(0.0, 0.0), FVector2D(100.0, 100.0) };
+	const TArray<FVector2D> Falling = { FVector2D(0.0, 100.0), FVector2D(100.0, 0.0) };
+	const TArray<FVector2D> Parallel = { FVector2D(0.0, 150.0), FVector2D(100.0, 150.0) };
+	TestTrue(
+		TEXT("rendered-polyline intersection detects a crossing"),
+		FK2RerouteRouter::RenderedPolylinesIntersect(Rising, Falling)
+	);
+	TestFalse(
+		TEXT("rendered-polyline intersection leaves separated paths alone"),
+		FK2RerouteRouter::RenderedPolylinesIntersect(Rising, Parallel)
+	);
+	const TArray<FVector2D> DegeneratePoint = { FVector2D(50.0, 50.0), FVector2D(50.0, 50.0) };
+	TestTrue(
+		TEXT("a degenerate point on a segment intersects in point-first order"),
+		FK2RerouteRouter::RenderedPolylinesIntersect(DegeneratePoint, Falling)
+	);
+	TestTrue(
+		TEXT("a degenerate point on a segment intersects in segment-first order"),
+		FK2RerouteRouter::RenderedPolylinesIntersect(Falling, DegeneratePoint)
+	);
+	const TArray<FVector2D> SharedStartA = { FVector2D(0.0, 0.0), FVector2D(50.0, 50.0), FVector2D(100.0, 100.0) };
+	const TArray<FVector2D> SharedStartDiverges = { FVector2D(0.0, 0.0), FVector2D(50.0, -50.0), FVector2D(100.0, -100.0) };
+	const TArray<FVector2D> SharedStartRecrosses = {
+		FVector2D(0.0, 0.0), FVector2D(50.0, -50.0), FVector2D(75.0, 75.0), FVector2D(100.0, -100.0)
+	};
+	const TArray<FVector2D> SharedStartReturnsToTerminal = {
+		FVector2D(0.0, 0.0), FVector2D(50.0, -50.0), FVector2D(0.0, 0.0), FVector2D(100.0, -100.0)
+	};
+	const TArray<FVector2D> SharedTerminal = { FVector2D(0.0, 0.0) };
+	TestFalse(
+		TEXT("an exact shared-pin touch is ignored when the paths then diverge"),
+		FK2RerouteRouter::RenderedPolylinesIntersectExceptAtSharedTerminals(SharedStartA, SharedStartDiverges, SharedTerminal)
+	);
+	TestTrue(
+		TEXT("ignoring a shared pin does not hide a later interior recrossing"),
+		FK2RerouteRouter::RenderedPolylinesIntersectExceptAtSharedTerminals(SharedStartA, SharedStartRecrosses, SharedTerminal)
+	);
+	TestTrue(
+		TEXT("a later return to the exact shared-terminal coordinate still counts"),
+		FK2RerouteRouter::RenderedPolylinesIntersectExceptAtSharedTerminals(SharedStartA, SharedStartReturnsToTerminal, SharedTerminal)
+	);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FK2RerouteStationaryReservationTest,
+	"Project.Unit Tests.GraphFormatter.K2Routing.StationaryContextWireIsReservationNotSkip",
+	EAutomationTestFlags::ProductFilter | EAutomationTestFlags::EditorContext
+)
+
+bool FK2RerouteStationaryReservationTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	FRouteFixture Fixture = MakeBackwardFixture();
+	FRerouteEdge Edge = MakeEdge(Fixture, TEXT("Stationary.Context"));
+	Edge.bReservationOnly = true;
+	const TSet<UEdGraphNode*> EmptyScope;
+	const FRerouteSettings Settings;
+	const FRerouteResult Result = FK2RerouteRouter::Route(
+		*Fixture.Graph, MakeArrayView(&Edge, 1), TConstArrayView<FRerouteObstacle>(), EmptyScope, Settings, 16.0
+	);
+
+	TestFalse(TEXT("a stationary context wire is not modified"), Result.WasModified());
+	TestEqual(TEXT("a stationary context wire is not reported as skipped"), Result.SkippedWires, 0);
+	TestTrue(TEXT("the stationary direct relationship remains intact"), HasDirectLink(*Fixture.Source, *Fixture.Destination));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FK2RerouteCrossingPairMonotonicityTest,
+	"Project.Unit Tests.GraphFormatter.K2Routing.RouteCannotIntroduceNewCrossingPair",
+	EAutomationTestFlags::ProductFilter | EAutomationTestFlags::EditorContext
+)
+
+bool FK2RerouteCrossingPairMonotonicityTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	FRouteFixture Fixture = MakeBackwardFixture();
+	UK2Node_Knot* BarrierSource = AddKnot(*Fixture.Graph, FVector2D(200.0, 0.0));
+	UK2Node_Knot* BarrierDestination = AddKnot(*Fixture.Graph, FVector2D(300.0, 0.0));
+	TestTrue(TEXT("the stationary barrier wire was created"), Connect(*Fixture.Graph, *BarrierSource, *BarrierDestination));
+
+	FRerouteEdge Target = MakeEdge(Fixture, TEXT("A.MonotonicTarget"));
+	Target.PreferredWaypoints = { FVector2D(400.0, 0.0), FVector2D(100.0, 0.0) };
+	FRerouteEdge Barrier;
+	Barrier.OutputPin = BarrierSource->GetOutputPin();
+	Barrier.InputPin = BarrierDestination->GetInputPin();
+	Barrier.OutputAnchor = FVector2D(200.0, 0.0);
+	Barrier.InputAnchor = FVector2D(300.0, 0.0);
+	Barrier.StableKey = TEXT("Z.StationaryBarrier");
+	Barrier.bExecution = true;
+	Barrier.bReservationOnly = true;
+	const TArray<FRerouteEdge> Edges = { Target, Barrier };
+	const TSet<UEdGraphNode*> Scope = { Fixture.Source, Fixture.Destination };
+	FRerouteSettings Settings;
+	// The two-knot preferred path overlaps the barrier, while every non-crossing generated
+	// alternative needs four knots. This isolates the hard crossing-pair acceptance rule.
+	Settings.MaxKnotsPerWire = 2;
+	const FRerouteResult Result =
+		FK2RerouteRouter::Route(*Fixture.Graph, Edges, TConstArrayView<FRerouteObstacle>(), Scope, Settings, 16.0);
+
+	TestFalse(TEXT("routing does not install a path that creates a new crossing pair"), Result.WasModified());
+	TestEqual(TEXT("the unsafe logical wire is reported as skipped"), Result.SkippedWires, 1);
+	TestTrue(TEXT("the original non-crossing target remains direct"), HasDirectLink(*Fixture.Source, *Fixture.Destination));
+	TestTrue(TEXT("the stationary barrier remains direct"), HasDirectLink(*BarrierSource, *BarrierDestination));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FK2RerouteEqualCountCrossingIdentityTest,
+	"Project.Unit Tests.GraphFormatter.K2Routing.RouteCannotSubstituteCrossingIdentity",
+	EAutomationTestFlags::ProductFilter | EAutomationTestFlags::EditorContext
+)
+
+bool FK2RerouteEqualCountCrossingIdentityTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	FRouteFixture Fixture = MakeBackwardFixture();
+	UK2Node_Knot* BaselineBarrierSource = AddKnot(*Fixture.Graph, FVector2D(200.0, 100.0));
+	UK2Node_Knot* BaselineBarrierDestination = AddKnot(*Fixture.Graph, FVector2D(300.0, 100.0));
+	UK2Node_Knot* CandidateBarrierSource = AddKnot(*Fixture.Graph, FVector2D(200.0, 0.0));
+	UK2Node_Knot* CandidateBarrierDestination = AddKnot(*Fixture.Graph, FVector2D(300.0, 0.0));
+	TestTrue(
+		TEXT("the baseline-only barrier wire was created"),
+		Connect(*Fixture.Graph, *BaselineBarrierSource, *BaselineBarrierDestination)
+	);
+	TestTrue(
+		TEXT("the candidate-only barrier wire was created"),
+		Connect(*Fixture.Graph, *CandidateBarrierSource, *CandidateBarrierDestination)
+	);
+
+	FRerouteEdge Target = MakeEdge(Fixture, TEXT("M.IdentityTarget"));
+	Target.PreferredWaypoints = { FVector2D(400.0, 0.0), FVector2D(100.0, 0.0) };
+	FRerouteEdge BaselineBarrier;
+	BaselineBarrier.OutputPin = BaselineBarrierSource->GetOutputPin();
+	BaselineBarrier.InputPin = BaselineBarrierDestination->GetInputPin();
+	BaselineBarrier.OutputAnchor = FVector2D(200.0, 100.0);
+	BaselineBarrier.InputAnchor = FVector2D(300.0, 100.0);
+	BaselineBarrier.StableKey = TEXT("A.BaselineBarrier");
+	BaselineBarrier.bExecution = true;
+	BaselineBarrier.bReservationOnly = true;
+	FRerouteEdge CandidateBarrier;
+	CandidateBarrier.OutputPin = CandidateBarrierSource->GetOutputPin();
+	CandidateBarrier.InputPin = CandidateBarrierDestination->GetInputPin();
+	CandidateBarrier.OutputAnchor = FVector2D(200.0, 0.0);
+	CandidateBarrier.InputAnchor = FVector2D(300.0, 0.0);
+	CandidateBarrier.StableKey = TEXT("Z.CandidateBarrier");
+	CandidateBarrier.bExecution = true;
+	CandidateBarrier.bReservationOnly = true;
+	const TArray<FRerouteEdge> Edges = { Target, BaselineBarrier, CandidateBarrier };
+	const TSet<UEdGraphNode*> Scope = { Fixture.Source, Fixture.Destination };
+	FRerouteSettings Settings;
+	Settings.MaxKnotsPerWire = 2;
+	const FRerouteResult Result =
+		FK2RerouteRouter::Route(*Fixture.Graph, Edges, TConstArrayView<FRerouteObstacle>(), Scope, Settings, 16.0);
+
+	TestFalse(TEXT("equal crossing counts cannot hide a new crossing identity"), Result.WasModified());
+	TestEqual(TEXT("the crossing-substitution route is reported as skipped"), Result.SkippedWires, 1);
+	TestTrue(TEXT("the original target remains direct"), HasDirectLink(*Fixture.Source, *Fixture.Destination));
+	TestTrue(TEXT("the baseline barrier remains direct"), HasDirectLink(*BaselineBarrierSource, *BaselineBarrierDestination));
+	TestTrue(
+		TEXT("the candidate barrier remains direct"), HasDirectLink(*CandidateBarrierSource, *CandidateBarrierDestination)
+	);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FK2RerouteManualKnotJunctionTest,
+	"Project.Unit Tests.GraphFormatter.K2Routing.ManualKnotInputAndOutputShareOnePhysicalTerminal",
+	EAutomationTestFlags::ProductFilter | EAutomationTestFlags::EditorContext
+)
+
+bool FK2RerouteManualKnotJunctionTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	UEdGraph* Graph = MakeGraph();
+	UK2Node_Knot* Source = AddKnot(*Graph, FVector2D(0.0, 100.0));
+	UK2Node_Knot* Junction = AddKnot(*Graph, FVector2D(200.0, 100.0));
+	UK2Node_Knot* Destination = AddKnot(*Graph, FVector2D(400.0, 100.0));
+	Connect(*Graph, *Source, *Junction);
+	Connect(*Graph, *Junction, *Destination);
+
+	FRerouteEdge First;
+	First.OutputPin = Source->GetOutputPin();
+	First.InputPin = Junction->GetInputPin();
+	First.OutputAnchor = FVector2D(0.0, 100.0);
+	First.InputAnchor = FVector2D(200.0, 100.0);
+	First.StableKey = TEXT("ManualJunction.First");
+	First.bExecution = true;
+	FRerouteEdge Second;
+	Second.OutputPin = Junction->GetOutputPin();
+	Second.InputPin = Destination->GetInputPin();
+	Second.OutputAnchor = FVector2D(200.0, 100.0);
+	Second.InputAnchor = FVector2D(400.0, 100.0);
+	Second.StableKey = TEXT("ManualJunction.Second");
+	Second.bExecution = true;
+	const TArray<FRerouteEdge> Edges = { First, Second };
+	const TSet<UEdGraphNode*> Scope = { Source, Junction, Destination };
+	const FRerouteSettings Settings;
+	const FRerouteResult Result =
+		FK2RerouteRouter::Route(*Graph, Edges, TConstArrayView<FRerouteObstacle>(), Scope, Settings, 16.0);
+
+	TestFalse(TEXT("adjacent manual-knot segments do not trigger a false crossing route"), Result.WasModified());
+	TestEqual(TEXT("adjacent manual-knot segments are not skipped"), Result.SkippedWires, 0);
+	TestTrue(TEXT("the first manual segment remains direct"), HasDirectLink(*Source, *Junction));
+	TestTrue(TEXT("the second manual segment remains direct"), HasDirectLink(*Junction, *Destination));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FK2RerouteMultiLinkManualKnotPreservationTest,
+	"Project.Unit Tests.GraphFormatter.K2Routing.MultiLinkManualKnotTangentIsPreserved",
+	EAutomationTestFlags::ProductFilter | EAutomationTestFlags::EditorContext
+)
+
+bool FK2RerouteMultiLinkManualKnotPreservationTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	FRouteFixture Fixture = MakeBackwardFixture();
+	UK2Node_Knot* Incoming = AddKnot(*Fixture.Graph, FVector2D(600.0, 100.0));
+	TestTrue(
+		TEXT("the source knot receives its authored second connection"), Connect(*Fixture.Graph, *Incoming, *Fixture.Source)
+	);
+	const FRerouteEdge Edge = MakeEdge(Fixture, TEXT("ManualKnot.MultiLinkEndpoint"));
+	const FRerouteResult Result = RouteEdge(Fixture, Edge);
+
+	TestFalse(TEXT("a multi-link manual endpoint is not rewritten from stale tangent averages"), Result.WasModified());
+	TestEqual(TEXT("the ambiguous manual-knot route is reported as skipped"), Result.SkippedWires, 1);
+	TestTrue(TEXT("the authored backward segment remains direct"), HasDirectLink(*Fixture.Source, *Fixture.Destination));
+	TestTrue(TEXT("the authored incoming segment remains direct"), HasDirectLink(*Incoming, *Fixture.Source));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FK2RerouteReversedManualKnotHintSideTest,
+	"Project.Unit Tests.GraphFormatter.K2Routing.ReversedManualKnotRejectsOppositeSideHint",
+	EAutomationTestFlags::ProductFilter | EAutomationTestFlags::EditorContext
+)
+
+bool FK2RerouteReversedManualKnotHintSideTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	FRouteFixture Fixture = MakeBackwardFixture();
+	FRerouteEdge Edge = MakeEdge(Fixture, TEXT("ManualKnot.ReversedHintSide"));
+	Edge.bReverseOutputTangent = true;
+	Edge.bReverseInputTangent = true;
+	// This authored hint uses ordinary endpoint sides and would flip both manual-knot
+	// tangents after installation. The router must discard it and use a reversed-side route.
+	Edge.PreferredWaypoints = {
+		FVector2D(448.0, 100.0),
+		FVector2D(448.0, 0.0),
+		FVector2D(48.0, 0.0),
+		FVector2D(48.0, 100.0),
+	};
+	const FRerouteResult Result = RouteEdge(Fixture, Edge);
+	const TArray<UK2Node_Knot*> Knots = GetGeneratedKnotsForLogicalEdge(*Fixture.Graph, Edge.StableKey);
+
+	TestEqual(TEXT("the backward wire still receives a safe generated route"), Result.RoutedWires, 1);
+	if (Knots.Num() >= 2)
+	{
+		TestTrue(
+			TEXT("the chosen source stub retains the reversed left side"),
+			GetKnotCenter(*Knots[0]).X < Edge.OutputAnchor.X
+		);
+		TestTrue(
+			TEXT("the chosen destination stub retains the reversed right side"),
+			GetKnotCenter(*Knots.Last()).X > Edge.InputAnchor.X
+		);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FK2RerouteReversedManualKnotObstacleTest,
+	"Project.Unit Tests.GraphFormatter.K2Routing.ReversedManualKnotEndpointCorridors",
+	EAutomationTestFlags::ProductFilter | EAutomationTestFlags::EditorContext
+)
+
+bool FK2RerouteReversedManualKnotObstacleTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	FRouteFixture Fixture = MakeBackwardFixture();
+	FRerouteEdge Edge = MakeEdge(Fixture, TEXT("ManualKnot.ReversedEndpoints"));
+	Edge.bReverseOutputTangent = true;
+	Edge.bReverseInputTangent = true;
+	Edge.PreferredWaypoints = {
+		FVector2D(352.0, 100.0),
+		FVector2D(352.0, 0.0),
+		FVector2D(144.0, 0.0),
+		FVector2D(144.0, 100.0),
+	};
+	const TArray<FRerouteObstacle> Obstacles = {
+		FRerouteObstacle{ Fixture.Source,      FBox2D(FVector2D(379.0, 88.0), FVector2D(421.0, 112.0)) },
+		FRerouteObstacle{ Fixture.Destination, FBox2D(FVector2D(79.0,  88.0), FVector2D(121.0, 112.0)) },
+	};
+	FRerouteSettings Settings;
+	Settings.ObstacleClearance = 0.0;
+	const FRerouteResult Result = RouteEdge(Fixture, Edge, Obstacles, Settings);
+	const TArray<UK2Node_Knot*> Knots = GetGeneratedKnotsForLogicalEdge(*Fixture.Graph, Edge.StableKey);
+
+	TestEqual(TEXT("the reversed manual-knot wire installs one safe route"), Result.RoutedWires, 1);
+	TestEqual(TEXT("the reversed endpoint corridors do not reject the route"), Result.SkippedWires, 0);
+	TestFalse(
+		TEXT("the routed wire replaces the backward direct link"), HasDirectLink(*Fixture.Source, *Fixture.Destination)
+	);
+	if (Knots.Num() >= 2)
+	{
+		TestTrue(
+			TEXT("the source stub exits through the reversed left side"), GetKnotCenter(*Knots[0]).X < Edge.OutputAnchor.X
+		);
+		TestTrue(
+			TEXT("the destination stub enters through the reversed right side"),
+			GetKnotCenter(*Knots.Last()).X > Edge.InputAnchor.X
+		);
+	}
+	return true;
+}
 } // namespace GraphFormatter::K2::Tests
 
 #endif

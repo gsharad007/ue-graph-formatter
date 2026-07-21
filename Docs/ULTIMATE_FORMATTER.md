@@ -198,8 +198,10 @@ The execution graph is the control-flow skeleton. Strongly connected components 
 deterministic acyclic component graph. That lets normal flow rank left-to-right while keeping a stable
 fallback for loop bodies and feedback edges.
 
-Disconnected execution/data components are solved independently and packed later. This prevents a
-small unrelated component from distorting the ranks of the main event flow.
+Preservation mode uses execution-only weak components as visual event paragraphs. Pure providers attach
+to their nearest downstream paragraph, while data and delegate links between impure paragraphs remain
+cross-paragraph routing relationships instead of merging both layouts. Full Reflow retains the broader
+all-edge component model as an explicit aggressive option.
 
 ### 6. Assign execution ranks
 
@@ -211,8 +213,9 @@ There is no `MaxLayerNodes` wrap. A rank has semantic meaning and grows vertical
 
 ### 7. Reduce crossings under semantic constraints
 
-Ordering begins from stable keys and branch-pin order. Alternating median/barycenter sweeps improve both
-directions, followed by bounded adjacent swaps. Exact crossing counts are measured before and after;
+Preservation ordering begins from authored Y/X positions and branch-pin order, with stable keys used only
+as the final deterministic tie-break. Full Reflow begins from stable keys. Alternating median/barycenter
+sweeps improve both directions, followed by bounded adjacent swaps. Exact crossing counts are measured before and after;
 the accepted order must not worsen the tracked objective. Dense graphs use a deterministic work budget
 rather than wall-clock timing, so a faster machine does not produce a different graph.
 
@@ -221,32 +224,47 @@ must remain visually ordered even if swapping them would remove one crossing.
 
 ### 8. Assign coordinates and straight execution blocks
 
-Rank widths include real node sizes and spacing. Alignment blocks attempt to align preferred execution
-output and input pins, not merely node centers. This is how straight execution wiring is achieved: node
-placement solves pin alignment first, while routing remains a fallback for unavoidable detours.
+Rank widths include real node sizes, recursively measured pure-input corridors, and spacing. Each next
+column starts after the widest prior node or statement compound plus at least one complete coarse layout
+cell. Alignment blocks attempt to align preferred execution output and input pins, not merely node
+centers. This is how straight execution wiring is achieved: node placement solves pin alignment first,
+while routing remains a fallback for unavoidable detours.
+
+In preservation mode, adjacent authored rank deltas are an expand-only lower bound. A cramped gap grows
+to satisfy the widest-node/provider-corridor clearance, and that growth propagates rightward without
+consuming a later generous gap. Deltas are measured independently from absolute authored positions, so
+nearby event roots can share a snapped start column without changing the spacing inside either paragraph.
+Interpolated authored positions on long-edge virtual ranks also contribute to those adjacent deltas, so a
+skip edge keeps a readable progression through intermediate columns instead of being compressed around
+the shorter real-node branch that established the ranks.
 
 Alignment proposals are rejected when they introduce collisions or worsen protected crossings. The
 result is snapped according to one of two policies:
 
 - **Node grid** snaps conventional node positions.
-- **Hybrid execution grid** snaps columns and alignment blocks while preserving execution-pin alignment
-  where integer node coordinates permit it.
+- **Hybrid execution grid** snaps columns and free satellites to a configurable coarse visual cell while
+  preserving execution-pin alignment even when a node top must leave the Y grid.
 
 ### 9. Place pure/data providers
 
-Pure nodes do not determine execution ranks. They are grouped upstream of the consumers they feed and
-ordered near the corresponding input pins. Shared providers use a deterministic compromise placement.
-Fallback placement searches for a clear slot rather than overlaying an already placed node.
+Pure nodes do not determine execution ranks. They are grouped in same-column consumer-local satellites,
+ordered by the corresponding input pins, and retain an authored above/below relationship when safe.
+Recursively reserved corridors keep pure chains between an impure producer and consumer; an upstream
+impure source forms a hard forward-X floor so the formatter cannot create the large reverse-running loops
+seen in the visual regression. Shared providers use a deterministic distance-aware compromise placement.
+Fallback placement searches for a clear coarse-grid slot rather than overlaying an already placed node.
 
 This phase is what makes a Blueprint look authored rather than like a generic DAG: inputs for one node
 read as a local group, while the execution spine remains easy to scan.
 
 ### 10. Pack components and avoid fixed nodes
 
-Disconnected components are packed with explicit component spacing. For a partial selection, unselected
-nodes and unrelated comments are fixed obstacles. A planned component moves as a whole to a grid-aligned
-clear position; the formatter does not scatter individual nodes around fixed content and destroy local
-structure.
+Preservation mode retains each event paragraph's authored root anchor and top-to-bottom order, then moves
+only a later paragraph downward when it must clear the previous paragraph plus the configured gutter.
+It never shelf-packs authored paragraphs horizontally. Full Reflow retains deterministic shelf packing.
+For a partial selection, unselected nodes and unrelated comments are fixed obstacles. A planned paragraph
+moves as a whole to a coarse-grid-aligned clear position; the formatter does not scatter individual nodes
+around fixed content and destroy local structure.
 
 ### 11. Plan comments
 
@@ -262,7 +280,9 @@ core is already idempotent.
 ### 12. Optionally plan wire routes
 
 Routing is explicit because adding knots changes topology. The router receives final node positions,
-real pin anchors, node obstacles, existing validated generated routes, and settings.
+real pin anchors, node obstacles, existing validated generated routes, every ordinary stationary wire in
+the graph-wide context, and settings. Out-of-scope wires are reservation-only: they constrain candidate
+channels without being mutated or reported as failed routes.
 
 A direct wire remains direct when it is readable. A route is considered for backward wires, node-
 obstructed wires, direct-wire conflicts, long data dependencies when enabled, or a non-trivial route
@@ -274,12 +294,17 @@ The route search is deterministic:
 
 1. Seed reservations for the current wire field and existing generated routes.
 2. Remove the candidate wire's own baseline while evaluating it.
-3. Reject candidates whose rendered spline intersects a node or itself.
-4. Score length, wire crossings, coincident segments, near-channel crowding, knot/wire conflicts, and
+3. Reject candidates whose rendered spline intersects a node or itself, or whose endpoint side would
+   change a single-link manual knot's tangent direction. Preserve multi-link manual-knot endpoints when
+   replacing one neighbor would make their post-install neighbor-average tangent ambiguous.
+4. Collect the stable identities of every wire crossed by the current baseline. Reject any candidate
+   that crosses an identity outside that set; sequential replacement therefore makes the graph-wide
+   crossing-pair set monotonically non-increasing.
+5. Score length, remaining wire crossings, coincident segments, near-channel crowding, knot/wire conflicts, and
    knot-box conflicts.
-5. Prefer a valid layout-core route without allowing that preference to overpower safety penalties.
-6. Reserve the accepted rendered route and knot boxes before considering the next wire.
-7. Stop deterministically when `K2RoutingPlanningWorkBudget` primitive geometry comparisons have been
+6. Prefer a valid layout-core route without allowing that preference to overpower safety rules.
+7. Reserve the accepted rendered route and knot boxes before considering the next wire.
+8. Stop deterministically when `K2RoutingPlanningWorkBudget` primitive geometry comparisons have been
    consumed, leaving the current and remaining wires unchanged.
 
 This is a bounded best-effort router, not a global minimum-crossing solver. See [Honest limitations](#honest-limitations).
@@ -334,8 +359,20 @@ matters for three common failures:
 - a backward knot can reverse a tangent and create a loop or self-intersection;
 - two logical channels can be distinct while their rendered splines cross or nearly coincide.
 
+The pre-mutation readability gate calls the same curve builder. It compares graph-wide node overlaps,
+wire/node intersections, and execution/data wire crossings before accepting a layout. A shared pin
+exempts only the exact common terminal touch: an overlapping shared segment or a later recross still
+counts. The input and output pin of one user-authored knot are treated as the same physical terminal,
+while distinct normal-node pins are not. User-authored knot endpoints use the same neighbor-average
+tangent reversal rule as Kismet. Existing generated knots participate in collision checks at their exact
+planned integer positions.
+Both authored and candidate passes have deterministic primitive-work budgets and reject conservatively on
+exhaustion.
+
 Node obstacles are inflated by configured clearance. Source and destination bodies expose only their
-short terminal corridors; the rest of each endpoint node remains an obstacle. Generated knot boxes are
+short terminal corridors, including the opposite-side corridor used by a reverse-facing manual knot;
+the rest of each endpoint node remains an obstacle. Missing Slate geometry for a knot uses its explicit
+42-by-24 size and shared center pin anchor rather than a generic node fallback. Generated knot boxes are
 also reservations, so a later wire should not run through the visible reroute handle.
 
 Custom graph connection policies, custom spline settings, and future engine rendering changes can still
@@ -414,6 +451,10 @@ The engine-independent layout tests cover:
 - linear execution alignment and semantic branch order;
 - scoped branch spacing and cycle condensation;
 - pure-provider grouping and collision fallback;
+- authored event-start clustering without collapsing full-cell or data-only columns;
+- expand-only authored execution gaps, including propagation across three ranks after root clustering
+  and interpolated evidence from long-edge virtual ranks;
+- directional, pin-ordered provider stacks, widest-provider columns, and preservation fixed points;
 - all-pairs node non-overlap;
 - disconnected component packing;
 - hybrid grid behavior;
@@ -431,6 +472,11 @@ The K2 routing tests cover:
 - competing, future-baseline, and existing-route reservations;
 - deterministic direct/direct crossing triggers, execution-over-data priority, and shared-terminal
   exemptions;
+- shared rendered-geometry primitives, degenerate-segment symmetry, interior recross detection, and
+  reservation-only stationary context wires;
+- user-authored knot physical-junction exemptions, reverse-side endpoint corridors, hint-side rejection,
+  and conservative multi-link tangent preservation;
+- post-layout routing that cannot introduce a new crossing pair;
 - bounded, insertion-order-independent planning-budget exhaustion;
 - layout-core preferred waypoints and straight-hint no-op;
 - malformed destination fan-in rejection;
@@ -478,6 +524,11 @@ screenshot or geometry manifest proves the visual result.
 | Branch-pin order violations | Zero. |
 | Execution crossings | Must not increase in the core ordering phase; track absolute result on the visual corpus. |
 | Straight primary execution links | Track ratio and prevent corpus regressions. |
+| Backward execution/data links | Never introduce backward execution; reject material backward-data regressions. |
+| Authored horizontal spacing | Expand gaps required by configured gutters, propagate that expansion, and never consume a later generous adjacent-rank gap. |
+| Authored event roots | Limit X/upward drift to coarse-grid snap tolerance and never invert top-to-bottom order. |
+| Unrouted wire/node intersections | Reject newly introduced rendered-spline intersections before mutation; evaluate direct and generated routes with the same flattened Kismet curve model. |
+| Rendered wire crossings | The pre-mutation layout gate permits no new execution or data crossing-pair identity, including equal-count substitutions; every installed reroute is additionally crossing-pair monotonic against the complete reserved wire field. |
 | Wire/node intersections | Zero for accepted generated routes under the stock Kismet policy. |
 | Bends and generated knots | Minimize after safety/crossings; enforce configured per-wire cap. |
 | Determinism | Identical plan across snapshot insertion permutations. |
@@ -498,6 +549,10 @@ The current architecture intentionally does not promise the following:
 - **Crossings can still remain.** Direct-wire intersections now trigger deterministic routing attempts,
   but a wire remains unchanged if every bounded candidate is unsafe, the knot cap is too small, or the
   planning-work budget is exhausted. There is no global rip-up/re-route optimizer yet.
+- **The pre-mutation gate is deliberately conservative.** A newly introduced rendered direct curve through a
+  node rejects the layout even when a later routing search might have found a detour. Existing generated
+  routes are assessed from their exact planned waypoint curves, but new-route planning still occurs
+  transactionally after the layout has passed this gate.
 - **Rendered-wire crowding is heuristic.** Adaptive spline flattening and a general angle/distance cost
   cover intersections and near-parallel microsegments, but they do not prove globally uniform clearance
   across every wire in a dense graph.
@@ -558,11 +613,14 @@ The current architecture intentionally does not promise the following:
 
 ### Phase 3: incremental and interactive stability
 
-- Treat untouched authored positions as soft constraints and minimize mental-map movement.
 - Add user locks for nodes, columns, comments, and routes.
 - Reformat the affected component after a local edit instead of repacking the whole graph.
 - Present a preview with quality metrics and allow layout-only versus layout+route acceptance.
 - Preserve prior channel identities where they remain safe.
+
+Preservation-first positioning, authored event-paragraph order, coarse-cell statement columns, and the
+pre-mutation readability rejection gate are implemented. This phase now concerns explicit user locks,
+incremental scope selection, and interactive preview rather than basic mental-map preservation.
 
 ### Phase 4: evidence-driven tuning
 

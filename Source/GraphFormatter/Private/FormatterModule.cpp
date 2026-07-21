@@ -143,7 +143,8 @@ void CollectActiveGraphTargets(const FFormatterCommandContext& Context, TArray<F
 		if (!EditorRootTab.IsValid()) { continue; }
 
 		TArray<SGraphEditor*> TabEditors;
-		CollectGraphEditors(EditorRootTab.ToSharedRef(), TabEditors);
+		// SDockTab only holds its content; the content is presented elsewhere in the docking tree.
+		CollectGraphEditors(EditorRootTab->GetContent(), TabEditors);
 		for (SGraphEditor* Editor : TabEditors)
 		{
 			if (!IsGraphOwnedByObject(Editor->GetCurrentGraph(), Object)) { continue; }
@@ -167,6 +168,17 @@ bool ResolveGraphTarget(const TSharedPtr<const FFormatterCommandContext>& Contex
 		if (UObject* Object = FindContextObjectForEditor(CursorEditor, *Context))
 		{
 			OutEditor = CursorEditor;
+			OutObject = Object;
+			return true;
+		}
+	}
+
+	// Moving from a graph to its toolbar removes the graph from the cursor path but not from the active window.
+	if (SGraphEditor* ActiveEditor = FFormatter::Instance().FindGraphEditorForTopLevelWindow())
+	{
+		if (UObject* Object = FindContextObjectForEditor(ActiveEditor, *Context))
+		{
+			OutEditor = ActiveEditor;
 			OutObject = Object;
 			return true;
 		}

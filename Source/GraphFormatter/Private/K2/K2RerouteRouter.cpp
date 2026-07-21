@@ -19,8 +19,6 @@ namespace GraphFormatter::K2
 namespace
 {
 constexpr TCHAR GeneratedRerouteMetadataKey[] = TEXT("GraphFormatter.GeneratedReroute");
-constexpr double KnotWidth = 42.0;
-constexpr double KnotHeight = 24.0;
 constexpr int32 MaxChannelCandidateCount = 24;
 constexpr double PreferredRouteBonus = 1.0e7;
 constexpr double ParallelCrowdingPenalty = 1.0e8;
@@ -58,6 +56,7 @@ struct FRouteGeometry
 {
 	TArray<FVector2D> RenderedPoints;
 	TArray<FBox2D> KnotBounds;
+	FBox2D RenderedBounds = FBox2D(EForceInit::ForceInit);
 	double RenderedLength = 0.0;
 };
 
@@ -68,6 +67,7 @@ struct FReservedRoute
 	const UEdGraphPin* InputPin = nullptr;
 	TArray<FVector2D> Points;
 	TArray<FBox2D> KnotBounds;
+	FBox2D Bounds = FBox2D(EForceInit::ForceInit);
 	bool bExecution = false;
 	bool bExistingGeneratedRoute = false;
 };
@@ -120,12 +120,16 @@ void AppendFlattenedBezier(
 	AppendFlattenedBezier(Middle, RightControl, SecondEnd, End, Depth + 1, OutPoints);
 }
 
-TArray<FVector2D> FlattenRenderedPolyline(TConstArrayView<FVector2D> LogicalPoints)
+TArray<FVector2D> FlattenRenderedPolyline(
+	TConstArrayView<FVector2D> LogicalPoints, const bool bReverseFirstTangent, const bool bReverseLastTangent
+)
 {
 	TArray<FVector2D> Result;
 	if (LogicalPoints.IsEmpty()) { return Result; }
 	TArray<bool> bReversedKnots;
 	bReversedKnots.Init(false, LogicalPoints.Num());
+	bReversedKnots[0] = bReverseFirstTangent;
+	bReversedKnots.Last() = bReverseLastTangent;
 	for (int32 Index = 1; Index + 1 < LogicalPoints.Num(); ++Index)
 	{
 		// FKismetConnectionDrawingPolicy reverses a knot when the average node to its right is
@@ -182,7 +186,7 @@ bool SegmentIntersectsBox(const FVector2D& Start, const FVector2D& End, const FB
 
 FBox2D MakeKnotBounds(const FVector2D& Center)
 {
-	const FVector2D Extent(KnotWidth * 0.5, KnotHeight * 0.5);
+	const FVector2D Extent(RerouteKnotWidth * 0.5, RerouteKnotHeight * 0.5);
 	return FBox2D(Center - Extent, Center + Extent);
 }
 
@@ -198,7 +202,19 @@ FSegmentInteraction GetSegmentInteraction(
 	const FVector2D BetweenStarts = SecondStart - FirstStart;
 	const double Denominator = Cross2D(FirstDelta, SecondDelta);
 	const double FirstLengthSquared = FirstDelta.SquaredLength();
-	if (FirstLengthSquared <= UE_DOUBLE_SMALL_NUMBER) { return Result; }
+	const double SecondLengthSquared = SecondDelta.SquaredLength();
+	if (FirstLengthSquared <= UE_DOUBLE_SMALL_NUMBER)
+	{
+		if (SecondLengthSquared <= UE_DOUBLE_SMALL_NUMBER)
+		{
+			Result.bIntersects = FirstStart.Equals(SecondStart);
+			Result.Intersection = FirstStart;
+			return Result;
+		}
+		// The ordinary collinearity/projection path already handles a degenerate second
+		// segment. Swap the arguments so point-versus-segment tests are symmetric.
+		return GetSegmentInteraction(SecondStart, SecondEnd, FirstStart, FirstEnd);
+	}
 
 	if (FMath::IsNearlyZero(Denominator))
 	{
@@ -226,8 +242,12 @@ FSegmentInteraction GetSegmentInteraction(
 	return Result;
 }
 
-bool IsPolylineTerminal(const FVector2D& Point, TConstArrayView<FVector2D> Polyline)
-{ return Polyline.Num() > 0 && (Point.Equals(Polyline[0]) || Point.Equals(Polyline.Last())); }
+bool IsTerminalAdjacentSegment(const FVector2D& Point, TConstArrayView<FVector2D> Polyline, const int32 SegmentEndIndex)
+{
+	return Polyline.Num() > 1
+		&& ((SegmentEndIndex == 1 && Point.Equals(Polyline[0]))
+			|| (SegmentEndIndex == Polyline.Num() - 1 && Point.Equals(Polyline.Last())));
+}
 
 double ProjectedOverlap(const double FirstStart, const double FirstEnd, const double SecondStart, const double SecondEnd)
 {
@@ -292,11 +312,17 @@ double PolylineLength(TConstArrayView<FVector2D> Points)
 	return Result;
 }
 
-FRouteGeometry MakeRouteGeometry(TConstArrayView<FVector2D> LogicalPoints)
+FRouteGeometry MakeRouteGeometry(
+	TConstArrayView<FVector2D> LogicalPoints, const bool bReverseFirstTangent = false, const bool bReverseLastTangent = false
+)
 {
 	FRouteGeometry Geometry;
-	Geometry.RenderedPoints = FlattenRenderedPolyline(LogicalPoints);
+	Geometry.RenderedPoints = FlattenRenderedPolyline(LogicalPoints, bReverseFirstTangent, bReverseLastTangent);
 	Geometry.RenderedLength = PolylineLength(Geometry.RenderedPoints);
+	for (const FVector2D& Point : Geometry.RenderedPoints)
+	{
+		Geometry.RenderedBounds += Point;
+	}
 	for (int32 Index = 1; Index + 1 < LogicalPoints.Num(); ++Index)
 	{
 		Geometry.KnotBounds.Add(MakeKnotBounds(LogicalPoints[Index]));
@@ -366,8 +392,8 @@ double RouteInteractionCost(
 				else if (
 					Interaction.bIntersects
 					&& !(
-						IsPolylineTerminal(Interaction.Intersection, Candidate.RenderedPoints)
-						&& IsPolylineTerminal(Interaction.Intersection, Reserved.Points)
+						IsTerminalAdjacentSegment(Interaction.Intersection, Candidate.RenderedPoints, CandidateSegment)
+						&& IsTerminalAdjacentSegment(Interaction.Intersection, Reserved.Points, ReservedSegment)
 					)
 				)
 				{
@@ -399,9 +425,10 @@ FReservedRoute MakeReservation(const FRerouteEdge& Edge, TConstArrayView<FVector
 		LogicalPoints.Add(Waypoint);
 	}
 	LogicalPoints.Add(Edge.InputAnchor);
-	FRouteGeometry Geometry = MakeRouteGeometry(LogicalPoints);
+	FRouteGeometry Geometry = MakeRouteGeometry(LogicalPoints, Edge.bReverseOutputTangent, Edge.bReverseInputTangent);
 	Reservation.Points = MoveTemp(Geometry.RenderedPoints);
 	Reservation.KnotBounds = MoveTemp(Geometry.KnotBounds);
+	Reservation.Bounds = Geometry.RenderedBounds;
 	return Reservation;
 }
 
@@ -411,6 +438,8 @@ bool RenderedPolylineIntersectsAnyObstacle(
 	TConstArrayView<FRerouteObstacle> Obstacles,
 	const UEdGraphNode* OutputNode,
 	const UEdGraphNode* InputNode,
+	const bool bReverseOutputTangent,
+	const bool bReverseInputTangent,
 	const double Clearance,
 	FRoutePlanningBudget& Budget
 )
@@ -424,16 +453,33 @@ bool RenderedPolylineIntersectsAnyObstacle(
 			FBox2D EffectiveBounds = Inflate(Obstacle.Bounds, Clearance + SplineFlatteningTolerance);
 			if (Obstacle.Node == OutputNode)
 			{
-				// Permit only the short terminal corridor leaving the output-facing edge; every
-				// later portion of the rendered spline must stay out of the source node body.
-				EffectiveBounds.Max.X = FMath::Min(EffectiveBounds.Max.X, LogicalPoints[0].X - SplineFlatteningTolerance);
+				// A user knot can reverse its rendered tangent. Retain only the half of the
+				// endpoint obstacle opposite the permitted exit corridor.
+				if (bReverseOutputTangent)
+				{
+					EffectiveBounds.Min.X =
+						FMath::Max(EffectiveBounds.Min.X, LogicalPoints[0].X + SplineFlatteningTolerance);
+				}
+				else
+				{
+					EffectiveBounds.Max.X =
+						FMath::Min(EffectiveBounds.Max.X, LogicalPoints[0].X - SplineFlatteningTolerance);
+				}
 			}
 			else if (Obstacle.Node == InputNode)
 			{
-				// Input pins are approached from the left. Keep the node body to the right as an
-				// obstacle instead of exempting the entire destination node.
-				EffectiveBounds.Min.X =
-					FMath::Max(EffectiveBounds.Min.X, LogicalPoints.Last().X + SplineFlatteningTolerance);
+				// Normal input pins are approached from the left; reversed user knots are
+				// approached from the right. Keep the opposite half as a real obstacle.
+				if (bReverseInputTangent)
+				{
+					EffectiveBounds.Max.X =
+						FMath::Min(EffectiveBounds.Max.X, LogicalPoints.Last().X - SplineFlatteningTolerance);
+				}
+				else
+				{
+					EffectiveBounds.Min.X =
+						FMath::Max(EffectiveBounds.Min.X, LogicalPoints.Last().X + SplineFlatteningTolerance);
+				}
 			}
 			if (EffectiveBounds.Min.X > EffectiveBounds.Max.X) { continue; }
 			if (SegmentIntersectsBox(
@@ -493,19 +539,114 @@ bool RenderedPolylineSelfIntersects(const FRouteGeometry& Geometry, FRoutePlanni
 	return false;
 }
 
+bool PinsSharePhysicalTerminal(const UEdGraphPin* First, const UEdGraphPin* Second)
+{
+	if (First == nullptr || Second == nullptr) { return false; }
+	if (First == Second) { return true; }
+	UEdGraphNode* FirstNode = First->GetOwningNodeUnchecked();
+	return FirstNode != nullptr && FirstNode == Second->GetOwningNodeUnchecked() && FirstNode->IsA<UK2Node_Knot>();
+}
+
 bool IsExactSharedTerminal(
-	const FVector2D& Intersection, const FRouteGeometry& Baseline, const FRerouteEdge& Edge, const FReservedRoute& Reserved
+	const FVector2D& Intersection,
+	const FRouteGeometry& Baseline,
+	const FRerouteEdge& Edge,
+	const FReservedRoute& Reserved,
+	const int32 BaselineSegment,
+	const int32 ReservedSegment
 )
 {
 	if (Baseline.RenderedPoints.IsEmpty() || Reserved.Points.IsEmpty()) { return false; }
-	const bool bAtCurrentOutput = Intersection.Equals(Baseline.RenderedPoints[0]);
-	const bool bAtCurrentInput = Intersection.Equals(Baseline.RenderedPoints.Last());
-	const bool bAtReservedOutput = Intersection.Equals(Reserved.Points[0]);
-	const bool bAtReservedInput = Intersection.Equals(Reserved.Points.Last());
-	return (bAtCurrentOutput && bAtReservedOutput && Edge.OutputPin == Reserved.OutputPin)
-		|| (bAtCurrentOutput && bAtReservedInput && Edge.OutputPin == Reserved.InputPin)
-		|| (bAtCurrentInput && bAtReservedOutput && Edge.InputPin == Reserved.OutputPin)
-		|| (bAtCurrentInput && bAtReservedInput && Edge.InputPin == Reserved.InputPin);
+	const bool bAtCurrentOutput = BaselineSegment == 1 && Intersection.Equals(Baseline.RenderedPoints[0]);
+	const bool bAtCurrentInput = BaselineSegment == Baseline.RenderedPoints.Num() - 1
+							  && Intersection.Equals(Baseline.RenderedPoints.Last());
+	const bool bAtReservedOutput = ReservedSegment == 1 && Intersection.Equals(Reserved.Points[0]);
+	const bool bAtReservedInput = ReservedSegment == Reserved.Points.Num() - 1
+							   && Intersection.Equals(Reserved.Points.Last());
+	return (bAtCurrentOutput && bAtReservedOutput && PinsSharePhysicalTerminal(Edge.OutputPin, Reserved.OutputPin))
+		|| (bAtCurrentOutput && bAtReservedInput && PinsSharePhysicalTerminal(Edge.OutputPin, Reserved.InputPin))
+		|| (bAtCurrentInput && bAtReservedOutput && PinsSharePhysicalTerminal(Edge.InputPin, Reserved.OutputPin))
+		|| (bAtCurrentInput && bAtReservedInput && PinsSharePhysicalTerminal(Edge.InputPin, Reserved.InputPin));
+}
+
+bool RouteIntersectsReservedRoute(
+	const FRouteGeometry& Route, const FRerouteEdge& Edge, const FReservedRoute& Reserved, FRoutePlanningBudget& Budget
+)
+{
+	if (!Route.RenderedBounds.bIsValid || !Reserved.Bounds.bIsValid
+		|| Route.RenderedBounds.Max.X < Reserved.Bounds.Min.X || Reserved.Bounds.Max.X < Route.RenderedBounds.Min.X
+		|| Route.RenderedBounds.Max.Y < Reserved.Bounds.Min.Y || Reserved.Bounds.Max.Y < Route.RenderedBounds.Min.Y)
+	{
+		return false;
+	}
+
+	for (int32 RouteSegment = 1; RouteSegment < Route.RenderedPoints.Num(); ++RouteSegment)
+	{
+		for (int32 ReservedSegment = 1; ReservedSegment < Reserved.Points.Num(); ++ReservedSegment)
+		{
+			if (!Budget.TryConsume()) { return false; }
+			const FSegmentInteraction Interaction = GetSegmentInteraction(
+				Route.RenderedPoints[RouteSegment - 1],
+				Route.RenderedPoints[RouteSegment],
+				Reserved.Points[ReservedSegment - 1],
+				Reserved.Points[ReservedSegment]
+			);
+			if (!Interaction.bIntersects) { continue; }
+			// A shared pin is only a zero-length terminal exemption. Collinear overlap or a
+			// later recrossing remains a real wire-pair interaction, matching the formatter gate.
+			if (Interaction.bCollinear
+				|| !IsExactSharedTerminal(Interaction.Intersection, Route, Edge, Reserved, RouteSegment, ReservedSegment))
+			{
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+TSet<FString> CollectIntersectingRouteKeys(
+	const FRouteGeometry& Route,
+	const FRerouteEdge& Edge,
+	TConstArrayView<FReservedRoute> ReservedRoutes,
+	FRoutePlanningBudget& Budget
+)
+{
+	TSet<FString> Result;
+	for (const FReservedRoute& Reserved : ReservedRoutes)
+	{
+		if (RouteIntersectsReservedRoute(Route, Edge, Reserved, Budget)) { Result.Add(Reserved.StableKey); }
+		if (Budget.bExhausted) { break; }
+	}
+	return Result;
+}
+
+bool KnotHasAdditionalConnections(const UEdGraphNode* Node)
+{
+	const UK2Node_Knot* Knot = Cast<UK2Node_Knot>(Node);
+	if (Knot == nullptr) { return false; }
+	const UEdGraphPin* InputPin = Knot->GetInputPin();
+	const UEdGraphPin* OutputPin = Knot->GetOutputPin();
+	const int32 LinkCount = (InputPin != nullptr ? InputPin->LinkedTo.Num() : 0)
+						  + (OutputPin != nullptr ? OutputPin->LinkedTo.Num() : 0);
+	return LinkCount > 1;
+}
+
+bool CandidatePreservesEndpointKnotTangents(
+	TConstArrayView<FVector2D> Candidate, const FRerouteEdge& Edge, const UEdGraphNode* OutputNode, const UEdGraphNode* InputNode
+)
+{
+	if (Candidate.Num() < 3) { return false; }
+	if (OutputNode != nullptr && OutputNode->IsA<UK2Node_Knot>())
+	{
+		const bool bCandidateReversesOutput = Candidate[1].X < Edge.OutputAnchor.X;
+		if (bCandidateReversesOutput != Edge.bReverseOutputTangent) { return false; }
+	}
+	if (InputNode != nullptr && InputNode->IsA<UK2Node_Knot>())
+	{
+		const bool bCandidateReversesInput = Edge.InputAnchor.X < Candidate[Candidate.Num() - 2].X;
+		if (bCandidateReversesInput != Edge.bReverseInputTangent) { return false; }
+	}
+	return true;
 }
 
 bool BaselineHasBlockingInteraction(
@@ -541,23 +682,8 @@ bool BaselineHasBlockingInteraction(
 			}
 		}
 
-		for (int32 BaselineSegment = 1; BaselineSegment < Baseline.RenderedPoints.Num(); ++BaselineSegment)
-		{
-			for (int32 ReservedSegment = 1; ReservedSegment < Reserved.Points.Num(); ++ReservedSegment)
-			{
-				if (!Budget.TryConsume()) { return false; }
-				const FSegmentInteraction Interaction = GetSegmentInteraction(
-					Baseline.RenderedPoints[BaselineSegment - 1],
-					Baseline.RenderedPoints[BaselineSegment],
-					Reserved.Points[ReservedSegment - 1],
-					Reserved.Points[ReservedSegment]
-				);
-				if (!Interaction.bIntersects) { continue; }
-				if (Interaction.bCollinear) { return true; }
-				const bool bSharedTerminal = IsExactSharedTerminal(Interaction.Intersection, Baseline, Edge, Reserved);
-				if (!bSharedTerminal) { return true; }
-			}
-		}
+		if (RouteIntersectsReservedRoute(Baseline, Edge, Reserved, Budget)) { return true; }
+		if (Budget.bExhausted) { return false; }
 	}
 	return false;
 }
@@ -583,9 +709,10 @@ TArray<FVector2D> BuildRoute(
 	const bool bBackward = Edge.InputAnchor.X <= Edge.OutputAnchor.X + Channel;
 
 	TArray<FVector2D> Baseline = { Edge.OutputAnchor, Edge.InputAnchor };
-	const FRouteGeometry BaselineGeometry = MakeRouteGeometry(Baseline);
+	const FRouteGeometry BaselineGeometry =
+		MakeRouteGeometry(Baseline, Edge.bReverseOutputTangent, Edge.bReverseInputTangent);
 	const bool bObstructed = RenderedPolylineIntersectsAnyObstacle(
-		BaselineGeometry, Baseline, Obstacles, OutputNode, InputNode, Clearance, Budget
+		BaselineGeometry, Baseline, Obstacles, OutputNode, InputNode, Edge.bReverseOutputTangent, Edge.bReverseInputTangent, Clearance, Budget
 	);
 	if (Budget.bExhausted) { return {}; }
 	const bool bWireConflict = BaselineHasBlockingInteraction(BaselineGeometry, Edge, ReservedRoutes, Budget);
@@ -606,6 +733,20 @@ TArray<FVector2D> BuildRoute(
 	const bool bHasPreferredRoute = PreferredRoute.Num() >= 3 && IsOrthogonalPolyline(PreferredRoute);
 	if (!bBackward && !bObstructed && !bWireConflict && !bLongData && !bHasPreferredRoute) { return {}; }
 	bOutRouteRequired = true;
+	// A multi-link manual knot derives its tangent direction from averages of every neighbor.
+	// Replacing only this edge can flip that average after installation, invalidating all planned
+	// spline geometry. Preserve such authored junctions rather than routing from stale tangents.
+	if (KnotHasAdditionalConnections(OutputNode) || KnotHasAdditionalConnections(InputNode))
+	{
+		OutFailure =
+			TEXT("A multi-link manual reroute endpoint was preserved because its post-route tangent is ambiguous.");
+		return {};
+	}
+	// Every direct baseline is reserved before planning begins. Requiring each replacement's
+	// crossing partners to be a subset of its current baseline partners makes the complete
+	// graph-wide crossing-pair set monotonically non-increasing throughout the routing pass.
+	const TSet<FString> BaselineCrossingKeys = CollectIntersectingRouteKeys(BaselineGeometry, Edge, ReservedRoutes, Budget);
+	if (Budget.bExhausted) { return {}; }
 
 	double TopCandidate = FMath::Min(Edge.OutputAnchor.Y, Edge.InputAnchor.Y) - Channel;
 	double BottomCandidate = FMath::Max(Edge.OutputAnchor.Y, Edge.InputAnchor.Y) + Channel;
@@ -629,15 +770,29 @@ TArray<FVector2D> BuildRoute(
 	int32 BestOrder = MAX_int32;
 	int32 MinimumRequiredKnots = MAX_int32;
 	bool bFoundObstacleClearRoute = false;
+	bool bRejectedNewCrossing = false;
 	const auto ConsiderCandidate = [&](TArray<FVector2D> Candidate, const int32 Order, const bool bPreferred)
 	{
 		if (Budget.bExhausted) { return; }
 		Candidate = SimplifyPolyline(MoveTemp(Candidate));
-		if (Candidate.Num() < 3 || !IsOrthogonalPolyline(Candidate)) { return; }
-		const FRouteGeometry CandidateGeometry = MakeRouteGeometry(Candidate);
+		if (Candidate.Num() < 3 || !IsOrthogonalPolyline(Candidate)
+			|| !CandidatePreservesEndpointKnotTangents(Candidate, Edge, OutputNode, InputNode))
+		{
+			return;
+		}
+		const FRouteGeometry CandidateGeometry =
+			MakeRouteGeometry(Candidate, Edge.bReverseOutputTangent, Edge.bReverseInputTangent);
 		if (RenderedPolylineSelfIntersects(CandidateGeometry, Budget) || Budget.bExhausted
 			|| RenderedPolylineIntersectsAnyObstacle(
-				CandidateGeometry, Candidate, Obstacles, OutputNode, InputNode, Clearance, Budget
+				CandidateGeometry,
+				Candidate,
+				Obstacles,
+				OutputNode,
+				InputNode,
+				Edge.bReverseOutputTangent,
+				Edge.bReverseInputTangent,
+				Clearance,
+				Budget
 			)
 			|| Budget.bExhausted)
 		{
@@ -648,6 +803,18 @@ TArray<FVector2D> BuildRoute(
 		const int32 RequiredKnots = Candidate.Num() - 2;
 		MinimumRequiredKnots = FMath::Min(MinimumRequiredKnots, RequiredKnots);
 		if (RequiredKnots > Settings.MaxKnotsPerWire) { return; }
+
+		const TSet<FString> CandidateCrossingKeys =
+			CollectIntersectingRouteKeys(CandidateGeometry, Edge, ReservedRoutes, Budget);
+		if (Budget.bExhausted) { return; }
+		for (const FString& CrossingKey : CandidateCrossingKeys)
+		{
+			if (!BaselineCrossingKeys.Contains(CrossingKey))
+			{
+				bRejectedNewCrossing = true;
+				return;
+			}
+		}
 
 		double Score = CandidateGeometry.RenderedLength
 					 + RouteInteractionCost(CandidateGeometry, ReservedRoutes, Channel, Budget);
@@ -670,9 +837,15 @@ TArray<FVector2D> BuildRoute(
 		const double HalfAvailableGap = (Edge.InputAnchor.X - Edge.OutputAnchor.X - GridSize) * 0.5;
 		TerminalStub = FMath::Min(Channel, FMath::Max(0.0, FMath::FloorToDouble(HalfAvailableGap / GridSize) * GridSize));
 	}
-	const double BaseOutputChannelX = Snap(Edge.OutputAnchor.X + TerminalStub, GridSize);
-	const double BaseInputChannelX = Snap(Edge.InputAnchor.X - TerminalStub, GridSize);
-	const double PortLaneStep = FMath::Max(Channel, Snap(KnotWidth + Channel, GridSize));
+	// Preserve the stock Kismet side chosen for user-authored reversed knots. Routing a
+	// reversed endpoint through the ordinary right-output/left-input stubs would make the
+	// rendered spline curl back through its endpoint node and can also change the knot's
+	// reversal after the new neighbor is installed.
+	const double OutputStubDirection = Edge.bReverseOutputTangent ? -1.0 : 1.0;
+	const double InputStubDirection = Edge.bReverseInputTangent ? 1.0 : -1.0;
+	const double BaseOutputChannelX = Snap(Edge.OutputAnchor.X + OutputStubDirection * TerminalStub, GridSize);
+	const double BaseInputChannelX = Snap(Edge.InputAnchor.X + InputStubDirection * TerminalStub, GridSize);
+	const double PortLaneStep = FMath::Max(Channel, Snap(RerouteKnotWidth + Channel, GridSize));
 	const int32 CandidateCount = FMath::Clamp(2 + ReservedRoutes.Num() * 2, 2, MaxChannelCandidateCount);
 	for (int32 CandidateIndex = 0; CandidateIndex < CandidateCount && !Budget.bExhausted; ++CandidateIndex)
 	{
@@ -680,8 +853,8 @@ TArray<FVector2D> BuildRoute(
 		const int32 ChannelRing = CandidateIndex / 2;
 		const double RouteY = bTop ? TopCandidate - ChannelRing * Channel : BottomCandidate + ChannelRing * Channel;
 		const double PortOffset = bGeometricallyBackward ? CandidateIndex * PortLaneStep : 0.0;
-		const double OutputChannelX = BaseOutputChannelX + PortOffset;
-		const double InputChannelX = BaseInputChannelX - PortOffset;
+		const double OutputChannelX = BaseOutputChannelX + OutputStubDirection * PortOffset;
+		const double InputChannelX = BaseInputChannelX + InputStubDirection * PortOffset;
 		if (!bGeometricallyBackward && OutputChannelX >= InputChannelX) { continue; }
 		TArray<FVector2D> Candidate;
 		Candidate.Add(Edge.OutputAnchor);
@@ -702,7 +875,11 @@ TArray<FVector2D> BuildRoute(
 		return BestRoute;
 	}
 
-	if (bFoundObstacleClearRoute && MinimumRequiredKnots != MAX_int32)
+	if (bRejectedNewCrossing)
+	{
+		OutFailure = TEXT("Every route within the configured knot limit would introduce a new wire crossing.");
+	}
+	else if (bFoundObstacleClearRoute && MinimumRequiredKnots != MAX_int32)
 	{
 		OutFailure = FString::Printf(
 			TEXT("The safe route needs %d knots, exceeding the configured limit of %d."), MinimumRequiredKnots, Settings.MaxKnotsPerWire
@@ -822,7 +999,7 @@ bool InstallRoute(
 	OutKnots.Reserve(Waypoints.Num());
 	for (int32 Index = 0; Index < Waypoints.Num(); ++Index)
 	{
-		const FVector2D TopLeft = Waypoints[Index] - FVector2D(KnotWidth * 0.5, KnotHeight * 0.5);
+		const FVector2D TopLeft = Waypoints[Index] - FVector2D(RerouteKnotWidth * 0.5, RerouteKnotHeight * 0.5);
 		UK2Node_Knot* Knot = CreateTransactionNeutralKnot(Graph, TopLeft);
 		if (!Knot)
 		{
@@ -877,6 +1054,55 @@ bool InstallRoute(
 	return true;
 }
 } // namespace
+
+TArray<FVector2D> FK2RerouteRouter::BuildRenderedPolyline(
+	const TConstArrayView<FVector2D> LogicalPoints, const bool bReverseFirstTangent, const bool bReverseLastTangent
+)
+{ return FlattenRenderedPolyline(LogicalPoints, bReverseFirstTangent, bReverseLastTangent); }
+
+bool FK2RerouteRouter::RenderedPolylinesIntersect(
+	const TConstArrayView<FVector2D> FirstPolyline, const TConstArrayView<FVector2D> SecondPolyline
+)
+{
+	return RenderedPolylinesIntersectExceptAtSharedTerminals(FirstPolyline, SecondPolyline, TConstArrayView<FVector2D>());
+}
+
+bool FK2RerouteRouter::RenderedPolylinesIntersectExceptAtSharedTerminals(
+	const TConstArrayView<FVector2D> FirstPolyline,
+	const TConstArrayView<FVector2D> SecondPolyline,
+	const TConstArrayView<FVector2D> IgnoredSharedTerminals
+)
+{
+	for (int32 FirstIndex = 1; FirstIndex < FirstPolyline.Num(); ++FirstIndex)
+	{
+		for (int32 SecondIndex = 1; SecondIndex < SecondPolyline.Num(); ++SecondIndex)
+		{
+			const FSegmentInteraction Interaction = GetSegmentInteraction(
+				FirstPolyline[FirstIndex - 1],
+				FirstPolyline[FirstIndex],
+				SecondPolyline[SecondIndex - 1],
+				SecondPolyline[SecondIndex]
+			);
+			if (!Interaction.bIntersects) { continue; }
+
+			bool bIgnoredSharedTerminal = false;
+			if (!Interaction.bCollinear && IsTerminalAdjacentSegment(Interaction.Intersection, FirstPolyline, FirstIndex)
+				&& IsTerminalAdjacentSegment(Interaction.Intersection, SecondPolyline, SecondIndex))
+			{
+				for (const FVector2D& IgnoredTerminal : IgnoredSharedTerminals)
+				{
+					if (Interaction.Intersection.Equals(IgnoredTerminal))
+					{
+						bIgnoredSharedTerminal = true;
+						break;
+					}
+				}
+			}
+			if (!bIgnoredSharedTerminal) { return true; }
+		}
+	}
+	return false;
+}
 
 bool FK2RerouteRouter::IsGeneratedRerouteNode(const UEdGraphNode* Node)
 {
@@ -937,7 +1163,8 @@ bool FK2RerouteRouter::FindGeneratedRoute(
 		if (OrderedKnots[Index].Ordinal != Index) { return false; }
 		OutKnots.Add(OrderedKnots[Index].Knot);
 		OutWaypoints.Add(FVector2D(
-			OrderedKnots[Index].Knot->NodePosX + KnotWidth * 0.5, OrderedKnots[Index].Knot->NodePosY + KnotHeight * 0.5
+			OrderedKnots[Index].Knot->NodePosX + RerouteKnotWidth * 0.5,
+			OrderedKnots[Index].Knot->NodePosY + RerouteKnotHeight * 0.5
 		));
 	}
 	return !OutWaypoints.IsEmpty();
@@ -1013,6 +1240,7 @@ FRerouteResult FK2RerouteRouter::Route(
 			}
 			continue;
 		}
+		if (Edge.bReservationOnly) { continue; }
 		if (!OutputNode || !InputNode || !Scope.Contains(OutputNode) || !Scope.Contains(InputNode))
 		{
 			++Result.SkippedWires;

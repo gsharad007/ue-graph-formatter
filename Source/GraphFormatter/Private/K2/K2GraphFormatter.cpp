@@ -34,6 +34,8 @@ constexpr double FallbackNodeWidth = 160.0;
 constexpr double FallbackNodeHeight = 80.0;
 constexpr double FallbackPinTop = 32.0;
 constexpr double FallbackPinPitch = 24.0;
+constexpr double ReadabilityEpsilon = 1.0;
+constexpr double MaterialReadabilityRatio = 1.25;
 constexpr int32 MaximumObstacleResolutionPasses = 4096;
 
 struct FAdapterPinRecord
@@ -61,6 +63,7 @@ struct FAdapterEdgeRecord
 	FString Key;
 	TArray<UEdGraphNode*> ExistingGeneratedKnots;
 	TArray<FVector2D> ExistingRouteWaypoints;
+	TArray<FVector2D> PlannedRouteWaypoints;
 	bool bExecution = false;
 	bool bExistingGeneratedRoute = false;
 	int32 BranchOrder = INDEX_NONE;
@@ -104,6 +107,56 @@ struct FCommentBoundsChange
 {
 	UEdGraphNode_Comment* Comment = nullptr;
 	FBox2D Bounds = FBox2D(EForceInit::ForceInit);
+};
+
+struct FReadabilityMetrics
+{
+	int32 OverlapPairCount = 0;
+	TSet<FString> OverlapPairs;
+	int32 BackwardExecutionEdgeCount = 0;
+	TSet<FString> BackwardExecutionEdges;
+	double BackwardExecutionDistance = 0.0;
+	int32 NonStraightPreferredExecutionEdgeCount = 0;
+	TSet<FString> NonStraightPreferredExecutionEdges;
+	double PreferredExecutionVerticalError = 0.0;
+	int32 BackwardDataEdgeCount = 0;
+	double BackwardDataDistance = 0.0;
+	TSet<FString> WiresThroughNodes;
+	TSet<FString> ExecutionWireCrossings;
+	TSet<FString> DataWireCrossings;
+	double MaximumExecutionRootHorizontalDrift = 0.0;
+	double MaximumExecutionRootUpwardDrift = 0.0;
+	int32 ExecutionRootOrderInversionCount = 0;
+	bool bWorkBudgetExhausted = false;
+};
+
+struct FReadabilityWorkBudget
+{
+	int64 Remaining = 0;
+
+	explicit FReadabilityWorkBudget(const int32 WorkBudget)
+		: Remaining(FMath::Max(0, WorkBudget))
+	{
+	}
+
+	bool TryConsume(const int64 Work)
+	{
+		if (Work < 0 || Work > Remaining) { return false; }
+		Remaining -= Work;
+		return true;
+	}
+};
+
+struct FMeasuredWirePath
+{
+	FString Key;
+	UEdGraphNode* OutputNode = nullptr;
+	UEdGraphNode* InputNode = nullptr;
+	const UEdGraphPin* OutputPin = nullptr;
+	const UEdGraphPin* InputPin = nullptr;
+	TArray<FVector2D> RenderedPoints;
+	FBox2D RenderedBounds = FBox2D(EForceInit::ForceInit);
+	bool bExecution = false;
 };
 
 [[nodiscard]]
@@ -191,6 +244,7 @@ FVector2D ResolveNodeSize(const UEdGraphNode& Node, const FGraphGeometrySnapshot
 			}
 		}
 	}
+	if (Node.IsA<UK2Node_Knot>()) { return FVector2D(RerouteKnotWidth, RerouteKnotHeight); }
 
 	const double PersistedWidth = static_cast<double>(Node.NodeWidth);
 	const double PersistedHeight = static_cast<double>(Node.NodeHeight);
@@ -212,6 +266,10 @@ FVector2D ResolvePinOffset(
 			return PinGeometry->NodeOffset;
 		}
 	}
+	if (Pin.GetOwningNodeUnchecked() != nullptr && Pin.GetOwningNodeUnchecked()->IsA<UK2Node_Knot>())
+	{
+		return FVector2D(RerouteKnotWidth * 0.5, RerouteKnotHeight * 0.5);
+	}
 
 	const double X = Pin.Direction == EGPD_Input ? 0.0 : NodeSize.X;
 	const double UnclampedY = FallbackPinTop + static_cast<double>(DirectionOrdinal) * FallbackPinPitch;
@@ -222,6 +280,561 @@ FVector2D ResolvePinOffset(
 [[nodiscard]]
 FBox2D MakeNodeBox(const FVector2D Position, const FVector2D Size)
 { return FBox2D(Position, Position + Size); }
+
+[[nodiscard]]
+bool HasPositiveAreaIntersection(const FBox2D& First, const FBox2D& Second)
+{
+	return First.Min.X < Second.Max.X - ReadabilityEpsilon && Second.Min.X < First.Max.X - ReadabilityEpsilon
+		&& First.Min.Y < Second.Max.Y - ReadabilityEpsilon && Second.Min.Y < First.Max.Y - ReadabilityEpsilon;
+}
+
+[[nodiscard]]
+bool TryResolveEdgeAnchors(
+	const FAdapterEdgeRecord& Edge,
+	const TMap<const UEdGraphPin*, FAdapterPinRecord>& PinRecords,
+	const TMap<UEdGraphNode*, FVector2D>& Positions,
+	FVector2D& OutOutputAnchor,
+	FVector2D& OutInputAnchor
+)
+{
+	UEdGraphNode* OutputNode = Edge.OutputPin != nullptr ? Edge.OutputPin->GetOwningNodeUnchecked() : nullptr;
+	UEdGraphNode* InputNode = Edge.InputPin != nullptr ? Edge.InputPin->GetOwningNodeUnchecked() : nullptr;
+	const FVector2D* OutputPosition = Positions.Find(OutputNode);
+	const FVector2D* InputPosition = Positions.Find(InputNode);
+	const FAdapterPinRecord* OutputPin = PinRecords.Find(Edge.OutputPin);
+	const FAdapterPinRecord* InputPin = PinRecords.Find(Edge.InputPin);
+	if (OutputPosition == nullptr || InputPosition == nullptr || OutputPin == nullptr || InputPin == nullptr)
+	{
+		return false;
+	}
+
+	OutOutputAnchor = *OutputPosition + OutputPin->Offset;
+	OutInputAnchor = *InputPosition + InputPin->Offset;
+	return true;
+}
+
+[[nodiscard]]
+bool TryResolvePinAnchor(
+	const UEdGraphPin& Pin,
+	const TMap<const UEdGraphPin*, FAdapterPinRecord>& PinRecords,
+	const TMap<UEdGraphNode*, FVector2D>& Positions,
+	FVector2D& OutAnchor
+)
+{
+	UEdGraphNode* Node = Pin.GetOwningNodeUnchecked();
+	const FVector2D* Position = Positions.Find(Node);
+	const FAdapterPinRecord* PinRecord = PinRecords.Find(&Pin);
+	if (Position == nullptr) { return false; }
+	if (PinRecord == nullptr)
+	{
+		// Validated formatter-generated knots are intentionally absent from semantic pin
+		// records, but they still participate in a neighboring manual knot's Kismet tangent
+		// average. Both knot pins render at the same physical center.
+		if (Node != nullptr && Node->IsA<UK2Node_Knot>())
+		{
+			OutAnchor = *Position + FVector2D(RerouteKnotWidth * 0.5, RerouteKnotHeight * 0.5);
+			return true;
+		}
+		return false;
+	}
+	OutAnchor = *Position + PinRecord->Offset;
+	return true;
+}
+
+[[nodiscard]]
+bool TryAverageConnectedPinAnchor(
+	const UEdGraphPin& Pin,
+	const TMap<const UEdGraphPin*, FAdapterPinRecord>& PinRecords,
+	const TMap<UEdGraphNode*, FVector2D>& Positions,
+	FVector2D& OutAverage
+)
+{
+	FVector2D Sum = FVector2D::ZeroVector;
+	int32 Count = 0;
+	for (const UEdGraphPin* LinkedPin : Pin.LinkedTo)
+	{
+		FVector2D Anchor;
+		if (LinkedPin != nullptr && TryResolvePinAnchor(*LinkedPin, PinRecords, Positions, Anchor))
+		{
+			Sum += Anchor;
+			++Count;
+		}
+	}
+	if (Count == 0) { return false; }
+	OutAverage = Sum / static_cast<double>(Count);
+	return true;
+}
+
+[[nodiscard]]
+bool ShouldReverseKnotTangent(
+	UEdGraphNode* Node,
+	const TMap<const UEdGraphPin*, FAdapterPinRecord>& PinRecords,
+	const TMap<UEdGraphNode*, FVector2D>& Positions
+)
+{
+	UK2Node_Knot* Knot = Cast<UK2Node_Knot>(Node);
+	if (Knot == nullptr) { return false; }
+	UEdGraphPin* InputPin = Knot->GetInputPin();
+	UEdGraphPin* OutputPin = Knot->GetOutputPin();
+	if (InputPin == nullptr || OutputPin == nullptr) { return false; }
+
+	FVector2D AverageLeft;
+	FVector2D AverageRight;
+	FVector2D Center;
+	const bool bLeftValid = TryAverageConnectedPinAnchor(*InputPin, PinRecords, Positions, AverageLeft);
+	const bool bRightValid = TryAverageConnectedPinAnchor(*OutputPin, PinRecords, Positions, AverageRight);
+	if (bLeftValid && bRightValid) { return AverageRight.X < AverageLeft.X; }
+	if (!TryResolvePinAnchor(*OutputPin, PinRecords, Positions, Center)) { return false; }
+	if (bLeftValid) { return Center.X < AverageLeft.X; }
+	return bRightValid && AverageRight.X < Center.X;
+}
+
+[[nodiscard]]
+bool PinsShareRenderedTerminal(const UEdGraphPin* First, const UEdGraphPin* Second)
+{
+	if (First == nullptr || Second == nullptr) { return false; }
+	if (First == Second) { return true; }
+	UEdGraphNode* FirstNode = First->GetOwningNodeUnchecked();
+	return FirstNode != nullptr && FirstNode == Second->GetOwningNodeUnchecked() && FirstNode->IsA<UK2Node_Knot>();
+}
+
+void MeasureNodeReadability(
+	TConstArrayView<FAdapterNodeRecord> Nodes,
+	const TMap<UEdGraphNode*, FVector2D>& Positions,
+	FReadabilityWorkBudget& WorkBudget,
+	FReadabilityMetrics& OutMetrics
+)
+{
+	for (int32 FirstIndex = 0; FirstIndex < Nodes.Num(); ++FirstIndex)
+	{
+		const FVector2D* FirstPosition = Positions.Find(Nodes[FirstIndex].Node);
+		if (FirstPosition == nullptr) { continue; }
+		const FBox2D FirstBounds = MakeNodeBox(*FirstPosition, Nodes[FirstIndex].Size);
+		for (int32 SecondIndex = FirstIndex + 1; SecondIndex < Nodes.Num(); ++SecondIndex)
+		{
+			const FVector2D* SecondPosition = Positions.Find(Nodes[SecondIndex].Node);
+			if (SecondPosition == nullptr) { continue; }
+			if (!WorkBudget.TryConsume(1))
+			{
+				OutMetrics.bWorkBudgetExhausted = true;
+				return;
+			}
+			const FBox2D SecondBounds = MakeNodeBox(*SecondPosition, Nodes[SecondIndex].Size);
+			if (HasPositiveAreaIntersection(FirstBounds, SecondBounds))
+			{
+				++OutMetrics.OverlapPairCount;
+				OutMetrics.OverlapPairs.Add(Nodes[FirstIndex].Key + TEXT("|") + Nodes[SecondIndex].Key);
+			}
+		}
+	}
+}
+
+[[nodiscard]]
+bool SegmentIntersectsBoxInterior(const FVector2D Start, const FVector2D End, const FBox2D& Box)
+{
+	// Shrink the rectangle so a wire merely touching a node's border or terminating at a pin
+	// does not count as travelling underneath that node.
+	const FVector2D InteriorMin = Box.Min + FVector2D(ReadabilityEpsilon, ReadabilityEpsilon);
+	const FVector2D InteriorMax = Box.Max - FVector2D(ReadabilityEpsilon, ReadabilityEpsilon);
+	if (InteriorMin.X >= InteriorMax.X || InteriorMin.Y >= InteriorMax.Y) { return false; }
+
+	double MinimumTime = 0.0;
+	double MaximumTime = 1.0;
+	const FVector2D Delta = End - Start;
+	const auto ClipAxis =
+		[&MinimumTime, &MaximumTime](
+			const double StartValue, const double DeltaValue, const double MinimumValue, const double MaximumValue
+		)
+	{
+		if (FMath::Abs(DeltaValue) <= UE_DOUBLE_SMALL_NUMBER)
+		{
+			return StartValue >= MinimumValue && StartValue <= MaximumValue;
+		}
+		double EntryTime = (MinimumValue - StartValue) / DeltaValue;
+		double ExitTime = (MaximumValue - StartValue) / DeltaValue;
+		if (EntryTime > ExitTime) { Swap(EntryTime, ExitTime); }
+		MinimumTime = FMath::Max(MinimumTime, EntryTime);
+		MaximumTime = FMath::Min(MaximumTime, ExitTime);
+		return MinimumTime <= MaximumTime;
+	};
+
+	return ClipAxis(Start.X, Delta.X, InteriorMin.X, InteriorMax.X)
+		&& ClipAxis(Start.Y, Delta.Y, InteriorMin.Y, InteriorMax.Y);
+}
+
+void MeasureWireReadability(
+	TConstArrayView<FAdapterNodeRecord> Nodes,
+	TConstArrayView<FAdapterEdgeRecord> Edges,
+	const TMap<const UEdGraphPin*, FAdapterPinRecord>& PinRecords,
+	const TMap<UEdGraphNode*, FVector2D>& Positions,
+	const bool bUsePlannedRoutes,
+	FReadabilityWorkBudget& WorkBudget,
+	FReadabilityMetrics& OutMetrics
+)
+{
+	TArray<FMeasuredWirePath> WirePaths;
+	WirePaths.Reserve(Edges.Num());
+	for (const FAdapterEdgeRecord& Edge : Edges)
+	{
+		FVector2D OutputAnchor;
+		FVector2D InputAnchor;
+		if (!TryResolveEdgeAnchors(Edge, PinRecords, Positions, OutputAnchor, InputAnchor)) { continue; }
+
+		TArray<FVector2D> LogicalPoints;
+		LogicalPoints.Add(OutputAnchor);
+		if (Edge.bExistingGeneratedRoute)
+		{
+			const TArray<FVector2D>& RouteWaypoints = bUsePlannedRoutes && !Edge.PlannedRouteWaypoints.IsEmpty()
+														? Edge.PlannedRouteWaypoints
+														: Edge.ExistingRouteWaypoints;
+			LogicalPoints.Append(RouteWaypoints);
+		}
+		LogicalPoints.Add(InputAnchor);
+		FMeasuredWirePath& Path = WirePaths.AddDefaulted_GetRef();
+		Path.Key = Edge.Key;
+		Path.OutputNode = Edge.OutputPin->GetOwningNodeUnchecked();
+		Path.InputNode = Edge.InputPin->GetOwningNodeUnchecked();
+		Path.OutputPin = Edge.OutputPin;
+		Path.InputPin = Edge.InputPin;
+		Path.bExecution = Edge.bExecution;
+		Path.RenderedPoints = FK2RerouteRouter::BuildRenderedPolyline(
+			LogicalPoints,
+			ShouldReverseKnotTangent(Path.OutputNode, PinRecords, Positions),
+			ShouldReverseKnotTangent(Path.InputNode, PinRecords, Positions)
+		);
+		if (!WorkBudget.TryConsume(Path.RenderedPoints.Num()))
+		{
+			OutMetrics.bWorkBudgetExhausted = true;
+			return;
+		}
+		for (const FVector2D Point : Path.RenderedPoints)
+		{
+			Path.RenderedBounds += Point;
+		}
+
+		const double BackwardDistance = FMath::Max(0.0, OutputAnchor.X - InputAnchor.X);
+		if (Edge.bExecution)
+		{
+			OutMetrics.BackwardExecutionDistance += BackwardDistance;
+			if (BackwardDistance > ReadabilityEpsilon)
+			{
+				++OutMetrics.BackwardExecutionEdgeCount;
+				OutMetrics.BackwardExecutionEdges.Add(Edge.Key);
+			}
+			if (Edge.bPreferredAlignment)
+			{
+				const double VerticalError = FMath::Abs(OutputAnchor.Y - InputAnchor.Y);
+				OutMetrics.PreferredExecutionVerticalError += VerticalError;
+				if (VerticalError > ReadabilityEpsilon)
+				{
+					++OutMetrics.NonStraightPreferredExecutionEdgeCount;
+					OutMetrics.NonStraightPreferredExecutionEdges.Add(Edge.Key);
+				}
+			}
+		}
+		else
+		{
+			OutMetrics.BackwardDataDistance += BackwardDistance;
+			OutMetrics.BackwardDataEdgeCount += BackwardDistance > ReadabilityEpsilon ? 1 : 0;
+		}
+	}
+
+	for (const FMeasuredWirePath& Path : WirePaths)
+	{
+		for (const FAdapterNodeRecord& Node : Nodes)
+		{
+			if (Node.Node == Path.OutputNode || Node.Node == Path.InputNode) { continue; }
+			const FVector2D* Position = Positions.Find(Node.Node);
+			if (Position == nullptr) { continue; }
+			const FBox2D NodeBounds = MakeNodeBox(*Position, Node.Size);
+			const bool bBoundsSeparated = Path.RenderedBounds.Max.X <= NodeBounds.Min.X
+									   || NodeBounds.Max.X <= Path.RenderedBounds.Min.X
+									   || Path.RenderedBounds.Max.Y <= NodeBounds.Min.Y
+									   || NodeBounds.Max.Y <= Path.RenderedBounds.Min.Y;
+			if (bBoundsSeparated) { continue; }
+			for (int32 PointIndex = 1; PointIndex < Path.RenderedPoints.Num(); ++PointIndex)
+			{
+				if (!WorkBudget.TryConsume(1))
+				{
+					OutMetrics.bWorkBudgetExhausted = true;
+					return;
+				}
+				if (SegmentIntersectsBoxInterior(
+						Path.RenderedPoints[PointIndex - 1], Path.RenderedPoints[PointIndex], NodeBounds
+					))
+				{
+					OutMetrics.WiresThroughNodes.Add(Path.Key + TEXT("|") + Node.Key);
+					break;
+				}
+			}
+		}
+	}
+
+	for (int32 FirstIndex = 0; FirstIndex < WirePaths.Num(); ++FirstIndex)
+	{
+		const FMeasuredWirePath& First = WirePaths[FirstIndex];
+		for (int32 SecondIndex = FirstIndex + 1; SecondIndex < WirePaths.Num(); ++SecondIndex)
+		{
+			const FMeasuredWirePath& Second = WirePaths[SecondIndex];
+			if (First.Key == Second.Key) { continue; }
+			const bool bBoundsSeparated = First.RenderedBounds.Max.X < Second.RenderedBounds.Min.X
+									   || Second.RenderedBounds.Max.X < First.RenderedBounds.Min.X
+									   || First.RenderedBounds.Max.Y < Second.RenderedBounds.Min.Y
+									   || Second.RenderedBounds.Max.Y < First.RenderedBounds.Min.Y;
+			if (bBoundsSeparated) { continue; }
+			const int64 FirstSegmentCount = FMath::Max(0, First.RenderedPoints.Num() - 1);
+			const int64 SecondSegmentCount = FMath::Max(0, Second.RenderedPoints.Num() - 1);
+			if (SecondSegmentCount > 0 && FirstSegmentCount > WorkBudget.Remaining / SecondSegmentCount)
+			{
+				OutMetrics.bWorkBudgetExhausted = true;
+				return;
+			}
+			if (!WorkBudget.TryConsume(FirstSegmentCount * SecondSegmentCount))
+			{
+				OutMetrics.bWorkBudgetExhausted = true;
+				return;
+			}
+
+			TArray<FVector2D, TInlineAllocator<2>> IgnoredSharedTerminals;
+			const auto AddIgnoredTerminal = [&IgnoredSharedTerminals](const FVector2D& Terminal)
+			{
+				if (!IgnoredSharedTerminals.ContainsByPredicate([&Terminal](const FVector2D& Existing)
+																{ return Existing.Equals(Terminal); }))
+				{
+					IgnoredSharedTerminals.Add(Terminal);
+				}
+			};
+			if (!First.RenderedPoints.IsEmpty() && !Second.RenderedPoints.IsEmpty())
+			{
+				if (PinsShareRenderedTerminal(First.OutputPin, Second.OutputPin))
+				{
+					AddIgnoredTerminal(First.RenderedPoints[0]);
+				}
+				if (PinsShareRenderedTerminal(First.OutputPin, Second.InputPin))
+				{
+					AddIgnoredTerminal(First.RenderedPoints[0]);
+				}
+				if (PinsShareRenderedTerminal(First.InputPin, Second.OutputPin))
+				{
+					AddIgnoredTerminal(First.RenderedPoints.Last());
+				}
+				if (PinsShareRenderedTerminal(First.InputPin, Second.InputPin))
+				{
+					AddIgnoredTerminal(First.RenderedPoints.Last());
+				}
+			}
+			if (!FK2RerouteRouter::RenderedPolylinesIntersectExceptAtSharedTerminals(
+					First.RenderedPoints, Second.RenderedPoints, IgnoredSharedTerminals
+				))
+			{
+				continue;
+			}
+
+			const bool bFirstKeyFirst = First.Key.Compare(Second.Key, ESearchCase::CaseSensitive) < 0;
+			const FString PairKey = bFirstKeyFirst ? First.Key + TEXT("|") + Second.Key
+												   : Second.Key + TEXT("|") + First.Key;
+			if (First.bExecution || Second.bExecution) { OutMetrics.ExecutionWireCrossings.Add(PairKey); }
+			else
+			{
+				OutMetrics.DataWireCrossings.Add(PairKey);
+			}
+		}
+	}
+}
+
+void MeasureExecutionRootMovement(
+	TConstArrayView<FAdapterNodeRecord> Nodes,
+	const TMap<UEdGraphNode*, FVector2D>& OriginalPositions,
+	const TMap<UEdGraphNode*, FVector2D>& CandidatePositions,
+	FReadabilityMetrics& OutMetrics
+)
+{
+	TSet<UEdGraphNode*> ExecutionRoots;
+	for (const FAdapterNodeRecord& Node : Nodes)
+	{
+		bool bHasExecutionOutput = false;
+		bool bHasLinkedExecutionInput = false;
+		for (const UEdGraphPin* Pin : Node.Node->Pins)
+		{
+			if (Pin == nullptr || !IsExecutionPin(*Pin)) { continue; }
+			bHasExecutionOutput |= Pin->Direction == EGPD_Output;
+			bHasLinkedExecutionInput |= Pin->Direction == EGPD_Input && !Pin->LinkedTo.IsEmpty();
+		}
+		if (bHasExecutionOutput && !bHasLinkedExecutionInput) { ExecutionRoots.Add(Node.Node); }
+	}
+
+	for (UEdGraphNode* Root : ExecutionRoots)
+	{
+		const FVector2D* OriginalPosition = OriginalPositions.Find(Root);
+		const FVector2D* CandidatePosition = CandidatePositions.Find(Root);
+		if (OriginalPosition == nullptr || CandidatePosition == nullptr) { continue; }
+		OutMetrics.MaximumExecutionRootHorizontalDrift = FMath::Max(
+			OutMetrics.MaximumExecutionRootHorizontalDrift, FMath::Abs(OriginalPosition->X - CandidatePosition->X)
+		);
+		OutMetrics.MaximumExecutionRootUpwardDrift =
+			FMath::Max(OutMetrics.MaximumExecutionRootUpwardDrift, OriginalPosition->Y - CandidatePosition->Y);
+	}
+
+	const TArray<UEdGraphNode*> OrderedExecutionRoots = ExecutionRoots.Array();
+	for (int32 FirstIndex = 0; FirstIndex < OrderedExecutionRoots.Num(); ++FirstIndex)
+	{
+		for (int32 SecondIndex = FirstIndex + 1; SecondIndex < OrderedExecutionRoots.Num(); ++SecondIndex)
+		{
+			const double OriginalDelta = OriginalPositions.FindChecked(OrderedExecutionRoots[FirstIndex]).Y
+									   - OriginalPositions.FindChecked(OrderedExecutionRoots[SecondIndex]).Y;
+			const double CandidateDelta = CandidatePositions.FindChecked(OrderedExecutionRoots[FirstIndex]).Y
+										- CandidatePositions.FindChecked(OrderedExecutionRoots[SecondIndex]).Y;
+			if (FMath::Abs(OriginalDelta) > ReadabilityEpsilon && OriginalDelta * CandidateDelta < -ReadabilityEpsilon)
+			{
+				++OutMetrics.ExecutionRootOrderInversionCount;
+			}
+		}
+	}
+}
+
+[[nodiscard]]
+FReadabilityMetrics MeasureReadability(
+	TConstArrayView<FAdapterNodeRecord> Nodes,
+	TConstArrayView<FAdapterEdgeRecord> Edges,
+	const TMap<const UEdGraphPin*, FAdapterPinRecord>& PinRecords,
+	const TMap<UEdGraphNode*, FVector2D>& Positions,
+	const int32 WorkBudget,
+	const bool bUsePlannedRoutes = false
+)
+{
+	FReadabilityMetrics Metrics;
+	FReadabilityWorkBudget RemainingWork(WorkBudget);
+	MeasureNodeReadability(Nodes, Positions, RemainingWork, Metrics);
+	if (!Metrics.bWorkBudgetExhausted)
+	{
+		MeasureWireReadability(Nodes, Edges, PinRecords, Positions, bUsePlannedRoutes, RemainingWork, Metrics);
+	}
+	return Metrics;
+}
+
+[[nodiscard]]
+bool IsMateriallyGreater(const double Candidate, const double Original, const double AbsoluteAllowance, const double Ratio)
+{ return Candidate > Original * Ratio + AbsoluteAllowance; }
+
+[[nodiscard]]
+bool ContainsNewKey(const TSet<FString>& Candidate, const TSet<FString>& Original)
+{
+	for (const FString& Key : Candidate)
+	{
+		if (!Original.Contains(Key)) { return true; }
+	}
+	return false;
+}
+
+[[nodiscard]]
+FString FindHardReadabilityRegression(
+	const FReadabilityMetrics& Original, const FReadabilityMetrics& Candidate, const double LayoutCellSize
+)
+{
+	if (ContainsNewKey(Candidate.OverlapPairs, Original.OverlapPairs))
+	{
+		return TEXT("the candidate creates a new node overlap");
+	}
+	if (ContainsNewKey(Candidate.BackwardExecutionEdges, Original.BackwardExecutionEdges)
+		|| Candidate.BackwardExecutionDistance > Original.BackwardExecutionDistance + LayoutCellSize)
+	{
+		return TEXT("the candidate makes execution flow run farther backward");
+	}
+	if (ContainsNewKey(Candidate.NonStraightPreferredExecutionEdges, Original.NonStraightPreferredExecutionEdges)
+		|| Candidate.PreferredExecutionVerticalError > Original.PreferredExecutionVerticalError + LayoutCellSize)
+	{
+		return TEXT("the candidate bends a preferred straight execution connection");
+	}
+	if (ContainsNewKey(Candidate.ExecutionWireCrossings, Original.ExecutionWireCrossings))
+	{
+		return TEXT("the candidate introduces a new execution-wire crossing pair");
+	}
+	return FString();
+}
+
+[[nodiscard]]
+FString FindWireThroughNodeRegression(const FReadabilityMetrics& Original, const FReadabilityMetrics& Candidate)
+{
+	if (ContainsNewKey(Candidate.WiresThroughNodes, Original.WiresThroughNodes))
+	{
+		return TEXT("the candidate introduces a wire that passes through another node");
+	}
+	return FString();
+}
+
+[[nodiscard]]
+FString FindBackwardDataRegression(const FReadabilityMetrics& Original, const FReadabilityMetrics& Candidate, const double LayoutCellSize)
+{
+	const int32 AllowedBackwardDataIncrease = FMath::Max(1, Original.BackwardDataEdgeCount / 4);
+	if (Candidate.BackwardDataEdgeCount > Original.BackwardDataEdgeCount + AllowedBackwardDataIncrease
+		|| IsMateriallyGreater(
+			Candidate.BackwardDataDistance, Original.BackwardDataDistance, LayoutCellSize * 2.0, MaterialReadabilityRatio
+		))
+	{
+		return TEXT("the candidate introduces materially worse backward data wiring");
+	}
+	return FString();
+}
+
+[[nodiscard]]
+FString FindDataCrossingRegression(const FReadabilityMetrics& Original, const FReadabilityMetrics& Candidate)
+{
+	if (ContainsNewKey(Candidate.DataWireCrossings, Original.DataWireCrossings))
+	{
+		return TEXT("the candidate introduces a new data-wire crossing pair");
+	}
+	return FString();
+}
+
+[[nodiscard]]
+FString FindRootPreservationRegression(const FReadabilityMetrics& Candidate, const double LayoutCellSize)
+{
+	const double SnapTolerance = LayoutCellSize * 0.5 + ReadabilityEpsilon;
+	if (Candidate.MaximumExecutionRootHorizontalDrift > SnapTolerance)
+	{
+		return TEXT("the candidate moves an execution graph start horizontally beyond coarse-grid snapping");
+	}
+	if (Candidate.MaximumExecutionRootUpwardDrift > SnapTolerance)
+	{
+		return TEXT("the candidate moves an execution graph start upward beyond coarse-grid snapping");
+	}
+	if (Candidate.ExecutionRootOrderInversionCount > 0)
+	{
+		return TEXT("the candidate changes the authored top-to-bottom order of execution graph starts");
+	}
+	return FString();
+}
+
+[[nodiscard]]
+FString FindReadabilityRegression(
+	const FReadabilityMetrics& Original, const FReadabilityMetrics& Candidate, const double LayoutCellSize, const bool bPreserveHumanLayout
+)
+{
+	if (Original.bWorkBudgetExhausted || Candidate.bWorkBudgetExhausted)
+	{
+		return TEXT("the graph-wide readability safety check exhausted its deterministic work budget");
+	}
+	if (FString Reason = FindHardReadabilityRegression(Original, Candidate, LayoutCellSize); !Reason.IsEmpty())
+	{
+		return Reason;
+	}
+	// Routing is best-effort and can be skipped when no safe path exists or its work budget is
+	// exhausted. Never accept a layout that depends on a later routing attempt for node clearance.
+	if (FString Reason = FindWireThroughNodeRegression(Original, Candidate); !Reason.IsEmpty()) { return Reason; }
+	if (FString Reason = FindBackwardDataRegression(Original, Candidate, LayoutCellSize); !Reason.IsEmpty())
+	{
+		return Reason;
+	}
+	if (FString Reason = FindDataCrossingRegression(Original, Candidate); !Reason.IsEmpty()) { return Reason; }
+	if (bPreserveHumanLayout)
+	{
+		if (FString Reason = FindRootPreservationRegression(Candidate, LayoutCellSize); !Reason.IsEmpty())
+		{
+			return Reason;
+		}
+	}
+	return FString();
+}
 
 [[nodiscard]]
 FBox2D ResolveCurrentNodeBounds(const UEdGraphNode& Node, const FGraphGeometrySnapshot& Geometry)
@@ -532,6 +1145,8 @@ FK2FormatResult FK2GraphFormatter::Format(
 		K2Layout::FNodeSnapshot& LayoutNode = LayoutSnapshot.Nodes.AddDefaulted_GetRef();
 		LayoutNode.Key = K2Layout::FNodeKey(AdapterNode.Key);
 		LayoutNode.Size = AdapterNode.Size;
+		LayoutNode.OriginalPosition = AdapterNode.OriginalPosition;
+		LayoutNode.bHasOriginalPosition = true;
 		const UK2Node* K2Node = CastChecked<UK2Node>(AdapterNode.Node);
 		bool bHasExecutionPin = false;
 		for (const UEdGraphPin* Pin : AdapterNode.Node->Pins)
@@ -737,21 +1352,252 @@ FK2FormatResult FK2GraphFormatter::Format(
 		}
 	}
 
+	// The layout core intentionally operates only on the requested scope, but links that cross
+	// that boundary still constrain readability. Record their stationary outside endpoints for
+	// the acceptance gate so formatting a middle node cannot silently bend a straight exec wire.
+	TArray<FAdapterEdgeRecord> ReadabilityEdgeRecords = EdgeRecords;
+	TSet<FString> ReadabilityEdgeKeys;
+	for (const FAdapterEdgeRecord& Edge : ReadabilityEdgeRecords)
+	{
+		ReadabilityEdgeKeys.Add(Edge.Key);
+	}
+	TMap<UEdGraphNode*, FVector2D> StationaryReadabilityPositions;
+	const auto EnsurePinRecord = [&Geometry, &PinRecords](UEdGraphPin& RequiredPin) -> const FAdapterPinRecord*
+	{
+		if (const FAdapterPinRecord* Existing = PinRecords.Find(&RequiredPin)) { return Existing; }
+		UEdGraphNode* Node = RequiredPin.GetOwningNodeUnchecked();
+		if (Node == nullptr) { return nullptr; }
+
+		const FVector2D NodeSize = ResolveNodeSize(*Node, Geometry);
+		int32 InputOrdinal = 0;
+		int32 OutputOrdinal = 0;
+		int32 ExecutionInputOrdinal = 0;
+		int32 ExecutionOutputOrdinal = 0;
+		for (int32 PinOrdinal = 0; PinOrdinal < Node->Pins.Num(); ++PinOrdinal)
+		{
+			UEdGraphPin* Pin = Node->Pins[PinOrdinal];
+			if (Pin == nullptr || (Pin->Direction != EGPD_Input && Pin->Direction != EGPD_Output)) { continue; }
+			const bool bInput = Pin->Direction == EGPD_Input;
+			const bool bExecution = IsExecutionPin(*Pin);
+			const int32 DirectionOrdinal = bInput ? InputOrdinal++ : OutputOrdinal++;
+			int32 KindOrdinal = DirectionOrdinal;
+			if (bExecution) { KindOrdinal = bInput ? ExecutionInputOrdinal++ : ExecutionOutputOrdinal++; }
+			if (Pin != &RequiredPin) { continue; }
+
+			FAdapterPinRecord Record;
+			Record.Key = MakeStablePinKey(*Pin, PinOrdinal);
+			Record.Offset = ResolvePinOffset(*Pin, Geometry, NodeSize, DirectionOrdinal);
+			Record.SemanticOrder = DirectionOrdinal;
+			Record.KindOrder = KindOrdinal;
+			Record.bExecution = bExecution;
+			Record.bPreferredExecutionPort = bExecution && KindOrdinal == 0;
+			PinRecords.Add(Pin, MoveTemp(Record));
+			return PinRecords.Find(Pin);
+		}
+		return nullptr;
+	};
+
+	for (const FAdapterNodeRecord& ScopeNode : NodeRecords)
+	{
+		for (UEdGraphPin* ScopePin : ScopeNode.Node->Pins)
+		{
+			if (ScopePin == nullptr || (ScopePin->Direction != EGPD_Input && ScopePin->Direction != EGPD_Output))
+			{
+				continue;
+			}
+			for (UEdGraphPin* LinkedPin : ScopePin->LinkedTo)
+			{
+				UEdGraphNode* OutsideNode = LinkedPin != nullptr ? LinkedPin->GetOwningNodeUnchecked() : nullptr;
+				if (OutsideNode == nullptr || OutsideNode->GetGraph() != &Graph
+					|| NodeRecordIndices.Contains(OutsideNode) || ValidatedGeneratedKnots.Contains(OutsideNode))
+				{
+					continue;
+				}
+				UEdGraphPin* OutputPin = ScopePin->Direction == EGPD_Output ? ScopePin : LinkedPin;
+				UEdGraphPin* InputPin = ScopePin->Direction == EGPD_Input ? ScopePin : LinkedPin;
+				if (OutputPin == nullptr || InputPin == nullptr || OutputPin->Direction != EGPD_Output
+					|| InputPin->Direction != EGPD_Input)
+				{
+					continue;
+				}
+				if (EnsurePinRecord(*OutputPin) == nullptr || EnsurePinRecord(*InputPin) == nullptr) { continue; }
+				// Reacquire both pointers after insertion because TMap growth may relocate values.
+				const FAdapterPinRecord* OutputRecord = PinRecords.Find(OutputPin);
+				const FAdapterPinRecord* InputRecord = PinRecords.Find(InputPin);
+				if (OutputRecord == nullptr || InputRecord == nullptr || OutputRecord->bExecution != InputRecord->bExecution)
+				{
+					continue;
+				}
+
+				FAdapterEdgeRecord BoundaryEdge;
+				BoundaryEdge.OutputPin = OutputPin;
+				BoundaryEdge.InputPin = InputPin;
+				BoundaryEdge.bExecution = OutputRecord->bExecution;
+				BoundaryEdge.BranchOrder = BoundaryEdge.bExecution ? OutputRecord->KindOrder : INDEX_NONE;
+				// Every execution link crossing an explicit-selection boundary is fixed context.
+				// Preserve an authored straight boundary segment even when it is not a primary branch pin.
+				BoundaryEdge.bPreferredAlignment = BoundaryEdge.bExecution;
+				BoundaryEdge.Key = FString::Printf(
+					TEXT("%s:%s/%s->%s/%s"),
+					BoundaryEdge.bExecution ? TEXT("E") : TEXT("D"),
+					*MakeStableNodeKey(Graph, *OutputPin->GetOwningNodeUnchecked()),
+					*OutputRecord->Key,
+					*MakeStableNodeKey(Graph, *InputPin->GetOwningNodeUnchecked()),
+					*InputRecord->Key
+				);
+				if (ReadabilityEdgeKeys.Contains(BoundaryEdge.Key)) { continue; }
+				ReadabilityEdgeKeys.Add(BoundaryEdge.Key);
+				ReadabilityEdgeRecords.Add(MoveTemp(BoundaryEdge));
+				StationaryReadabilityPositions.Add(
+					OutsideNode,
+					FVector2D(static_cast<double>(OutsideNode->NodePosX), static_cast<double>(OutsideNode->NodePosY))
+				);
+			}
+		}
+	}
+	// A partial selection can also move beneath a completely stationary outside-to-outside wire.
+	// Include every remaining direct logical edge in the graph-wide readability field. Validated
+	// formatter knots are collapsed separately below; user-authored knots remain ordinary nodes.
+	for (const TObjectPtr<UEdGraphNode>& GraphNodePointer : Graph.Nodes)
+	{
+		UEdGraphNode* OutputNode = GraphNodePointer.Get();
+		if (OutputNode == nullptr || OutputNode->IsA<UEdGraphNode_Comment>()
+			|| ValidatedGeneratedKnots.Contains(OutputNode))
+		{
+			continue;
+		}
+		for (UEdGraphPin* OutputPin : OutputNode->Pins)
+		{
+			if (OutputPin == nullptr || OutputPin->Direction != EGPD_Output) { continue; }
+			for (UEdGraphPin* InputPin : OutputPin->LinkedTo)
+			{
+				UEdGraphNode* InputNode = InputPin != nullptr ? InputPin->GetOwningNodeUnchecked() : nullptr;
+				if (InputPin == nullptr || InputPin->Direction != EGPD_Input || InputNode == nullptr
+					|| InputNode->GetGraph() != &Graph || InputNode->IsA<UEdGraphNode_Comment>()
+					|| ValidatedGeneratedKnots.Contains(InputNode))
+				{
+					continue;
+				}
+				if (EnsurePinRecord(*OutputPin) == nullptr || EnsurePinRecord(*InputPin) == nullptr) { continue; }
+				const FAdapterPinRecord* OutputRecord = PinRecords.Find(OutputPin);
+				const FAdapterPinRecord* InputRecord = PinRecords.Find(InputPin);
+				if (OutputRecord == nullptr || InputRecord == nullptr || OutputRecord->bExecution != InputRecord->bExecution)
+				{
+					continue;
+				}
+
+				const FString EdgeKey = FString::Printf(
+					TEXT("%s:%s/%s->%s/%s"),
+					OutputRecord->bExecution ? TEXT("E") : TEXT("D"),
+					*MakeStableNodeKey(Graph, *OutputNode),
+					*OutputRecord->Key,
+					*MakeStableNodeKey(Graph, *InputNode),
+					*InputRecord->Key
+				);
+				if (ReadabilityEdgeKeys.Contains(EdgeKey)) { continue; }
+
+				FAdapterEdgeRecord& ReadabilityEdge = ReadabilityEdgeRecords.AddDefaulted_GetRef();
+				ReadabilityEdge.OutputPin = OutputPin;
+				ReadabilityEdge.InputPin = InputPin;
+				ReadabilityEdge.Key = EdgeKey;
+				ReadabilityEdge.bExecution = OutputRecord->bExecution;
+				ReadabilityEdge.BranchOrder = ReadabilityEdge.bExecution ? OutputRecord->KindOrder : INDEX_NONE;
+				ReadabilityEdge.bPreferredAlignment = ReadabilityEdge.bExecution && OutputRecord->bPreferredExecutionPort
+												   && InputRecord->bPreferredExecutionPort;
+				ReadabilityEdgeKeys.Add(EdgeKey);
+			}
+		}
+	}
+	for (const TPair<FString, FValidatedGeneratedRoute>& RoutePair : ValidatedGeneratedRoutes)
+	{
+		const FValidatedGeneratedRoute& Route = RoutePair.Value;
+		UEdGraphNode* OutputNode = Route.OutputPin != nullptr ? Route.OutputPin->GetOwningNodeUnchecked() : nullptr;
+		UEdGraphNode* InputNode = Route.InputPin != nullptr ? Route.InputPin->GetOwningNodeUnchecked() : nullptr;
+		if (OutputNode == nullptr || InputNode == nullptr) { continue; }
+		const bool bOutputInScope = NodeRecordIndices.Contains(OutputNode);
+		const bool bInputInScope = NodeRecordIndices.Contains(InputNode);
+		if (ReadabilityEdgeKeys.Contains(RoutePair.Key)) { continue; }
+		if (EnsurePinRecord(*Route.OutputPin) == nullptr || EnsurePinRecord(*Route.InputPin) == nullptr) { continue; }
+		const FAdapterPinRecord* OutputRecord = PinRecords.Find(Route.OutputPin);
+		const FAdapterPinRecord* InputRecord = PinRecords.Find(Route.InputPin);
+		if (OutputRecord == nullptr || InputRecord == nullptr || OutputRecord->bExecution != InputRecord->bExecution)
+		{
+			continue;
+		}
+
+		FAdapterEdgeRecord BoundaryEdge;
+		BoundaryEdge.OutputPin = Route.OutputPin;
+		BoundaryEdge.InputPin = Route.InputPin;
+		BoundaryEdge.Key = RoutePair.Key;
+		BoundaryEdge.ExistingGeneratedKnots = Route.Knots;
+		BoundaryEdge.ExistingRouteWaypoints = Route.Waypoints;
+		BoundaryEdge.bExecution = OutputRecord->bExecution;
+		BoundaryEdge.bExistingGeneratedRoute = true;
+		BoundaryEdge.BranchOrder = BoundaryEdge.bExecution ? OutputRecord->KindOrder : INDEX_NONE;
+		BoundaryEdge.bPreferredAlignment = BoundaryEdge.bExecution;
+		ReadabilityEdgeKeys.Add(BoundaryEdge.Key);
+		ReadabilityEdgeRecords.Add(MoveTemp(BoundaryEdge));
+		if (bOutputInScope != bInputInScope)
+		{
+			UEdGraphNode* OutsideNode = bOutputInScope ? InputNode : OutputNode;
+			StationaryReadabilityPositions.Add(
+				OutsideNode,
+				FVector2D(static_cast<double>(OutsideNode->NodePosX), static_cast<double>(OutsideNode->NodePosY))
+			);
+		}
+	}
+
+	// Stationary graph nodes still matter to readability: a moved selected wire must not
+	// start travelling beneath an unselected node, and selected roots must not cross an
+	// unselected event root. Keep this graph-wide view separate from the layout scope.
+	TArray<FAdapterNodeRecord> ReadabilityNodeRecords = NodeRecords;
+	TSet<UEdGraphNode*> ReadabilityNodes;
+	for (const FAdapterNodeRecord& Node : NodeRecords)
+	{
+		ReadabilityNodes.Add(Node.Node);
+	}
+	for (const TObjectPtr<UEdGraphNode>& GraphNodePointer : Graph.Nodes)
+	{
+		UEdGraphNode* GraphNode = GraphNodePointer.Get();
+		if (GraphNode == nullptr || GraphNode->IsA<UEdGraphNode_Comment>() || ReadabilityNodes.Contains(GraphNode))
+		{
+			continue;
+		}
+		FAdapterNodeRecord& Record = ReadabilityNodeRecords.AddDefaulted_GetRef();
+		Record.Node = GraphNode;
+		Record.Key = MakeStableNodeKey(Graph, *GraphNode);
+		Record.OriginalPosition =
+			FVector2D(static_cast<double>(GraphNode->NodePosX), static_cast<double>(GraphNode->NodePosY));
+		Record.Size = ResolveNodeSize(*GraphNode, Geometry);
+		StationaryReadabilityPositions.Add(GraphNode, Record.OriginalPosition);
+	}
+	ReadabilityNodeRecords.Sort([](const FAdapterNodeRecord& Left, const FAdapterNodeRecord& Right)
+								{ return Left.Key < Right.Key; });
+	ReadabilityEdgeRecords.Sort([](const FAdapterEdgeRecord& Left, const FAdapterEdgeRecord& Right)
+								{ return Left.Key < Right.Key; });
+
 	const double GridSize = FMath::Max(1.0, static_cast<double>(SNodePanel::GetSnapGridSize()));
+	const double LayoutCellSize = FMath::Max(1.0, static_cast<double>(Settings.K2LayoutCellSize));
+	const bool bPreserveHumanLayout = Settings.K2LayoutMode == EGraphFormatterK2LayoutMode::PreserveHumanLayout;
 	K2Layout::FLayoutSettings LayoutSettings;
-	LayoutSettings.HorizontalSpacing = static_cast<double>(Settings.K2HorizontalSpacing);
-	LayoutSettings.VerticalSpacing = static_cast<double>(Settings.K2VerticalSpacing);
-	LayoutSettings.BranchSpacing = static_cast<double>(Settings.K2BranchSpacing);
-	LayoutSettings.PureNodeHorizontalSpacing = static_cast<double>(Settings.K2PureHorizontalSpacing);
-	LayoutSettings.PureNodeVerticalSpacing = static_cast<double>(Settings.K2PureVerticalSpacing);
-	LayoutSettings.CollisionClearance = static_cast<double>(Settings.K2ObstacleClearance);
-	LayoutSettings.ComponentSpacing =
-		FVector2D(static_cast<double>(Settings.K2ComponentSpacing), static_cast<double>(Settings.K2ComponentSpacing));
+	LayoutSettings.HorizontalSpacing = FMath::Max(static_cast<double>(Settings.K2HorizontalSpacing), LayoutCellSize);
+	LayoutSettings.VerticalSpacing = FMath::Max(static_cast<double>(Settings.K2VerticalSpacing), LayoutCellSize);
+	LayoutSettings.BranchSpacing = FMath::Max(static_cast<double>(Settings.K2BranchSpacing), LayoutCellSize);
+	LayoutSettings.PureNodeHorizontalSpacing =
+		FMath::Max(static_cast<double>(Settings.K2PureHorizontalSpacing), LayoutCellSize);
+	LayoutSettings.PureNodeVerticalSpacing =
+		FMath::Max(static_cast<double>(Settings.K2PureVerticalSpacing), LayoutCellSize);
+	LayoutSettings.CollisionClearance = FMath::Max(static_cast<double>(Settings.K2ObstacleClearance), LayoutCellSize);
+	const double ComponentSpacing = FMath::Max(static_cast<double>(Settings.K2ComponentSpacing), LayoutCellSize);
+	LayoutSettings.ComponentSpacing = FVector2D(ComponentSpacing, ComponentSpacing);
 	LayoutSettings.GridSize = FVector2D(GridSize, GridSize);
+	LayoutSettings.LayoutCellSize = LayoutCellSize;
 	LayoutSettings.OrderingSweeps = Settings.K2OrderingSweeps;
 	LayoutSettings.AdjacentSwapPasses = FMath::Clamp(Settings.K2OrderingSweeps / 3, 1, 12);
 	LayoutSettings.GridPolicy = Settings.bEnableHybridGridSnap ? K2Layout::EGridPolicy::HybridExecution
 															   : K2Layout::EGridPolicy::NodeGrid;
+	LayoutSettings.LayoutMode = bPreserveHumanLayout ? K2Layout::ELayoutMode::PreserveAuthored
+													 : K2Layout::ELayoutMode::Reflow;
 
 	K2Layout::FLayoutPlan LayoutPlan = K2Layout::BuildLayout(LayoutSnapshot, LayoutSettings);
 	for (const K2Layout::FLayoutDiagnostic& Diagnostic : LayoutPlan.Diagnostics)
@@ -776,10 +1622,10 @@ FK2FormatResult FK2GraphFormatter::Format(
 		OriginalTopLeft.X = FMath::Min(OriginalTopLeft.X, Node.OriginalPosition.X);
 		OriginalTopLeft.Y = FMath::Min(OriginalTopLeft.Y, Node.OriginalPosition.Y);
 	}
-	if (Settings.bPreserveComponentAnchor)
+	if (!bPreserveHumanLayout)
 	{
-		OriginalTopLeft.X = FMath::GridSnap(OriginalTopLeft.X, GridSize);
-		OriginalTopLeft.Y = FMath::GridSnap(OriginalTopLeft.Y, GridSize);
+		OriginalTopLeft.X = FMath::GridSnap(OriginalTopLeft.X, LayoutCellSize);
+		OriginalTopLeft.Y = FMath::GridSnap(OriginalTopLeft.Y, LayoutCellSize);
 	}
 
 	FVector2D PlannedTopLeft(DBL_MAX, DBL_MAX);
@@ -788,13 +1634,16 @@ FK2FormatResult FK2GraphFormatter::Format(
 		PlannedTopLeft.X = FMath::Min(PlannedTopLeft.X, PlannedNode.Position.X);
 		PlannedTopLeft.Y = FMath::Min(PlannedTopLeft.Y, PlannedNode.Position.Y);
 	}
-	const FVector2D AnchorOffset = Settings.bPreserveComponentAnchor ? OriginalTopLeft - PlannedTopLeft
-																	 : FVector2D::ZeroVector;
+	// Preserve mode is already expressed in authored graph coordinates by the core. A second global
+	// translation would destroy its per-island anchors. Full Reflow gets one scope-level anchor so
+	// an explicitly aggressive redraw still does not teleport the selected graph to the origin.
+	const FVector2D AnchorOffset = bPreserveHumanLayout ? FVector2D::ZeroVector : OriginalTopLeft - PlannedTopLeft;
 
 	TArray<FPlannedAdapterNode> PlannedNodes;
 	PlannedNodes.Reserve(LayoutPlan.Nodes.Num());
 	TMap<UEdGraphNode*, int32> PlannedNodeIndices;
 	TMap<int32, FBox2D> ComponentBaseBounds;
+	TMap<int32, TArray<FBox2D>> ComponentNodeBaseBounds;
 	for (int32 PlannedIndex = 0; PlannedIndex < LayoutPlan.Nodes.Num(); ++PlannedIndex)
 	{
 		const K2Layout::FPlannedNodePosition& LayoutNode = LayoutPlan.Nodes[PlannedIndex];
@@ -818,6 +1667,7 @@ FK2FormatResult FK2GraphFormatter::Format(
 		PlannedNode.ExecutionRank = LayoutNode.ExecutionRank;
 		PlannedNodeIndices.Add(Node, PlannedIndex);
 		const FBox2D NodeBounds = MakeNodeBox(PlannedNode.Position, PlannedNode.Size);
+		ComponentNodeBaseBounds.FindOrAdd(PlannedNode.ComponentIndex).Add(NodeBounds);
 		if (FBox2D* ComponentBounds = ComponentBaseBounds.Find(PlannedNode.ComponentIndex))
 		{
 			*ComponentBounds += NodeBounds;
@@ -844,6 +1694,7 @@ FK2FormatResult FK2GraphFormatter::Format(
 	}
 
 	TArray<FBox2D> FixedObstacles;
+	const double PlacementClearance = FMath::Max(static_cast<double>(Settings.K2ObstacleClearance), LayoutCellSize);
 	for (const TObjectPtr<UEdGraphNode>& GraphNodePointer : Graph.Nodes)
 	{
 		UEdGraphNode* GraphNode = GraphNodePointer.Get();
@@ -868,9 +1719,7 @@ FK2FormatResult FK2GraphFormatter::Format(
 			// obstacle so a partial selection cannot accidentally move into a foreign group.
 			if (bEnclosesScope) { continue; }
 		}
-		FixedObstacles.Add(
-			InflateBox(ResolveCurrentNodeBounds(*GraphNode, Geometry), static_cast<double>(Settings.K2ObstacleClearance))
-		);
+		FixedObstacles.Add(InflateBox(ResolveCurrentNodeBounds(*GraphNode, Geometry), PlacementClearance));
 	}
 
 	TArray<int32> ComponentIndices;
@@ -888,26 +1737,29 @@ FK2FormatResult FK2GraphFormatter::Format(
 			const FBox2D Candidate = BaseBounds.ShiftBy(FVector2D(0.0, VerticalShift));
 			double RequiredShift = VerticalShift;
 			bool bIntersects = false;
-			for (const FBox2D& Obstacle : FixedObstacles)
+			for (const FBox2D& NodeBaseBounds : ComponentNodeBaseBounds.FindChecked(ComponentIndex))
 			{
-				if (Candidate.Intersect(Obstacle))
+				const FBox2D CandidateNode = NodeBaseBounds.ShiftBy(FVector2D(0.0, VerticalShift));
+				for (const FBox2D& Obstacle : FixedObstacles)
 				{
-					bIntersects = true;
-					RequiredShift = FMath::Max(RequiredShift, Obstacle.Max.Y + GridSize - BaseBounds.Min.Y);
+					if (HasPositiveAreaIntersection(CandidateNode, Obstacle))
+					{
+						bIntersects = true;
+						RequiredShift = FMath::Max(RequiredShift, Obstacle.Max.Y + LayoutCellSize - NodeBaseBounds.Min.Y);
+					}
 				}
 			}
-			for (const TPair<int32, FBox2D>& OtherComponent : ComponentBaseBounds)
+			// Components are processed in authored top-to-bottom order. Only paragraphs that
+			// have already been placed are obstacles here; treating a later paragraph's
+			// unresolved authored bounds as fixed can push an earlier event graph below it
+			// and invert the layout the user authored.
+			for (const TPair<int32, FBox2D>& ResolvedComponent : ResolvedComponentBounds)
 			{
-				if (OtherComponent.Key == ComponentIndex) { continue; }
-				const FBox2D* ResolvedBounds = ResolvedComponentBounds.Find(OtherComponent.Key);
-				const FBox2D Obstacle = InflateBox(
-					ResolvedBounds != nullptr ? *ResolvedBounds : OtherComponent.Value,
-					static_cast<double>(Settings.K2ObstacleClearance)
-				);
-				if (Candidate.Intersect(Obstacle))
+				const FBox2D Obstacle = InflateBox(ResolvedComponent.Value, PlacementClearance);
+				if (HasPositiveAreaIntersection(Candidate, Obstacle))
 				{
 					bIntersects = true;
-					RequiredShift = FMath::Max(RequiredShift, Obstacle.Max.Y + GridSize - BaseBounds.Min.Y);
+					RequiredShift = FMath::Max(RequiredShift, Obstacle.Max.Y + LayoutCellSize - BaseBounds.Min.Y);
 				}
 			}
 
@@ -916,7 +1768,7 @@ FK2FormatResult FK2GraphFormatter::Format(
 				bResolved = true;
 				break;
 			}
-			VerticalShift = SnapUp(FMath::Max(VerticalShift + GridSize, RequiredShift), GridSize);
+			VerticalShift = SnapUp(FMath::Max(VerticalShift + LayoutCellSize, RequiredShift), LayoutCellSize);
 		}
 
 		if (!bResolved)
@@ -956,12 +1808,15 @@ FK2FormatResult FK2GraphFormatter::Format(
 		}
 	}
 
-	// Generated knots are presentation artifacts and do not participate in semantic ranking. Keep
-	// a validated existing chain attached to its newly formatted endpoints by interpolating the two
-	// endpoint deltas across its ordered knots. This changes geometry only; pin topology is untouched.
+	// Generated knots are presentation artifacts and do not participate in semantic ranking. Plan
+	// their movement before the readability gate so both the gate and the router inspect the exact
+	// endpoint-to-waypoint polyline that will be committed. Interpolating the endpoint deltas keeps
+	// a validated authored chain attached without changing pin topology.
 	TMap<UEdGraphNode*, FVector2D> PlannedGeneratedKnotPositions;
+	TMap<FString, TArray<FVector2D>> PlannedGeneratedRouteWaypoints;
 	for (FAdapterEdgeRecord& Edge : EdgeRecords)
 	{
+		Edge.PlannedRouteWaypoints.Reset();
 		if (!Edge.bExistingGeneratedRoute || Edge.ExistingGeneratedKnots.IsEmpty()
 			|| Edge.ExistingGeneratedKnots.Num() != Edge.ExistingRouteWaypoints.Num())
 		{
@@ -986,6 +1841,7 @@ FK2FormatResult FK2GraphFormatter::Format(
 		const FVector2D OriginalInputAnchor = NodeRecords[*InputNodeIndex].OriginalPosition + InputPinRecord->Offset;
 		const FVector2D OutputDelta = *FinalOutputPosition + OutputPinRecord->Offset - OriginalOutputAnchor;
 		const FVector2D InputDelta = *FinalInputPosition + InputPinRecord->Offset - OriginalInputAnchor;
+		Edge.PlannedRouteWaypoints.Reserve(Edge.ExistingGeneratedKnots.Num());
 		for (int32 KnotIndex = 0; KnotIndex < Edge.ExistingGeneratedKnots.Num(); ++KnotIndex)
 		{
 			UEdGraphNode* Knot = Edge.ExistingGeneratedKnots[KnotIndex];
@@ -996,7 +1852,14 @@ FK2FormatResult FK2GraphFormatter::Format(
 			FVector2D PlannedCenter = Edge.ExistingRouteWaypoints[KnotIndex] + FMath::Lerp(OutputDelta, InputDelta, Alpha);
 			PlannedCenter.X = FMath::GridSnap(PlannedCenter.X, GridSize);
 			PlannedCenter.Y = FMath::GridSnap(PlannedCenter.Y, GridSize);
-			const FVector2D PlannedKnotTopLeft = PlannedCenter - CenterOffset;
+			const FVector2D UnroundedKnotTopLeft = PlannedCenter - CenterOffset;
+			const FVector2D PlannedKnotTopLeft{
+				static_cast<double>(FMath::RoundToInt(UnroundedKnotTopLeft.X)),
+				static_cast<double>(FMath::RoundToInt(UnroundedKnotTopLeft.Y)),
+			};
+			// NodePos is integer-valued. Derive the measured waypoint from that exact applied
+			// top-left so the acceptance gate and the committed graph cannot disagree by a pixel.
+			const FVector2D AppliedCenter = PlannedKnotTopLeft + CenterOffset;
 
 			if (const FVector2D* ExistingPosition = PlannedGeneratedKnotPositions.Find(Knot))
 			{
@@ -1019,8 +1882,58 @@ FK2FormatResult FK2GraphFormatter::Format(
 					NodeChanges.Add({ Knot, PlannedKnotTopLeft });
 				}
 			}
-			Edge.ExistingRouteWaypoints[KnotIndex] = PlannedCenter;
+			Edge.PlannedRouteWaypoints.Add(AppliedCenter);
 		}
+		PlannedGeneratedRouteWaypoints.Add(Edge.Key, Edge.PlannedRouteWaypoints);
+	}
+	for (FAdapterEdgeRecord& ReadabilityEdge : ReadabilityEdgeRecords)
+	{
+		if (const TArray<FVector2D>* PlannedWaypoints = PlannedGeneratedRouteWaypoints.Find(ReadabilityEdge.Key))
+		{
+			ReadabilityEdge.PlannedRouteWaypoints = *PlannedWaypoints;
+		}
+	}
+
+	TMap<UEdGraphNode*, FVector2D> OriginalNodePositions;
+	OriginalNodePositions.Reserve(NodeRecords.Num() + StationaryReadabilityPositions.Num());
+	for (const FAdapterNodeRecord& Node : NodeRecords)
+	{
+		OriginalNodePositions.Add(Node.Node, Node.OriginalPosition);
+	}
+	TMap<UEdGraphNode*, FVector2D> CandidateReadabilityPositions = FinalNodePositions;
+	for (const TPair<UEdGraphNode*, FVector2D>& StationaryPosition : StationaryReadabilityPositions)
+	{
+		OriginalNodePositions.Add(StationaryPosition.Key, StationaryPosition.Value);
+		if (!CandidateReadabilityPositions.Contains(StationaryPosition.Key))
+		{
+			CandidateReadabilityPositions.Add(StationaryPosition.Key, StationaryPosition.Value);
+		}
+	}
+	const FReadabilityMetrics OriginalReadability = MeasureReadability(
+		ReadabilityNodeRecords, ReadabilityEdgeRecords, PinRecords, OriginalNodePositions, Settings.K2RoutingPlanningWorkBudget
+	);
+	FReadabilityMetrics CandidateReadability = MeasureReadability(
+		ReadabilityNodeRecords,
+		ReadabilityEdgeRecords,
+		PinRecords,
+		CandidateReadabilityPositions,
+		Settings.K2RoutingPlanningWorkBudget,
+		true
+	);
+	if (!OriginalReadability.bWorkBudgetExhausted && !CandidateReadability.bWorkBudgetExhausted)
+	{
+		MeasureExecutionRootMovement(
+			ReadabilityNodeRecords, OriginalNodePositions, CandidateReadabilityPositions, CandidateReadability
+		);
+	}
+	const FString ReadabilityRegression =
+		FindReadabilityRegression(OriginalReadability, CandidateReadability, LayoutCellSize, bPreserveHumanLayout);
+	if (!ReadabilityRegression.IsEmpty())
+	{
+		Result.Status = EK2FormatStatus::NoChanges;
+		Result.Message = TEXT("The readability safety gate kept the authored graph unchanged.");
+		Result.Diagnostics.Add(FString::Printf(TEXT("Rejected layout because %s."), *ReadabilityRegression));
+		return Result;
 	}
 
 	// Formatting a selection can move nodes out of an unselected parent comment. Discover every
@@ -1231,14 +2144,17 @@ FK2FormatResult FK2GraphFormatter::Format(
 	TArray<FRerouteObstacle> RerouteObstacles;
 	if (bRouteWires)
 	{
-		RerouteEdges.Reserve(EdgeRecords.Num() + ValidatedGeneratedRoutes.Num());
+		// Seed routing with the complete graph-wide wire field used by the readability gate.
+		// Out-of-scope edges are skipped for mutation by the router, but their rendered paths
+		// remain reservations so a newly routed selected wire cannot cross them after acceptance.
+		RerouteEdges.Reserve(ReadabilityEdgeRecords.Num() + ValidatedGeneratedRoutes.Num());
 		TSet<FString> AddedRerouteKeys;
-		for (const FAdapterEdgeRecord& Edge : EdgeRecords)
+		for (const FAdapterEdgeRecord& Edge : ReadabilityEdgeRecords)
 		{
 			UEdGraphNode* OutputNode = Edge.OutputPin->GetOwningNodeUnchecked();
 			UEdGraphNode* InputNode = Edge.InputPin->GetOwningNodeUnchecked();
-			const FVector2D* OutputPosition = FinalNodePositions.Find(OutputNode);
-			const FVector2D* InputPosition = FinalNodePositions.Find(InputNode);
+			const FVector2D* OutputPosition = CandidateReadabilityPositions.Find(OutputNode);
+			const FVector2D* InputPosition = CandidateReadabilityPositions.Find(InputNode);
 			const FAdapterPinRecord* OutputPinRecord = PinRecords.Find(Edge.OutputPin);
 			const FAdapterPinRecord* InputPinRecord = PinRecords.Find(Edge.InputPin);
 			if (OutputPosition == nullptr || InputPosition == nullptr || OutputPinRecord == nullptr
@@ -1255,10 +2171,16 @@ FK2FormatResult FK2GraphFormatter::Format(
 			RerouteEdge.StableKey = Edge.Key;
 			AddedRerouteKeys.Add(Edge.Key);
 			RerouteEdge.bExecution = Edge.bExecution;
+			RerouteEdge.bReverseOutputTangent =
+				ShouldReverseKnotTangent(OutputNode, PinRecords, CandidateReadabilityPositions);
+			RerouteEdge.bReverseInputTangent =
+				ShouldReverseKnotTangent(InputNode, PinRecords, CandidateReadabilityPositions);
 			RerouteEdge.bExistingGeneratedRoute = Edge.bExistingGeneratedRoute;
+			RerouteEdge.bReservationOnly = !Scope.Contains(OutputNode) || !Scope.Contains(InputNode);
 			if (Edge.bExistingGeneratedRoute)
 			{
-				RerouteEdge.PreferredWaypoints = Edge.ExistingRouteWaypoints;
+				RerouteEdge.PreferredWaypoints = !Edge.PlannedRouteWaypoints.IsEmpty() ? Edge.PlannedRouteWaypoints
+																					   : Edge.ExistingRouteWaypoints;
 				if (RerouteEdge.PreferredWaypoints.IsEmpty())
 				{
 					Result.Diagnostics.Add(
@@ -1284,11 +2206,11 @@ FK2FormatResult FK2GraphFormatter::Format(
 					}
 				}
 			}
-			const int32 OutputRank = ExecutionRanks.FindRef(OutputNode);
-			const int32 InputRank = ExecutionRanks.FindRef(InputNode);
-			if (OutputRank != INDEX_NONE && InputRank != INDEX_NONE)
+			const int32* OutputRank = ExecutionRanks.Find(OutputNode);
+			const int32* InputRank = ExecutionRanks.Find(InputNode);
+			if (OutputRank != nullptr && InputRank != nullptr && *OutputRank != INDEX_NONE && *InputRank != INDEX_NONE)
 			{
-				RerouteEdge.RankSpan = FMath::Abs(InputRank - OutputRank);
+				RerouteEdge.RankSpan = FMath::Abs(*InputRank - *OutputRank);
 			}
 			else
 			{
@@ -1336,6 +2258,10 @@ FK2FormatResult FK2GraphFormatter::Format(
 			Reservation.StableKey = StableKey;
 			Reservation.PreferredWaypoints = ExistingRoute.Waypoints;
 			Reservation.bExecution = IsExecutionPin(*ExistingRoute.OutputPin);
+			Reservation.bReverseOutputTangent =
+				ShouldReverseKnotTangent(OutputNode, PinRecords, CandidateReadabilityPositions);
+			Reservation.bReverseInputTangent =
+				ShouldReverseKnotTangent(InputNode, PinRecords, CandidateReadabilityPositions);
 			Reservation.bExistingGeneratedRoute = true;
 		}
 
