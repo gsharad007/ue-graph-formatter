@@ -1428,6 +1428,61 @@ bool FK2LayoutPreservedCoarseColumnsTest::RunTest(const FString& Parameters)
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FK2LayoutVisibleMajorGridColumnsTest,
+	"Project.Unit Tests.GraphFormatter.K2Layout.Preservation.VisibleMajorGridColumns",
+	EAutomationTestFlags::ProductFilter | EAutomationTestFlags::EditorContext
+)
+
+bool FK2LayoutVisibleMajorGridColumnsTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	TestEqual(
+		TEXT("the former 50-unit request expands to one visible 16-by-8 major square"),
+		ResolveMajorGridAlignedCellSize(50.0, 16.0, 8.0),
+		128.0
+	);
+	TestEqual(
+		TEXT("an exact visible major-grid request remains unchanged"), ResolveMajorGridAlignedCellSize(128.0, 16.0, 8.0), 128.0
+	);
+
+	FGraphSnapshot Snapshot;
+	Snapshot.Nodes.Add(WithOriginalPosition(
+		MakeExecutionNode(TEXT("FunctionEntry"), 32.0, 37.0, FVector2D{ 224.0, 80.0 }), FVector2D::ZeroVector
+	));
+	Snapshot.Nodes.Add(WithOriginalPosition(
+		MakeExecutionNode(TEXT("FunctionResult"), 13.0, 32.0, FVector2D{ 174.0, 96.0 }), FVector2D{ 256.0, 24.0 }
+	));
+	Snapshot.ExecutionEdges.Add(MakeExecutionEdge(
+		TEXT("Entry-Result"), TEXT("FunctionEntry"), TEXT("ExecOut"), TEXT("FunctionResult"), TEXT("ExecIn")
+	));
+
+	FLayoutSettings Settings = MakePreserveAuthoredSettings();
+	Settings.LayoutCellSize = 128.0;
+	Settings.HorizontalSpacing = 160.0;
+	const FLayoutPlan Plan = BuildLayout(Snapshot, Settings);
+	const FPlannedNodePosition* Entry = FindPlannedNode(Plan, TEXT("FunctionEntry"));
+	const FPlannedNodePosition* Result = FindPlannedNode(Plan, TEXT("FunctionResult"));
+	if (Entry == nullptr || Result == nullptr)
+	{
+		AddError(TEXT("visible-major-grid plan omitted a function boundary node"));
+		return false;
+	}
+
+	TestFalse(TEXT("the two-node function plan is valid"), Plan.HasErrors());
+	TestTrue(TEXT("the function entry starts on a visible major-grid rule"), IsOnGrid(Entry->Position.X, 128.0));
+	TestTrue(TEXT("the return node starts on a visible major-grid rule"), IsOnGrid(Result->Position.X, 128.0));
+	TestTrue(
+		TEXT("the return leaves the configured clearance after the entry"),
+		Result->Position.X + PositionTolerance >= Entry->Position.X + 224.0 + Settings.HorizontalSpacing
+	);
+	TestTrue(
+		TEXT("the execution pins remain exactly straight"),
+		FMath::IsNearlyEqual(Entry->Position.Y + 37.0, Result->Position.Y + 13.0, PositionTolerance)
+	);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FK2LayoutPreservedExecutionPinAlignmentTest,
 	"Project.Unit Tests.GraphFormatter.K2Layout.Preservation.ExecutionPinAlignmentBeatsNodeYGrid",
 	EAutomationTestFlags::ProductFilter | EAutomationTestFlags::EditorContext

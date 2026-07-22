@@ -21,18 +21,20 @@ The manifest is checked into `Private/Tests/K2BlueprintCorpusTests.cpp`. The Jul
 | `BP_LoomMod_DroneClamp` | Highest local Blueprint-open count in the available editing sessions. |
 | `BP_LoomMod_LightCable` | Recently opened and saved module graph. |
 | `BP_LoomCradle` | Root of the currently edited Loom feature. |
+| `BP_LoomCradleHex` | Current simple-function grid-alignment and inherited/read-only graph repro. |
 | `BP_LoomSlotDriver` | Recently saved/currently edited feature driver. |
 | `BP_DrinkMeStation` | High-revision, large, carefully hand-formatted production graph. |
 | `BP_DrinkMeIngredientSlot` | Recently opened DrinkMe slot graph. |
 | `BP_DrinkMeOutputSlot` | Frequently revised sibling slot graph. |
 | `BP_WorldItemSlot` | Recently opened large item-slot graph. |
 | `BP_WorldItem` | Frequently revised foundational item graph. |
+| `BPC_ResourceCarrier` | Current `DropHeldActor` no-op regression with an authored multi-link data bus beneath the execution spine. |
 
 Intermediate compiler graphs and `_MERGED` artifacts are excluded. Every eligible authored event, function, macro, and collapsed K2 graph with at least two nodes is exercised.
 
 ## Acceptance gates
 
-Each graph is duplicated into `/Engine/Transient` and tested with fixed Preserve Human Layout settings: a 50-unit coarse cell, hybrid snapping, 160-unit execution spacing, 96-unit node/branch spacing, and 256-unit component spacing.
+Each graph is duplicated into `/Engine/Transient` and tested with fixed Preserve Human Layout settings: a 128-unit visible major-grid cell, hybrid snapping, 160-unit execution spacing, 96-unit node/branch spacing, and 256-unit component spacing.
 
 For **Format Graph**, the corpus requires:
 
@@ -43,6 +45,8 @@ For **Format Graph**, the corpus requires:
 - execution-root horizontal and vertical drift limited to half a coarse cell, with root reading order unchanged;
 - graphs with no measured readability improvement to keep at least 65% of nodes within one coarse cell of their authored position; an improving candidate may move at most 65% beyond a cell, with a three-node allowance so a small exec/data chain can be straightened without forcing Full Reflow;
 - a second pass to move zero nodes, resize zero comments, and preserve topology.
+
+`BPC_ResourceCarrier.DropHeldActor` additionally requires a genuinely formatted result with useful node movement. A readability-gate no-op is a failure for this targeted regression, not an acceptable “safe” result.
 
 For **Format + Route Wires**, generated Graph Formatter knots are collapsed while topology is compared. The real endpoint topology and every authored node must remain identical; overlaps, backward data flow, execution/data crossings, and wire-under-node counts cannot materially regress; and a second pass may not move nodes, create more knots, or grow the graph.
 

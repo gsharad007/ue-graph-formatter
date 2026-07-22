@@ -31,13 +31,14 @@ constexpr double FallbackNodeWidth = 160.0;
 constexpr double FallbackNodeHeight = 80.0;
 constexpr double FallbackPinTop = 32.0;
 constexpr double FallbackPinPitch = 24.0;
-constexpr double LayoutCellSize = 50.0;
+constexpr double LayoutCellSize = 128.0;
 
 struct FBlueprintCorpusEntry
 {
 	const TCHAR* Label;
 	const TCHAR* ObjectPath;
 	const TCHAR* SelectionEvidence;
+	const TCHAR* RequiredFormattedGraph = nullptr;
 };
 
 // This is deliberately a checked-in manifest, not a test-discovery query. Local editor history and
@@ -70,6 +71,11 @@ const FBlueprintCorpusEntry BlueprintCorpus[] = {
      TEXT("current Loom feature root Blueprint"),
 	 },
 	{
+     TEXT("LoomCradleHex.CurrentFormattingRepro"),
+     TEXT("/Game/Development/LoomCradle/Blueprints/BP_LoomCradleHex.BP_LoomCradleHex"),
+     TEXT("current simple-function grid-alignment and inherited-graph formatting repro"),
+	 },
+	{
      TEXT("LoomSlotDriver.CurrentFeatureDriver"),
      TEXT("/Game/Development/LoomCradle/Blueprints/BP_LoomSlotDriver.BP_LoomSlotDriver"),
      TEXT("recently saved and currently edited Loom driver Blueprint"),
@@ -99,16 +105,31 @@ const FBlueprintCorpusEntry BlueprintCorpus[] = {
      TEXT("/Game/Blueprints/Items/BP_WorldItem.BP_WorldItem"),
      TEXT("frequently revised foundational item Blueprint"),
 	 },
+	{
+     TEXT("ResourceCarrier.CurrentFormattingRepro"),
+     TEXT("/Game/Player/HeldObject/BPC_ResourceCarrier.BPC_ResourceCarrier"),
+     TEXT("current DropHeldActor safety-gate no-op repro with an authored multi-link data bus"),
+     TEXT("DropHeldActor"),
+	 },
 };
 
 struct FEdgeSample
 {
 	const UEdGraphNode* Source = nullptr;
 	const UEdGraphNode* Target = nullptr;
+	const UEdGraphPin* OutputPin = nullptr;
+	const UEdGraphPin* InputPin = nullptr;
 	FVector2D Start = FVector2D::ZeroVector;
 	FVector2D End = FVector2D::ZeroVector;
+	TArray<FVector2D> RenderedPoints;
 	bool bExecution = false;
 	bool bPreferredExecution = false;
+};
+
+struct FResolvedLogicalPath
+{
+	const UEdGraphPin* Target = nullptr;
+	TArray<FVector2D> Waypoints;
 };
 
 struct FGraphQualityMetrics
@@ -327,6 +348,78 @@ FVector2D ResolvePinAnchor(const UEdGraphPin& Pin)
 	return Position + FVector2D(Pin.Direction == EGPD_Input ? 0.0 : Size.X, Y);
 }
 
+void ResolveLogicalPaths(
+	const UEdGraphPin& CandidateInput,
+	TSet<const UEdGraphPin*>& Traversal,
+	TArray<FVector2D>& Waypoints,
+	TArray<FResolvedLogicalPath>& OutPaths
+)
+{
+	if (Traversal.Contains(&CandidateInput)) { return; }
+	Traversal.Add(&CandidateInput);
+	const UK2Node_Knot* Knot = Cast<UK2Node_Knot>(CandidateInput.GetOwningNodeUnchecked());
+	if (Knot == nullptr || !FK2RerouteRouter::IsGeneratedRerouteNode(Knot) || &CandidateInput != Knot->GetInputPin())
+	{
+		FResolvedLogicalPath& Path = OutPaths.AddDefaulted_GetRef();
+		Path.Target = &CandidateInput;
+		Path.Waypoints = Waypoints;
+		Traversal.Remove(&CandidateInput);
+		return;
+	}
+
+	Waypoints.Add(ResolvePinAnchor(CandidateInput));
+	if (const UEdGraphPin* KnotOutput = Knot->GetOutputPin())
+	{
+		for (const UEdGraphPin* LinkedPin : KnotOutput->LinkedTo)
+		{
+			if (LinkedPin != nullptr) { ResolveLogicalPaths(*LinkedPin, Traversal, Waypoints, OutPaths); }
+		}
+	}
+	Waypoints.Pop(EAllowShrinking::No);
+	Traversal.Remove(&CandidateInput);
+}
+
+[[nodiscard]]
+bool TryAverageConnectedPinAnchor(const UEdGraphPin& Pin, FVector2D& OutAverage)
+{
+	FVector2D Sum = FVector2D::ZeroVector;
+	int32 Count = 0;
+	for (const UEdGraphPin* LinkedPin : Pin.LinkedTo)
+	{
+		if (LinkedPin == nullptr) { continue; }
+		Sum += ResolvePinAnchor(*LinkedPin);
+		++Count;
+	}
+	if (Count == 0) { return false; }
+	OutAverage = Sum / static_cast<double>(Count);
+	return true;
+}
+
+[[nodiscard]]
+bool ShouldReverseKnotTangent(const UEdGraphNode* Node)
+{
+	const UK2Node_Knot* Knot = Cast<UK2Node_Knot>(Node);
+	if (Knot == nullptr || Knot->GetInputPin() == nullptr || Knot->GetOutputPin() == nullptr) { return false; }
+
+	FVector2D AverageLeft;
+	FVector2D AverageRight;
+	const bool bLeftValid = TryAverageConnectedPinAnchor(*Knot->GetInputPin(), AverageLeft);
+	const bool bRightValid = TryAverageConnectedPinAnchor(*Knot->GetOutputPin(), AverageRight);
+	if (bLeftValid && bRightValid) { return AverageRight.X < AverageLeft.X; }
+	const FVector2D Center = ResolvePinAnchor(*Knot->GetOutputPin());
+	if (bLeftValid) { return Center.X < AverageLeft.X; }
+	return bRightValid && AverageRight.X < Center.X;
+}
+
+[[nodiscard]]
+bool PinsShareRenderedTerminal(const UEdGraphPin* First, const UEdGraphPin* Second)
+{
+	if (First == nullptr || Second == nullptr) { return false; }
+	if (First == Second) { return true; }
+	const UEdGraphNode* FirstNode = First->GetOwningNodeUnchecked();
+	return FirstNode != nullptr && FirstNode == Second->GetOwningNodeUnchecked() && FirstNode->IsA<UK2Node_Knot>();
+}
+
 [[nodiscard]]
 bool Overlaps(const UEdGraphNode& First, const UEdGraphNode& Second)
 {
@@ -393,23 +486,42 @@ TArray<FEdgeSample> CaptureEdges(const UEdGraph& Graph)
 	for (const TObjectPtr<UEdGraphNode>& NodePointer : Graph.Nodes)
 	{
 		const UEdGraphNode* Node = NodePointer.Get();
-		if (Node == nullptr) { continue; }
+		if (Node == nullptr || FK2RerouteRouter::IsGeneratedRerouteNode(Node)) { continue; }
 		for (const UEdGraphPin* OutputPin : Node->Pins)
 		{
 			if (OutputPin == nullptr || OutputPin->Direction != EGPD_Output) { continue; }
-			for (const UEdGraphPin* InputPin : OutputPin->LinkedTo)
+			for (const UEdGraphPin* LinkedPin : OutputPin->LinkedTo)
 			{
-				const UEdGraphNode* InputNode = InputPin != nullptr ? InputPin->GetOwningNodeUnchecked() : nullptr;
-				if (InputPin == nullptr || InputPin->Direction != EGPD_Input || InputNode == nullptr) { continue; }
-				const bool bExecution = IsExecutionPin(*OutputPin) && IsExecutionPin(*InputPin);
-				FEdgeSample& Edge = Edges.AddDefaulted_GetRef();
-				Edge.Source = Node;
-				Edge.Target = InputNode;
-				Edge.Start = ResolvePinAnchor(*OutputPin);
-				Edge.End = ResolvePinAnchor(*InputPin);
-				Edge.bExecution = bExecution;
-				Edge.bPreferredExecution = bExecution && IsPreferredExecutionPin(*OutputPin)
-										&& IsPreferredExecutionPin(*InputPin);
+				if (LinkedPin == nullptr) { continue; }
+				TSet<const UEdGraphPin*> Traversal;
+				TArray<FVector2D> Waypoints;
+				TArray<FResolvedLogicalPath> LogicalPaths;
+				ResolveLogicalPaths(*LinkedPin, Traversal, Waypoints, LogicalPaths);
+				for (const FResolvedLogicalPath& LogicalPath : LogicalPaths)
+				{
+					const UEdGraphPin* InputPin = LogicalPath.Target;
+					const UEdGraphNode* InputNode = InputPin != nullptr ? InputPin->GetOwningNodeUnchecked() : nullptr;
+					if (InputPin == nullptr || InputPin->Direction != EGPD_Input || InputNode == nullptr) { continue; }
+					const bool bExecution = IsExecutionPin(*OutputPin) && IsExecutionPin(*InputPin);
+					FEdgeSample& Edge = Edges.AddDefaulted_GetRef();
+					Edge.Source = Node;
+					Edge.Target = InputNode;
+					Edge.OutputPin = OutputPin;
+					Edge.InputPin = InputPin;
+					Edge.Start = ResolvePinAnchor(*OutputPin);
+					Edge.End = ResolvePinAnchor(*InputPin);
+					TArray<FVector2D> LogicalPoints;
+					LogicalPoints.Reserve(LogicalPath.Waypoints.Num() + 2);
+					LogicalPoints.Add(Edge.Start);
+					LogicalPoints.Append(LogicalPath.Waypoints);
+					LogicalPoints.Add(Edge.End);
+					Edge.RenderedPoints = FK2RerouteRouter::BuildRenderedPolyline(
+						LogicalPoints, ShouldReverseKnotTangent(Node), ShouldReverseKnotTangent(InputNode)
+					);
+					Edge.bExecution = bExecution;
+					Edge.bPreferredExecution = bExecution && IsPreferredExecutionPin(*OutputPin)
+											&& IsPreferredExecutionPin(*InputPin);
+				}
 			}
 		}
 	}
@@ -424,7 +536,10 @@ FGraphQualityMetrics MeasureQuality(const UEdGraph& Graph)
 	for (const TObjectPtr<UEdGraphNode>& NodePointer : Graph.Nodes)
 	{
 		const UEdGraphNode* Node = NodePointer.Get();
-		if (Node == nullptr || Node->IsA<UEdGraphNode_Comment>()) { continue; }
+		if (Node == nullptr || Node->IsA<UEdGraphNode_Comment>() || FK2RerouteRouter::IsGeneratedRerouteNode(Node))
+		{
+			continue;
+		}
 		Nodes.Add(Node);
 		Metrics.Positions.Add(Node, FVector2D(Node->NodePosX, Node->NodePosY));
 		bool bHasExecutionOutput = false;
@@ -471,9 +586,14 @@ FGraphQualityMetrics MeasureQuality(const UEdGraph& Graph)
 
 		for (const UEdGraphNode* Node : Nodes)
 		{
-			if (Node != Edge.Source && Node != Edge.Target && SegmentPassesThroughNode(Edge.Start, Edge.End, *Node))
+			if (Node == Edge.Source || Node == Edge.Target) { continue; }
+			for (int32 PointIndex = 1; PointIndex < Edge.RenderedPoints.Num(); ++PointIndex)
 			{
-				++Metrics.WireThroughNodeCount;
+				if (SegmentPassesThroughNode(Edge.RenderedPoints[PointIndex - 1], Edge.RenderedPoints[PointIndex], *Node))
+				{
+					++Metrics.WireThroughNodeCount;
+					break;
+				}
 			}
 		}
 	}
@@ -484,12 +604,22 @@ FGraphQualityMetrics MeasureQuality(const UEdGraph& Graph)
 		{
 			const FEdgeSample& First = Edges[FirstIndex];
 			const FEdgeSample& Second = Edges[SecondIndex];
-			if (First.Source == Second.Source || First.Source == Second.Target || First.Target == Second.Source
-				|| First.Target == Second.Target)
+			TArray<FVector2D, TInlineAllocator<2>> IgnoredSharedTerminals;
+			const auto AddIgnoredTerminal = [&IgnoredSharedTerminals](const FVector2D& Terminal)
 			{
-				continue;
-			}
-			if (SegmentsCrossProperly(First.Start, First.End, Second.Start, Second.End))
+				if (!IgnoredSharedTerminals.ContainsByPredicate([&Terminal](const FVector2D& Existing)
+																{ return Existing.Equals(Terminal); }))
+				{
+					IgnoredSharedTerminals.Add(Terminal);
+				}
+			};
+			if (PinsShareRenderedTerminal(First.OutputPin, Second.OutputPin)) { AddIgnoredTerminal(First.Start); }
+			if (PinsShareRenderedTerminal(First.OutputPin, Second.InputPin)) { AddIgnoredTerminal(First.Start); }
+			if (PinsShareRenderedTerminal(First.InputPin, Second.OutputPin)) { AddIgnoredTerminal(First.End); }
+			if (PinsShareRenderedTerminal(First.InputPin, Second.InputPin)) { AddIgnoredTerminal(First.End); }
+			if (FK2RerouteRouter::RenderedPolylinesIntersectExceptAtSharedTerminals(
+					First.RenderedPoints, Second.RenderedPoints, IgnoredSharedTerminals
+				))
 			{
 				if (First.bExecution || Second.bExecution) { ++Metrics.ExecutionCrossingCount; }
 				else
@@ -608,11 +738,15 @@ void VerifyRootPreservation(
 	}
 
 	Test.TestTrue(
-		*FString::Printf(TEXT("%s: execution roots move horizontally by no more than half a 50-unit cell"), *Context),
+		*FString::Printf(
+			TEXT("%s: execution roots move horizontally by no more than half a %.0f-unit cell"), *Context, LayoutCellSize
+		),
 		MaximumHorizontalDrift <= LayoutCellSize * 0.5 + GeometryEpsilon
 	);
 	Test.TestTrue(
-		*FString::Printf(TEXT("%s: execution roots move vertically by no more than half a 50-unit cell"), *Context),
+		*FString::Printf(
+			TEXT("%s: execution roots move vertically by no more than half a %.0f-unit cell"), *Context, LayoutCellSize
+		),
 		MaximumVerticalDrift <= LayoutCellSize * 0.5 + GeometryEpsilon
 	);
 
@@ -692,10 +826,12 @@ void VerifyHumanMovementBudget(
 {
 	int32 LargeMovementCount = 0;
 	TArray<FString> LargeMovements;
+	const double LocalMovementRadius = LayoutCellSize * 1.5;
 	for (const TPair<const UEdGraphNode*, FVector2D>& Pair : Before.Positions)
 	{
 		const FVector2D* AfterPosition = After.Positions.Find(Pair.Key);
-		if (AfterPosition != nullptr && FVector2D::Distance(Pair.Value, *AfterPosition) > LayoutCellSize + GeometryEpsilon)
+		if (AfterPosition != nullptr
+			&& FVector2D::Distance(Pair.Value, *AfterPosition) > LocalMovementRadius + GeometryEpsilon)
 		{
 			++LargeMovementCount;
 			const FVector2D Delta = *AfterPosition - Pair.Value;
@@ -731,10 +867,11 @@ void VerifyHumanMovementBudget(
 	const bool bWithinMovementBudget = LargeMovementCount <= AllowedLargeMovementCount;
 	Test.TestTrue(
 		*FString::Printf(
-			TEXT("%s: authored movement stays local (%d of %d nodes may move beyond one 50-unit cell%s)"),
+			TEXT("%s: authored movement stays local (%d of %d nodes may move beyond the %.0f-unit local radius%s)"),
 			*Context,
 			AllowedLargeMovementCount,
 			Before.NodeCount,
+			LocalMovementRadius,
 			bHasMeasuredImprovement ? TEXT(" because readability improved") : TEXT("")
 		),
 		bWithinMovementBudget
@@ -746,6 +883,37 @@ void VerifyHumanMovementBudget(
 		{
 			Test.AddInfo(FString::Printf(TEXT("%s movement: %s"), *Context, *Movement));
 		}
+	}
+}
+
+void VerifyFormattedSemanticNodeXGrid(
+	FAutomationTestBase& Test,
+	const FString& Context,
+	const UEdGraph& Graph,
+	const FGraphQualityMetrics& Before,
+	const FK2FormatResult& Result
+)
+{
+	if (Result.Status != EK2FormatStatus::Formatted) { return; }
+
+	const int32 MajorGridSize = FMath::RoundToInt(LayoutCellSize);
+	for (const TObjectPtr<UEdGraphNode>& NodePointer : Graph.Nodes)
+	{
+		const UEdGraphNode* Node = NodePointer.Get();
+		if (Node == nullptr || Node->IsA<UEdGraphNode_Comment>() || Node->IsA<UK2Node_Knot>()) { continue; }
+		const FVector2D* OriginalPosition = Before.Positions.Find(Node);
+		if (OriginalPosition != nullptr && Node->NodePosX == FMath::RoundToInt(OriginalPosition->X)
+			&& Node->NodePosY == FMath::RoundToInt(OriginalPosition->Y))
+		{
+			continue;
+		}
+		Test.TestEqual(
+			*FString::Printf(
+				TEXT("%s: every moved node '%s' starts on a visible major-grid X rule"), *Context, *Node->GetName()
+			),
+			Node->NodePosX % MajorGridSize,
+			0
+		);
 	}
 }
 
@@ -813,6 +981,14 @@ bool FK2BlueprintCorpusPreservationTest::RunTest(const FString& Parameters)
 	{
 		AddError(FString::Printf(TEXT("Unknown Blueprint corpus command '%s'."), *Parameters));
 		return false;
+	}
+	if (FCString::Strcmp(Entry->ObjectPath, TEXT("/Game/Player/HeldObject/BPC_ResourceCarrier.BPC_ResourceCarrier")) == 0)
+	{
+		// Duplicating this component Blueprint under /Engine/Transient causes two existing
+		// viewmodel/self links to be reconstructed against the transient generated class. The source
+		// asset compiles normally; these eight messages are a DuplicateObject test-fixture artifact.
+		AddExpectedError(TEXT("Can't connect pins  Viewmodel  and  Self"), EAutomationExpectedErrorFlags::Contains, 4);
+		AddExpectedError(TEXT("Can't connect pins  Self  and  Viewmodel"), EAutomationExpectedErrorFlags::Contains, 4);
 	}
 
 	UBlueprint* SourceBlueprint = LoadObject<UBlueprint>(nullptr, Entry->ObjectPath);
@@ -892,6 +1068,26 @@ bool FK2BlueprintCorpusPreservationTest::RunTest(const FString& Parameters)
 		const FGraphQualityMetrics QualityBefore = MeasureQuality(*WorkingGraph);
 		const FK2FormatResult FirstResult =
 			FK2GraphFormatter::Format(*WorkingGraph, HeadlessGeometry, Scope, false, *Settings);
+		if (Entry->RequiredFormattedGraph != nullptr && SourceGraph->GetName() == Entry->RequiredFormattedGraph)
+		{
+			if (FirstResult.bSafetyRejected)
+			{
+				AddInfo(FString::Printf(TEXT("%s targeted rejection: %s"), *Context, *DescribeResult(FirstResult)));
+			}
+			TestFalse(
+				*FString::Printf(TEXT("%s: the targeted repro is not discarded by the readability safety gate"), *Context),
+				FirstResult.bSafetyRejected
+			);
+			TestEqual(
+				*FString::Printf(TEXT("%s: the targeted repro produces a formatted layout"), *Context),
+				FirstResult.Status,
+				EK2FormatStatus::Formatted
+			);
+			TestTrue(
+				*FString::Printf(TEXT("%s: the targeted repro performs useful node movement"), *Context),
+				FirstResult.MovedNodeCount > 0
+			);
+		}
 		TestTrue(
 			*FString::Printf(TEXT("%s: formatter completes or safely keeps the authored layout"), *Context),
 			IsSuccessfulFormatStatus(FirstResult.Status)
@@ -915,9 +1111,42 @@ bool FK2BlueprintCorpusPreservationTest::RunTest(const FString& Parameters)
 		VerifyRootPreservation(*this, Context, QualityBefore, QualityAfter);
 		VerifyReadabilityDoesNotRegress(*this, Context, QualityBefore, QualityAfter);
 		VerifyHumanMovementBudget(*this, Context, QualityBefore, QualityAfter);
+		VerifyFormattedSemanticNodeXGrid(*this, Context, *WorkingGraph, QualityBefore, FirstResult);
 
 		const FK2FormatResult SecondResult =
 			FK2GraphFormatter::Format(*WorkingGraph, HeadlessGeometry, Scope, false, *Settings);
+		if (SecondResult.MovedNodeCount > 0)
+		{
+			TArray<FString> SecondPassMoves;
+			for (const TPair<const UEdGraphNode*, FVector2D>& BeforePosition : QualityAfter.Positions)
+			{
+				const UEdGraphNode* Node = BeforePosition.Key;
+				const FVector2D AfterPosition(Node->NodePosX, Node->NodePosY);
+				if (!AfterPosition.Equals(BeforePosition.Value, GeometryEpsilon))
+				{
+					SecondPassMoves.Add(
+						FString::Printf(
+							TEXT("%s (%.0f,%.0f)->(%.0f,%.0f)"),
+							*Node->GetName(),
+							BeforePosition.Value.X,
+							BeforePosition.Value.Y,
+							AfterPosition.X,
+							AfterPosition.Y
+						)
+					);
+				}
+			}
+			SecondPassMoves.Sort();
+			AddInfo(
+				FString::Printf(
+					TEXT("%s non-idempotent second pass: %s; first pass: %s; second pass: %s"),
+					*Context,
+					*FString::Join(SecondPassMoves, TEXT(", ")),
+					*DescribeResult(FirstResult),
+					*DescribeResult(SecondResult)
+				)
+			);
+		}
 		TestTrue(
 			*FString::Printf(TEXT("%s: the idempotence pass completes safely"), *Context),
 			IsSuccessfulFormatStatus(SecondResult.Status)

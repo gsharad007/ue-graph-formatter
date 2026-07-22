@@ -33,6 +33,7 @@ struct FK2FormatResult
 	int32 RoutedWireCount = 0;
 	int32 CreatedKnotCount = 0;
 	int32 SkippedRerouteWireCount = 0;
+	bool bSafetyRejected = false;
 	FString Message;
 	TArray<FString> Diagnostics;
 

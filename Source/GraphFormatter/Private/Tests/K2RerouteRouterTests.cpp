@@ -111,6 +111,34 @@ TArray<UK2Node_Knot*> GetGeneratedKnotsForLogicalEdge(const UEdGraph& Graph, con
 
 FVector2D GetKnotCenter(const UK2Node_Knot& Knot) { return FVector2D(Knot.NodePosX + 21.0, Knot.NodePosY + 12.0); }
 
+double SignedArea(const FVector2D A, const FVector2D B, const FVector2D C)
+{ return (B.X - A.X) * (C.Y - A.Y) - (B.Y - A.Y) * (C.X - A.X); }
+
+bool SegmentsCrossProperlyForMultiplicityTest(const FVector2D A, const FVector2D B, const FVector2D C, const FVector2D D)
+{
+	const double First = SignedArea(A, B, C);
+	const double Second = SignedArea(A, B, D);
+	const double Third = SignedArea(C, D, A);
+	const double Fourth = SignedArea(C, D, B);
+	return ((First > UE_DOUBLE_SMALL_NUMBER && Second < -UE_DOUBLE_SMALL_NUMBER)
+			|| (First < -UE_DOUBLE_SMALL_NUMBER && Second > UE_DOUBLE_SMALL_NUMBER))
+		&& ((Third > UE_DOUBLE_SMALL_NUMBER && Fourth < -UE_DOUBLE_SMALL_NUMBER)
+			|| (Third < -UE_DOUBLE_SMALL_NUMBER && Fourth > UE_DOUBLE_SMALL_NUMBER));
+}
+
+int32 CountProperPolylineCrossings(TConstArrayView<FVector2D> Polyline, const FVector2D BarrierStart, const FVector2D BarrierEnd)
+{
+	int32 Result = 0;
+	for (int32 Index = 1; Index < Polyline.Num(); ++Index)
+	{
+		if (SegmentsCrossProperlyForMultiplicityTest(Polyline[Index - 1], Polyline[Index], BarrierStart, BarrierEnd))
+		{
+			++Result;
+		}
+	}
+	return Result;
+}
+
 int32 CountGeneratedKnotsOnPath(const UK2Node_Knot& Source, const UK2Node_Knot& Destination, TArray<UK2Node_Knot*>* OutPath = nullptr)
 {
 	UEdGraphPin* CurrentOutput = Source.GetOutputPin();
@@ -1432,6 +1460,75 @@ bool FK2RerouteCrossingPairMonotonicityTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("the unsafe logical wire is reported as skipped"), Result.SkippedWires, 1);
 	TestTrue(TEXT("the original non-crossing target remains direct"), HasDirectLink(*Fixture.Source, *Fixture.Destination));
 	TestTrue(TEXT("the stationary barrier remains direct"), HasDirectLink(*BarrierSource, *BarrierDestination));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FK2RerouteCrossingMultiplicityMonotonicityTest,
+	"Project.Unit Tests.GraphFormatter.K2Routing.RouteCannotRepeatExistingCrossingPair",
+	EAutomationTestFlags::ProductFilter | EAutomationTestFlags::EditorContext
+)
+
+bool FK2RerouteCrossingMultiplicityMonotonicityTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	UEdGraph* Graph = MakeGraph();
+	UK2Node_Knot* TargetSource = AddKnot(*Graph, FVector2D(100.0, 0.0));
+	UK2Node_Knot* TargetDestination = AddKnot(*Graph, FVector2D(400.0, 200.0));
+	UK2Node_Knot* BarrierSource = AddKnot(*Graph, FVector2D(250.0, -100.0));
+	UK2Node_Knot* BarrierDestination = AddKnot(*Graph, FVector2D(250.0, 300.0));
+	TestTrue(TEXT("the target wire was created"), Connect(*Graph, *TargetSource, *TargetDestination));
+	TestTrue(TEXT("the crossing barrier wire was created"), Connect(*Graph, *BarrierSource, *BarrierDestination));
+
+	FRerouteEdge Target;
+	Target.OutputPin = TargetSource->GetOutputPin();
+	Target.InputPin = TargetDestination->GetInputPin();
+	Target.OutputAnchor = FVector2D(100.0, 0.0);
+	Target.InputAnchor = FVector2D(400.0, 200.0);
+	Target.StableKey = TEXT("A.MultiplicityTarget");
+	Target.bExecution = true;
+	// This non-self-intersecting S route crosses the same reserved wire three times. Its direct
+	// baseline crosses that wire once, so preserving only the crossing partner identity is unsafe.
+	Target.PreferredWaypoints = {
+		FVector2D(300.0, 0.0), FVector2D(300.0, 100.0), FVector2D(200.0, 100.0), FVector2D(200.0, 200.0)
+	};
+
+	FRerouteEdge Barrier;
+	Barrier.OutputPin = BarrierSource->GetOutputPin();
+	Barrier.InputPin = BarrierDestination->GetInputPin();
+	Barrier.OutputAnchor = FVector2D(250.0, -100.0);
+	Barrier.InputAnchor = FVector2D(250.0, 300.0);
+	Barrier.StableKey = TEXT("Z.MultiplicityBarrier");
+	Barrier.bExecution = true;
+	Barrier.bReservationOnly = true;
+
+	// Move generated alternatives far away without obstructing the compact preferred S route.
+	// Before the multiplicity gate, the preferred-route bonus makes the unsafe S route win.
+	const TArray<FRerouteObstacle> Obstacles = {
+		{ nullptr, FBox2D(FVector2D(245.0, -100000000000.0), FVector2D(255.0, -99999999990.0)) },
+		{ nullptr, FBox2D(FVector2D(245.0, 99999999990.0),   FVector2D(255.0, 100000000000.0)) }
+	};
+	const TArray<FRerouteEdge> Edges = { Target, Barrier };
+	const TSet<UEdGraphNode*> Scope = { TargetSource, TargetDestination };
+	const FRerouteSettings Settings;
+	const FReroutePlan Plan = FK2RerouteRouter::Plan(Edges, Obstacles, Scope, Settings, 16.0);
+
+	TestFalse(TEXT("crossing-multiplicity planning stays within its work budget"), Plan.bPlanningBudgetExhausted);
+	TestEqual(TEXT("the target still receives a safe generated route"), Plan.Routes.Num(), 1);
+	if (Plan.Routes.Num() != 1) { return false; }
+
+	TArray<FVector2D> PlannedPolyline;
+	PlannedPolyline.Add(Target.OutputAnchor);
+	PlannedPolyline.Append(Plan.Routes[0].Waypoints);
+	PlannedPolyline.Add(Target.InputAnchor);
+	const TArray<FVector2D> BaselinePolyline = { Target.OutputAnchor, Target.InputAnchor };
+	const int32 BaselineCrossings =
+		CountProperPolylineCrossings(BaselinePolyline, Barrier.OutputAnchor, Barrier.InputAnchor);
+	const int32 PlannedCrossings = CountProperPolylineCrossings(PlannedPolyline, Barrier.OutputAnchor, Barrier.InputAnchor);
+	TestEqual(TEXT("the direct baseline has exactly one crossing with the reserved wire"), BaselineCrossings, 1);
+	TestTrue(
+		TEXT("routing cannot turn one crossing with a logical wire into repeated crossings"), PlannedCrossings <= BaselineCrossings
+	);
 	return true;
 }
 

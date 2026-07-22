@@ -31,7 +31,7 @@ UFormatterSettings::UFormatterSettings()
 	bEnableBlueprintParameterGroup(true), SpacingFactorOfParameterGroup(0.314), MaxOrderingIterations(10),
 	bEnableK2Formatter(true), bEnableHybridGridSnap(true),
 	K2LayoutMode(EGraphFormatterK2LayoutMode::PreserveHumanLayout), bPreserveComponentAnchor(true),
-	K2LayoutCellSize(50), K2OrderingSweeps(8), K2RoutingPlanningWorkBudget(1000000), K2HorizontalSpacing(160),
+	K2LayoutCellSize(128), K2OrderingSweeps(8), K2RoutingPlanningWorkBudget(1000000), K2HorizontalSpacing(160),
 	K2VerticalSpacing(96), K2BranchSpacing(96), K2ComponentSpacing(256), K2PureHorizontalSpacing(80),
 	K2PureVerticalSpacing(48), K2CommentPadding(64), K2ObstacleClearance(48), K2RoutingChannelSpacing(32),
 	K2MaxGeneratedKnots(6), K2LongDataWireRankThreshold(3), bRouteDataWires(true), bShowLayoutNotifications(true)

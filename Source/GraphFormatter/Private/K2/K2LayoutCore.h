@@ -180,7 +180,7 @@ struct FLayoutSettings
 		FVector2D{ 16.0, 16.0 }
 	};
 	/** Coarse Blueprint canvas cell used for paragraph bands, statement columns, and minimum gutters. */
-	double LayoutCellSize{ 50.0 };
+	double LayoutCellSize{ 128.0 };
 	int32 OrderingSweeps{ 12 };
 	int32 AdjacentSwapPasses{ 4 };
 	/** Deterministic cap on expensive local crossing evaluations for interactive editor latency. */
@@ -260,6 +260,10 @@ struct FLayoutPlan
 	[[nodiscard]]
 	bool HasErrors() const noexcept;
 };
+
+/** Rounds a requested coarse cell up to a whole visible major graph-grid square. */
+[[nodiscard]]
+double ResolveMajorGridAlignedCellSize(double RequestedCellSize, double FineGridSize, double MajorRulePeriod);
 
 /**
  * Produces a deterministic plan without reading or mutating UObject/Slate state.

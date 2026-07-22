@@ -101,7 +101,7 @@ public:
 	)
 	bool bPreserveComponentAnchor;
 
-	/** Coarse visual grid unit used for execution columns and event-island gutters. */
+	/** Minimum coarse visual grid unit. It is rounded up to a whole major Blueprint canvas square. */
 	UPROPERTY(config, EditAnywhere, Category = "K2 Layout|Spacing", meta = (ClampMin = 1, ClampMax = 1024))
 	int32 K2LayoutCellSize;
 

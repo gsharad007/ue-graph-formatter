@@ -16,6 +16,7 @@
 #include "GraphEditorSettings.h"
 #include "ISettingsModule.h"
 #include "Modules/ModuleManager.h"
+#include "SGraphPanel.h"
 #include "Subsystems/AssetEditorSubsystem.h"
 #include "Toolkits/AssetEditorToolkit.h"
 #include "Widgets/Docking/SDockTab.h"
@@ -198,11 +199,18 @@ bool IsFormattingEnabledForObject(const UObject* Object)
 	return Object != nullptr && (FFormatter::IsAssetSupported(Object) || Settings->AutoDetectGraphEditor);
 }
 
+bool IsGraphTargetEditable(const SGraphEditor* Editor)
+{
+	const SGraphPanel* Panel = Editor != nullptr ? Editor->GetGraphPanel() : nullptr;
+	return Panel != nullptr && Panel->IsGraphEditable();
+}
+
 bool CanExecuteGraphCommand(const TSharedPtr<const FFormatterCommandContext> Context)
 {
 	SGraphEditor* Editor = nullptr;
 	UObject* Object = nullptr;
-	return ResolveGraphTarget(Context, Editor, Object) && IsFormattingEnabledForObject(Object);
+	return ResolveGraphTarget(Context, Editor, Object) && IsFormattingEnabledForObject(Object)
+		&& IsGraphTargetEditable(Editor);
 }
 
 void RecordDetectedGraphEditor(UObject* Object)

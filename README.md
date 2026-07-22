@@ -25,7 +25,7 @@ The K2 formatter separates execution flow from data dependencies instead of trea
 - Event-rooted execution islands are discovered from execution wiring only. Delegate and data links may cross between islands without flattening them into one layout paragraph.
 - Execution strongly determines left-to-right ranks.
 - The primary execution path is pin-aligned so wires stay visually straight where integer node positions permit it.
-- Execution-pin alignment has priority over node-top Y snapping. Columns, event anchors, and provider satellites use a configurable coarse layout cell (50 units by default).
+- Execution-pin alignment has priority over node-top Y snapping. Columns, event anchors, and provider satellites use the visible major Blueprint canvas grid (128 graph units with Unreal's default 16-unit snap and 8-cell rule period).
 - Every execution column begins after the widest node or pure-input compound in the previous column, with at least one complete layout cell of empty horizontal space. Preserve mode expands cramped authored gaps but propagates that expansion forward instead of compacting any later generous rank-to-rank gap.
 - Branch output order is a hard ordering constraint; alternating median/barycenter sweeps and adjacent swaps reduce crossings around it.
 - Long execution edges use virtual layout vertices, avoiding rank compression and arbitrary layer wrapping.
@@ -51,7 +51,7 @@ Generated knots are tagged as Graph Formatter routes. Later layout passes valida
 | `bEnableK2Formatter` | Enables the semantic K2 path. Unsupported graphs automatically use the generic formatter. |
 | `bEnableHybridGridSnap` | Uses alignment-preserving grid snapping; when disabled, nodes use conventional grid snapping. |
 | `K2LayoutMode` | Selects default **Preserve Human Layout** or explicit **Full Reflow**. The legacy whole-scope `bPreserveComponentAnchor` value is retained only for config compatibility. |
-| `K2LayoutCellSize` | Coarse visual cell for event anchors, statement columns, provider rows, and minimum gutters; defaults to 50 units. |
+| `K2LayoutCellSize` | Minimum coarse visual cell for event anchors, statement columns, provider rows, and gutters. It is rounded up to a whole visible major Blueprint canvas square and defaults to 128 units. |
 | `K2OrderingSweeps` | Controls deterministic crossing-reduction effort. |
 | `K2RoutingPlanningWorkBudget` | Caps primitive geometry work independently for each graph-wide readability pass and for routing; the constructor default is 1,000,000. Exhaustion conservatively leaves the layout or remaining wires unchanged. |
 | `K2HorizontalSpacing`, `K2VerticalSpacing`, `K2BranchSpacing` | Control execution-column and branch-lane clearance. |
@@ -65,7 +65,7 @@ Generated knots are tagged as Graph Formatter routes. Later layout passes valida
 | `bRouteDataWires` | Allows crossing, backward, long, or obstructed data wires to be routed. |
 | `bShowLayoutNotifications` | Shows success and safe-abort notifications. |
 
-The constructor defaults favor readability over compactness: preservation mode, a 50-unit coarse cell, 160 units between execution columns, 96 units of node and branch clearance, 256 units between event paragraphs, and 64 units of comment padding. Spacing values smaller than one layout cell are promoted to one complete cell.
+The constructor defaults favor readability over compactness: preservation mode, a 128-unit major-grid cell, 160 units between execution columns, 96 units of node and branch clearance, 256 units between event paragraphs, and 64 units of comment padding. Spacing values smaller than one layout cell are promoted to one complete cell.
 
 ## Safety and determinism
 

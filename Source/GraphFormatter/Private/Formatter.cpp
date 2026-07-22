@@ -51,6 +51,24 @@ static void ShowFormatterNotification(const FText& Text, const SNotificationItem
 	}
 }
 
+static void ReportReadOnlyGraph()
+{
+	UE_LOG(
+		LogGraphFormatter,
+		Warning,
+		TEXT("Formatting was not started because the active graph is read-only. Stop simulation or open the Blueprint that owns the graph.")
+	);
+	if (GetDefault<UFormatterSettings>()->bShowLayoutNotifications)
+	{
+		ShowFormatterNotification(
+			LOCTEXT(
+				"ReadOnlyGraph", "Graph Formatter cannot change this read-only graph. Stop simulation, or open the Blueprint that owns the inherited graph."
+			),
+			SNotificationItem::CS_Fail
+		);
+	}
+}
+
 void FFormatter::SetCurrentEditor(SGraphEditor* Editor, UObject* Object)
 {
 	CurrentEditor = Editor;
@@ -225,6 +243,11 @@ bool FFormatter::PreCommand()
 	if (!CurrentGraph) { return false; }
 	CurrentPanel = GetCurrentPanel();
 	if (!CurrentPanel) { return false; }
+	if (!CurrentPanel->IsGraphEditable())
+	{
+		ReportReadOnlyGraph();
+		return false;
+	}
 
 	CurrentPanel->Update();
 	CurrentPanel->SlatePrepass();
@@ -419,6 +442,12 @@ void FFormatter::HandleK2PostTick(float DeltaTime)
 		CancelPendingFormat();
 		return;
 	}
+	if (!Panel->IsGraphEditable())
+	{
+		CancelPendingFormat();
+		ReportReadOnlyGraph();
+		return;
+	}
 
 	GraphFormatter::K2::FGraphGeometrySnapshot Geometry = GraphFormatter::K2::FGraphGeometrySnapshot::Capture(*Panel);
 	if (Geometry.ShouldRetry() && PendingK2Format->RetryCount++ == 0)
@@ -461,11 +490,11 @@ void FFormatter::HandleK2PostTick(float DeltaTime)
 	}
 	if (Settings.bShowLayoutNotifications && !Result.Message.IsEmpty())
 	{
-		const SNotificationItem::ECompletionState State = Result.Status == GraphFormatter::K2::EK2FormatStatus::Formatted
-															   || Result.Status
-																	  == GraphFormatter::K2::EK2FormatStatus::NoChanges
-															? SNotificationItem::CS_Success
-															: SNotificationItem::CS_Fail;
+		const SNotificationItem::ECompletionState State =
+			Result.Status == GraphFormatter::K2::EK2FormatStatus::Formatted
+					|| (Result.Status == GraphFormatter::K2::EK2FormatStatus::NoChanges && !Result.bSafetyRejected)
+				? SNotificationItem::CS_Success
+				: SNotificationItem::CS_Fail;
 		ShowFormatterNotification(FText::FromString(Result.Message), State);
 	}
 }

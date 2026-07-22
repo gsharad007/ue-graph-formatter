@@ -2755,6 +2755,16 @@ FLayoutPlan FLayoutBuilder::Build()
 }
 } // namespace Private
 
+double ResolveMajorGridAlignedCellSize(const double RequestedCellSize, const double FineGridSize, const double MajorRulePeriod)
+{
+	const double SafeFineGridSize = FMath::IsFinite(FineGridSize) ? FMath::Max(1.0, FineGridSize) : 1.0;
+	const double SafeRulePeriod =
+		FMath::IsFinite(MajorRulePeriod) ? FMath::Max(1.0, FMath::RoundToDouble(MajorRulePeriod)) : 1.0;
+	const double SafeRequestedCellSize = FMath::IsFinite(RequestedCellSize) ? FMath::Max(1.0, RequestedCellSize)
+																			: SafeFineGridSize * SafeRulePeriod;
+	return Private::SnapUp(SafeRequestedCellSize, SafeFineGridSize * SafeRulePeriod);
+}
+
 FLayoutPlan BuildLayout(const FGraphSnapshot& Snapshot, const FLayoutSettings& Settings)
 { return Private::FLayoutBuilder{ Snapshot, Settings }.Build(); }
 } // namespace GraphFormatter::K2Layout

@@ -648,17 +648,52 @@ bool RouteIntersectsReservedRoute(
 	return false;
 }
 
-TSet<FString> CollectIntersectingRouteKeys(
+int32 CountRouteIntersections(
+	const FRouteGeometry& Route, const FRerouteEdge& Edge, const FReservedRoute& Reserved, FRoutePlanningBudget& Budget
+)
+{
+	if (!Route.RenderedBounds.bIsValid || !Reserved.Bounds.bIsValid
+		|| Route.RenderedBounds.Max.X < Reserved.Bounds.Min.X || Reserved.Bounds.Max.X < Route.RenderedBounds.Min.X
+		|| Route.RenderedBounds.Max.Y < Reserved.Bounds.Min.Y || Reserved.Bounds.Max.Y < Route.RenderedBounds.Min.Y)
+	{
+		return 0;
+	}
+
+	int32 Result = 0;
+	for (int32 RouteSegment = 1; RouteSegment < Route.RenderedPoints.Num(); ++RouteSegment)
+	{
+		for (int32 ReservedSegment = 1; ReservedSegment < Reserved.Points.Num(); ++ReservedSegment)
+		{
+			if (!Budget.TryConsume()) { return Result; }
+			const FSegmentInteraction Interaction = GetSegmentInteraction(
+				Route.RenderedPoints[RouteSegment - 1],
+				Route.RenderedPoints[RouteSegment],
+				Reserved.Points[ReservedSegment - 1],
+				Reserved.Points[ReservedSegment]
+			);
+			if (!Interaction.bIntersects) { continue; }
+			if (Interaction.bCollinear
+				|| !IsExactSharedTerminal(Interaction.Intersection, Route, Edge, Reserved, RouteSegment, ReservedSegment))
+			{
+				++Result;
+			}
+		}
+	}
+	return Result;
+}
+
+TMap<FString, int32> CollectRouteIntersectionCounts(
 	const FRouteGeometry& Route,
 	const FRerouteEdge& Edge,
 	TConstArrayView<FReservedRoute> ReservedRoutes,
 	FRoutePlanningBudget& Budget
 )
 {
-	TSet<FString> Result;
+	TMap<FString, int32> Result;
 	for (const FReservedRoute& Reserved : ReservedRoutes)
 	{
-		if (RouteIntersectsReservedRoute(Route, Edge, Reserved, Budget)) { Result.Add(Reserved.StableKey); }
+		const int32 IntersectionCount = CountRouteIntersections(Route, Edge, Reserved, Budget);
+		if (IntersectionCount > 0) { Result.FindOrAdd(Reserved.StableKey) += IntersectionCount; }
 		if (Budget.bExhausted) { break; }
 	}
 	return Result;
@@ -787,9 +822,10 @@ TArray<FVector2D> BuildRoute(
 		return {};
 	}
 	// Every direct baseline is reserved before planning begins. Requiring each replacement's
-	// crossing partners to be a subset of its current baseline partners makes the complete
-	// graph-wide crossing-pair set monotonically non-increasing throughout the routing pass.
-	const TSet<FString> BaselineCrossingKeys = CollectIntersectingRouteKeys(BaselineGeometry, Edge, ReservedRoutes, Budget);
+	// crossing count with every reserved logical wire to be no greater than its current count
+	// keeps both crossing identity and multiplicity monotonically non-increasing across the pass.
+	const TMap<FString, int32> BaselineIntersectionCounts =
+		CollectRouteIntersectionCounts(BaselineGeometry, Edge, ReservedRoutes, Budget);
 	if (Budget.bExhausted) { return {}; }
 
 	double TopCandidate = FMath::Min(Edge.OutputAnchor.Y, Edge.InputAnchor.Y) - Channel;
@@ -814,7 +850,7 @@ TArray<FVector2D> BuildRoute(
 	int32 BestOrder = MAX_int32;
 	int32 MinimumRequiredKnots = MAX_int32;
 	bool bFoundObstacleClearRoute = false;
-	bool bRejectedNewCrossing = false;
+	bool bRejectedCrossingRegression = false;
 	const auto ConsiderCandidate = [&](TArray<FVector2D> Candidate, const int32 Order, const bool bPreferred)
 	{
 		if (Budget.bExhausted) { return; }
@@ -849,14 +885,14 @@ TArray<FVector2D> BuildRoute(
 		MinimumRequiredKnots = FMath::Min(MinimumRequiredKnots, RequiredKnots);
 		if (RequiredKnots > Settings.MaxKnotsPerWire) { return; }
 
-		const TSet<FString> CandidateCrossingKeys =
-			CollectIntersectingRouteKeys(CandidateGeometry, Edge, ReservedRoutes, Budget);
+		const TMap<FString, int32> CandidateIntersectionCounts =
+			CollectRouteIntersectionCounts(CandidateGeometry, Edge, ReservedRoutes, Budget);
 		if (Budget.bExhausted) { return; }
-		for (const FString& CrossingKey : CandidateCrossingKeys)
+		for (const TPair<FString, int32>& CandidateIntersection : CandidateIntersectionCounts)
 		{
-			if (!BaselineCrossingKeys.Contains(CrossingKey))
+			if (CandidateIntersection.Value > BaselineIntersectionCounts.FindRef(CandidateIntersection.Key))
 			{
-				bRejectedNewCrossing = true;
+				bRejectedCrossingRegression = true;
 				return;
 			}
 		}
@@ -920,9 +956,10 @@ TArray<FVector2D> BuildRoute(
 		return BestRoute;
 	}
 
-	if (bRejectedNewCrossing)
+	if (bRejectedCrossingRegression)
 	{
-		OutFailure = TEXT("Every route within the configured knot limit would introduce a new wire crossing.");
+		OutFailure =
+			TEXT("Every route within the configured knot limit would introduce a new wire crossing or repeat an existing one.");
 	}
 	else if (bFoundObstacleClearRoute && MinimumRequiredKnots != MAX_int32)
 	{
