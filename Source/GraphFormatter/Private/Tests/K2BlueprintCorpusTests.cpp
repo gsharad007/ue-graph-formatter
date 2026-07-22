@@ -68,7 +68,14 @@ const FBlueprintCorpusEntry BlueprintCorpus[] = {
 	{
      TEXT("LoomCradle.CurrentFeatureRoot"),
      TEXT("/Game/Development/LoomCradle/Blueprints/BP_LoomCradle.BP_LoomCradle"),
-     TEXT("current Loom feature root Blueprint"),
+     TEXT("current LLM-generated Loom feature root; 112 K2 nodes across 11 graphs"),
+     TEXT("EventGraph"),
+	 },
+	{
+     TEXT("LoomCradleOrganic.LargestGeneratedBlueprint"),
+     TEXT("/Game/Development/LoomCradle/Blueprints/BP_LoomCradleOrganic.BP_LoomCradleOrganic"),
+     TEXT("largest LLM-generated Loom Blueprint; 289 K2 nodes across 16 graphs"),
+     TEXT("EventGraph"),
 	 },
 	{
      TEXT("LoomCradleHex.CurrentFormattingRepro"),
@@ -78,7 +85,20 @@ const FBlueprintCorpusEntry BlueprintCorpus[] = {
 	{
      TEXT("LoomSlotDriver.CurrentFeatureDriver"),
      TEXT("/Game/Development/LoomCradle/Blueprints/BP_LoomSlotDriver.BP_LoomSlotDriver"),
-     TEXT("recently saved and currently edited Loom driver Blueprint"),
+     TEXT("recently saved LLM-generated Loom driver; 238 K2 nodes across 10 graphs"),
+     TEXT("EventGraph"),
+	 },
+	{
+     TEXT("LoomSlotDriverOrganic.GeneratedVariant"),
+     TEXT("/Game/Development/LoomCradle/Blueprints/BP_LoomSlotDriverOrganic.BP_LoomSlotDriverOrganic"),
+     TEXT("LLM-generated organic driver variant; 92 K2 nodes across 7 graphs"),
+     TEXT("EventGraph"),
+	 },
+	{
+     TEXT("LoomSlotDriverOrganic2.GeneratedVariant"),
+     TEXT("/Game/Development/LoomCradle/Blueprints/BP_LoomSlotDriverOrganic2.BP_LoomSlotDriverOrganic2"),
+     TEXT("second LLM-generated organic driver variant; 106 K2 nodes across 7 graphs"),
+     TEXT("EventGraph"),
 	 },
 	{
      TEXT("DrinkMeStation.HighRevisionLargeGraph"),
@@ -108,7 +128,7 @@ const FBlueprintCorpusEntry BlueprintCorpus[] = {
 	{
      TEXT("ResourceCarrier.CurrentFormattingRepro"),
      TEXT("/Game/Player/HeldObject/BPC_ResourceCarrier.BPC_ResourceCarrier"),
-     TEXT("current DropHeldActor safety-gate no-op repro with an authored multi-link data bus"),
+     TEXT("current DropHeldActor no-op and DetachActor spacing/reroute-column repros"),
      TEXT("DropHeldActor"),
 	 },
 };
@@ -302,6 +322,59 @@ FVector2D ResolveNodeSize(const UEdGraphNode& Node)
 		Node.NodeWidth >= 1 ? static_cast<double>(Node.NodeWidth) : FallbackNodeWidth,
 		Node.NodeHeight >= 1 ? static_cast<double>(Node.NodeHeight) : FallbackNodeHeight
 	);
+}
+
+[[nodiscard]]
+const UEdGraphNode* FindNodeByObjectName(const UEdGraph& Graph, const TCHAR* Name)
+{
+	for (const TObjectPtr<UEdGraphNode>& NodePointer : Graph.Nodes)
+	{
+		const UEdGraphNode* Node = NodePointer.Get();
+		if (Node != nullptr && Node->GetName() == Name) { return Node; }
+	}
+	return nullptr;
+}
+
+void VerifyResourceCarrierDetachRerouteColumns(FAutomationTestBase& Test, const FString& Context, const UEdGraph& Graph)
+{
+	struct FExpectedAlignment
+	{
+		const TCHAR* Knot;
+		const TCHAR* SemanticNode;
+		bool bInputColumn = false;
+	};
+	const FExpectedAlignment ExpectedAlignments[] = {
+		{ TEXT("K2Node_Knot_2"), TEXT("K2Node_CallFunction_43"), true },
+		{ TEXT("K2Node_Knot_0"), TEXT("K2Node_CallFunction_43") },
+		{ TEXT("K2Node_Knot_1"), TEXT("K2Node_CallFunction_0") },
+		{ TEXT("K2Node_Knot_3"), TEXT("K2Node_Message_1") },
+		{ TEXT("K2Node_Knot_4"), TEXT("K2Node_VariableSet_0") },
+		{ TEXT("K2Node_Knot_5"), TEXT("K2Node_IfThenElse_0") },
+		{ TEXT("K2Node_Knot_6"), TEXT("K2Node_CallFunction_1"), true },
+	};
+	for (const FExpectedAlignment& Expected : ExpectedAlignments)
+	{
+		const UEdGraphNode* Knot = FindNodeByObjectName(Graph, Expected.Knot);
+		const UEdGraphNode* SemanticNode = FindNodeByObjectName(Graph, Expected.SemanticNode);
+		Test.TestNotNull(*FString::Printf(TEXT("%s: finds reroute '%s'"), *Context, Expected.Knot), Knot);
+		Test.TestNotNull(
+			*FString::Printf(TEXT("%s: finds semantic column node '%s'"), *Context, Expected.SemanticNode), SemanticNode
+		);
+		if (Knot == nullptr || SemanticNode == nullptr) { continue; }
+		const double KnotCenterX = static_cast<double>(Knot->NodePosX) + RerouteKnotWidth * 0.5;
+		const double ExpectedPinX = static_cast<double>(SemanticNode->NodePosX)
+								  + (Expected.bInputColumn ? 0.0 : ResolveNodeSize(*SemanticNode).X);
+		Test.TestTrue(
+			*FString::Printf(
+				TEXT("%s: reroute '%s' center aligns with the %s pin column of '%s'"),
+				*Context,
+				Expected.Knot,
+				Expected.bInputColumn ? TEXT("input") : TEXT("output"),
+				Expected.SemanticNode
+			),
+			FMath::IsNearlyEqual(KnotCenterX, ExpectedPinX, GeometryEpsilon)
+		);
+	}
 }
 
 [[nodiscard]]
@@ -1068,7 +1141,13 @@ bool FK2BlueprintCorpusPreservationTest::RunTest(const FString& Parameters)
 		const FGraphQualityMetrics QualityBefore = MeasureQuality(*WorkingGraph);
 		const FK2FormatResult FirstResult =
 			FK2GraphFormatter::Format(*WorkingGraph, HeadlessGeometry, Scope, false, *Settings);
-		if (Entry->RequiredFormattedGraph != nullptr && SourceGraph->GetName() == Entry->RequiredFormattedGraph)
+		const bool bResourceCarrierDetachGraph =
+			FCString::Strcmp(Entry->ObjectPath, TEXT("/Game/Player/HeldObject/BPC_ResourceCarrier.BPC_ResourceCarrier")) == 0
+			&& SourceGraph->GetName() == TEXT("DetachActor");
+		const bool bRequiredFormattedGraph =
+			(Entry->RequiredFormattedGraph != nullptr && SourceGraph->GetName() == Entry->RequiredFormattedGraph)
+			|| bResourceCarrierDetachGraph;
+		if (bRequiredFormattedGraph)
 		{
 			if (FirstResult.bSafetyRejected)
 			{
@@ -1112,6 +1191,15 @@ bool FK2BlueprintCorpusPreservationTest::RunTest(const FString& Parameters)
 		VerifyReadabilityDoesNotRegress(*this, Context, QualityBefore, QualityAfter);
 		VerifyHumanMovementBudget(*this, Context, QualityBefore, QualityAfter);
 		VerifyFormattedSemanticNodeXGrid(*this, Context, *WorkingGraph, QualityBefore, FirstResult);
+		if (bResourceCarrierDetachGraph)
+		{
+			TestEqual(
+				*FString::Printf(TEXT("%s: every straight execution edge retains one full major-grid gutter"), *Context),
+				QualityAfter.InsufficientStraightExecutionGapCount,
+				0
+			);
+			VerifyResourceCarrierDetachRerouteColumns(*this, Context, *WorkingGraph);
+		}
 
 		const FK2FormatResult SecondResult =
 			FK2GraphFormatter::Format(*WorkingGraph, HeadlessGeometry, Scope, false, *Settings);
@@ -1226,6 +1314,15 @@ bool FK2BlueprintCorpusPreservationTest::RunTest(const FString& Parameters)
 		VerifyRootPreservation(*this, Context + TEXT(" routed"), RoutedQualityBefore, RoutedQualityAfter);
 		VerifyRoutedReadabilityDoesNotRegress(*this, Context, RoutedQualityBefore, RoutedQualityAfter);
 		VerifyHumanMovementBudget(*this, Context + TEXT(" routed"), RoutedQualityBefore, RoutedQualityAfter);
+		if (bResourceCarrierDetachGraph)
+		{
+			TestEqual(
+				*FString::Printf(TEXT("%s routed: every straight execution edge retains one full major-grid gutter"), *Context),
+				RoutedQualityAfter.InsufficientStraightExecutionGapCount,
+				0
+			);
+			VerifyResourceCarrierDetachRerouteColumns(*this, Context + TEXT(" routed"), *RoutedGraph);
+		}
 
 		const int32 RoutedNodeCountAfterFirstPass = RoutedGraph->Nodes.Num();
 		const FGraphQualityMetrics RoutedQualityBeforeSecondPass = MeasureQuality(*RoutedGraph);

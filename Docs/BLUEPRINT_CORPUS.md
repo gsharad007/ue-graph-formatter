@@ -21,16 +21,21 @@ The manifest is checked into `Private/Tests/K2BlueprintCorpusTests.cpp`. The Jul
 | `BP_LoomMod_DroneClamp` | Highest local Blueprint-open count in the available editing sessions. |
 | `BP_LoomMod_LightCable` | Recently opened and saved module graph. |
 | `BP_LoomCradle` | Root of the currently edited Loom feature. |
+| `BP_LoomCradleOrganic` | Largest LLM-generated Loom Blueprint: 289 K2 nodes across 16 graphs. |
 | `BP_LoomCradleHex` | Current simple-function grid-alignment and inherited/read-only graph repro. |
-| `BP_LoomSlotDriver` | Recently saved/currently edited feature driver. |
+| `BP_LoomSlotDriver` | Recently saved/currently edited LLM-generated feature driver: 238 K2 nodes across 10 graphs. |
+| `BP_LoomSlotDriverOrganic` | LLM-generated organic driver variant: 92 K2 nodes across 7 graphs. |
+| `BP_LoomSlotDriverOrganic2` | Second LLM-generated organic driver variant: 106 K2 nodes across 7 graphs. |
 | `BP_DrinkMeStation` | High-revision, large, carefully hand-formatted production graph. |
 | `BP_DrinkMeIngredientSlot` | Recently opened DrinkMe slot graph. |
 | `BP_DrinkMeOutputSlot` | Frequently revised sibling slot graph. |
 | `BP_WorldItemSlot` | Recently opened large item-slot graph. |
 | `BP_WorldItem` | Frequently revised foundational item graph. |
-| `BPC_ResourceCarrier` | Current `DropHeldActor` no-op regression with an authored multi-link data bus beneath the execution spine. |
+| `BPC_ResourceCarrier` | Current `DropHeldActor` and `DetachActor` no-op/spacing regressions, including an authored multi-link data bus beneath the execution spine. |
 
 Intermediate compiler graphs and `_MERGED` artifacts are excluded. Every eligible authored event, function, macro, and collapsed K2 graph with at least two nodes is exercised.
+
+The LoomCradle slice intentionally includes every graph-bearing top-level Blueprint. Its module children currently contain near-identical six-node shells, so `BP_LoomMod_DroneClamp` and `BP_LoomMod_LightCable` provide representative module coverage without multiplying structurally duplicate cases. Promote another module independently if its authored graph diverges.
 
 ## Acceptance gates
 
@@ -46,7 +51,9 @@ For **Format Graph**, the corpus requires:
 - graphs with no measured readability improvement to keep at least 65% of nodes within one coarse cell of their authored position; an improving candidate may move at most 65% beyond a cell, with a three-node allowance so a small exec/data chain can be straightened without forcing Full Reflow;
 - a second pass to move zero nodes, resize zero comments, and preserve topology.
 
-`BPC_ResourceCarrier.DropHeldActor` additionally requires a genuinely formatted result with useful node movement. A readability-gate no-op is a failure for this targeted regression, not an acceptable “safe” result.
+The `EventGraph` in `BP_LoomCradle`, `BP_LoomCradleOrganic`, `BP_LoomSlotDriver`, `BP_LoomSlotDriverOrganic`, and `BP_LoomSlotDriverOrganic2` must produce a genuinely formatted result with useful node movement. These deliberately messy LLM-generated graphs are cleanup targets, so a readability-gate no-op is a failure rather than an acceptable “safe” result.
+
+`BPC_ResourceCarrier.DropHeldActor` and `BPC_ResourceCarrier.DetachActor` have the same useful-movement requirement. `DetachActor` must leave at least one complete visible major-grid cell between consecutive straight execution nodes. Its authored data-bus reroutes must also retain their horizontal channel while aligning the receiver-side reroute to the receiving input-pin column and each source/intermediate reroute to the corresponding output-pin column.
 
 For **Format + Route Wires**, generated Graph Formatter knots are collapsed while topology is compared. The real endpoint topology and every authored node must remain identical; overlaps, backward data flow, execution/data crossings, and wire-under-node counts cannot materially regress; and a second pass may not move nodes, create more knots, or grow the graph.
 

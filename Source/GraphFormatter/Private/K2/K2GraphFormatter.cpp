@@ -86,7 +86,7 @@ struct FPlannedAdapterNode
 	FVector2D Size = FVector2D(FallbackNodeWidth, FallbackNodeHeight);
 	int32 ComponentIndex = INDEX_NONE;
 	int32 ExecutionRank = INDEX_NONE;
-	bool bPreserveAuthoredReroute = false;
+	bool bPreserveAuthoredRerouteChannel = false;
 };
 
 struct FNodePositionChange
@@ -1057,6 +1057,212 @@ struct FConservativeFallbackResult
 };
 
 [[nodiscard]]
+TMap<UEdGraphNode*, FVector2D> BuildAuthoredRerouteColumnAlignments(
+	TConstArrayView<FAdapterNodeRecord> Nodes,
+	TConstArrayView<FAdapterEdgeRecord> Edges,
+	const TMap<const UEdGraphPin*, FAdapterPinRecord>& PinRecords,
+	const TMap<UEdGraphNode*, FVector2D>& Positions
+)
+{
+	TMap<UEdGraphNode*, const FAdapterNodeRecord*> NodeRecords;
+	TSet<UEdGraphNode*> Knots;
+	for (const FAdapterNodeRecord& Node : Nodes)
+	{
+		NodeRecords.Add(Node.Node, &Node);
+		if (Node.Node != nullptr && Node.Node->IsA<UK2Node_Knot>()) { Knots.Add(Node.Node); }
+	}
+
+	TMap<UEdGraphNode*, TArray<const FAdapterEdgeRecord*>> IncomingEdges;
+	TMap<UEdGraphNode*, TArray<const FAdapterEdgeRecord*>> OutgoingEdges;
+	TMap<UEdGraphNode*, TArray<UEdGraphNode*>> KnotPredecessors;
+	TMap<UEdGraphNode*, TArray<UEdGraphNode*>> KnotSuccessors;
+	for (const FAdapterEdgeRecord& Edge : Edges)
+	{
+		UEdGraphNode* Source = Edge.OutputPin != nullptr ? Edge.OutputPin->GetOwningNodeUnchecked() : nullptr;
+		UEdGraphNode* Target = Edge.InputPin != nullptr ? Edge.InputPin->GetOwningNodeUnchecked() : nullptr;
+		if (Knots.Contains(Source)) { OutgoingEdges.FindOrAdd(Source).Add(&Edge); }
+		if (Knots.Contains(Target)) { IncomingEdges.FindOrAdd(Target).Add(&Edge); }
+		if (Knots.Contains(Source) && Knots.Contains(Target))
+		{
+			KnotSuccessors.FindOrAdd(Source).AddUnique(Target);
+			KnotPredecessors.FindOrAdd(Target).AddUnique(Source);
+		}
+	}
+
+	const auto StableNodeLess = [&NodeRecords](const UEdGraphNode& Left, const UEdGraphNode& Right)
+	{
+		const FAdapterNodeRecord* const* LeftRecord = NodeRecords.Find(&Left);
+		const FAdapterNodeRecord* const* RightRecord = NodeRecords.Find(&Right);
+		const FString LeftKey = LeftRecord != nullptr ? (*LeftRecord)->Key : Left.GetName();
+		const FString RightKey = RightRecord != nullptr ? (*RightRecord)->Key : Right.GetName();
+		return LeftKey < RightKey;
+	};
+	for (TPair<UEdGraphNode*, TArray<UEdGraphNode*>>& Pair : KnotPredecessors)
+	{
+		Pair.Value.Sort([&StableNodeLess](const UEdGraphNode& Left, const UEdGraphNode& Right)
+						{ return StableNodeLess(Left, Right); });
+	}
+	for (TPair<UEdGraphNode*, TArray<UEdGraphNode*>>& Pair : KnotSuccessors)
+	{
+		Pair.Value.Sort([&StableNodeLess](const UEdGraphNode& Left, const UEdGraphNode& Right)
+						{ return StableNodeLess(Left, Right); });
+	}
+
+	const auto ResolvePinX = [&PinRecords, &Positions](const UEdGraphPin* Pin, double& OutX)
+	{
+		if (Pin == nullptr) { return false; }
+		UEdGraphNode* Owner = Pin->GetOwningNodeUnchecked();
+		const FVector2D* Position = Positions.Find(Owner);
+		const FAdapterPinRecord* Record = PinRecords.Find(Pin);
+		if (Position == nullptr || Record == nullptr) { return false; }
+		OutX = Position->X + Record->Offset.X;
+		return true;
+	};
+	const auto ResolveOutputColumnX = [&NodeRecords, &PinRecords, &Positions](const UEdGraphNode& Node, double& OutX)
+	{
+		const FVector2D* Position = Positions.Find(&Node);
+		if (Position == nullptr) { return false; }
+		bool bFoundOutput = false;
+		for (const UEdGraphPin* Pin : Node.Pins)
+		{
+			if (Pin == nullptr || Pin->Direction != EGPD_Output) { continue; }
+			if (const FAdapterPinRecord* Record = PinRecords.Find(Pin))
+			{
+				OutX = bFoundOutput ? FMath::Max(OutX, Position->X + Record->Offset.X) : Position->X + Record->Offset.X;
+				bFoundOutput = true;
+			}
+		}
+		if (bFoundOutput) { return true; }
+		const FAdapterNodeRecord* const* Record = NodeRecords.Find(&Node);
+		if (Record == nullptr) { return false; }
+		OutX = Position->X + (*Record)->Size.X;
+		return true;
+	};
+	const auto FindSemanticTargetInputX = [&OutgoingEdges, &Knots, &ResolvePinX](UEdGraphNode& Knot, double& OutX)
+	{
+		const TArray<const FAdapterEdgeRecord*>* KnotEdges = OutgoingEdges.Find(&Knot);
+		if (KnotEdges == nullptr) { return false; }
+		bool bFound = false;
+		for (const FAdapterEdgeRecord* Edge : *KnotEdges)
+		{
+			UEdGraphNode* Target = Edge != nullptr && Edge->InputPin != nullptr ? Edge->InputPin->GetOwningNodeUnchecked()
+																				: nullptr;
+			if (Target == nullptr || Knots.Contains(Target)) { continue; }
+			double Candidate = 0.0;
+			if (ResolvePinX(Edge->InputPin, Candidate))
+			{
+				OutX = bFound ? FMath::Min(OutX, Candidate) : Candidate;
+				bFound = true;
+			}
+		}
+		return bFound;
+	};
+	const auto FindSemanticTargetOutputX = [&OutgoingEdges, &Knots, &ResolveOutputColumnX](UEdGraphNode& Knot, double& OutX)
+	{
+		const TArray<const FAdapterEdgeRecord*>* KnotEdges = OutgoingEdges.Find(&Knot);
+		if (KnotEdges == nullptr) { return false; }
+		bool bFound = false;
+		for (const FAdapterEdgeRecord* Edge : *KnotEdges)
+		{
+			UEdGraphNode* Target = Edge != nullptr && Edge->InputPin != nullptr ? Edge->InputPin->GetOwningNodeUnchecked()
+																				: nullptr;
+			if (Target == nullptr || Knots.Contains(Target)) { continue; }
+			double Candidate = 0.0;
+			if (ResolveOutputColumnX(*Target, Candidate))
+			{
+				OutX = bFound ? FMath::Max(OutX, Candidate) : Candidate;
+				bFound = true;
+			}
+		}
+		return bFound;
+	};
+
+	TArray<UEdGraphNode*> Starts;
+	for (UEdGraphNode* Knot : Knots)
+	{
+		const TArray<UEdGraphNode*>* Predecessors = KnotPredecessors.Find(Knot);
+		if (Predecessors == nullptr || Predecessors->IsEmpty()) { Starts.Add(Knot); }
+	}
+	Starts.Sort([&StableNodeLess](const UEdGraphNode& Left, const UEdGraphNode& Right)
+				{ return StableNodeLess(Left, Right); });
+
+	TSet<UEdGraphNode*> Visited;
+	TMap<UEdGraphNode*, FVector2D> Result;
+	for (UEdGraphNode* Start : Starts)
+	{
+		TArray<UEdGraphNode*> Chain;
+		UEdGraphNode* Current = Start;
+		while (Current != nullptr && !Visited.Contains(Current))
+		{
+			Visited.Add(Current);
+			Chain.Add(Current);
+			const TArray<UEdGraphNode*>* Successors = KnotSuccessors.Find(Current);
+			if (Successors == nullptr || Successors->Num() != 1) { break; }
+			UEdGraphNode* Next = (*Successors)[0];
+			const TArray<UEdGraphNode*>* NextPredecessors = KnotPredecessors.Find(Next);
+			if (NextPredecessors == nullptr || NextPredecessors->Num() != 1) { break; }
+			Current = Next;
+		}
+		if (Chain.IsEmpty()) { continue; }
+
+		bool bBranchingBus = false;
+		for (int32 Index = 0; Index + 1 < Chain.Num(); ++Index)
+		{
+			double Unused = 0.0;
+			bBranchingBus |= FindSemanticTargetInputX(*Chain[Index], Unused);
+		}
+
+		TMap<UEdGraphNode*, double> DesiredCenters;
+		if (bBranchingBus)
+		{
+			double FirstInputX = 0.0;
+			if (FindSemanticTargetInputX(*Chain[0], FirstInputX)) { DesiredCenters.Add(Chain[0], FirstInputX); }
+			for (int32 Index = 1; Index < Chain.Num(); ++Index)
+			{
+				double PreviousOutputX = 0.0;
+				if (FindSemanticTargetOutputX(*Chain[Index - 1], PreviousOutputX))
+				{
+					DesiredCenters.Add(Chain[Index], PreviousOutputX);
+				}
+			}
+		}
+		else
+		{
+			const TArray<const FAdapterEdgeRecord*>* FirstIncoming = IncomingEdges.Find(Chain[0]);
+			if (FirstIncoming != nullptr && Chain.Num() > 1)
+			{
+				for (const FAdapterEdgeRecord* Edge : *FirstIncoming)
+				{
+					UEdGraphNode* Source = Edge != nullptr && Edge->OutputPin != nullptr
+											 ? Edge->OutputPin->GetOwningNodeUnchecked()
+											 : nullptr;
+					if (Source == nullptr || Knots.Contains(Source)) { continue; }
+					double OutputX = 0.0;
+					if (ResolvePinX(Edge->OutputPin, OutputX))
+					{
+						DesiredCenters.Add(Chain[0], OutputX);
+						break;
+					}
+				}
+			}
+			double LastInputX = 0.0;
+			if (FindSemanticTargetInputX(*Chain.Last(), LastInputX)) { DesiredCenters.Add(Chain.Last(), LastInputX); }
+		}
+
+		for (const TPair<UEdGraphNode*, double>& Alignment : DesiredCenters)
+		{
+			const FVector2D* Position = Positions.Find(Alignment.Key);
+			if (Position == nullptr) { continue; }
+			const FVector2D AlignedPosition(
+				static_cast<double>(FMath::RoundToInt(Alignment.Value - RerouteKnotWidth * 0.5)), Position->Y
+			);
+			if (!Position->Equals(AlignedPosition, ReadabilityEpsilon)) { Result.Add(Alignment.Key, AlignedPosition); }
+		}
+	}
+	return Result;
+}
+
+[[nodiscard]]
 FConservativeFallbackResult BuildConservativeFallback(
 	const FReadabilityEvaluationContext& ReadabilityContext, TConstArrayView<FAdapterEdgeRecord> LayoutEdges
 )
@@ -1098,6 +1304,74 @@ FConservativeFallbackResult BuildConservativeFallback(
 	{
 		NodesByObject.Add(Node.Node, &Node);
 	}
+	TMap<const UEdGraphNode*, TArray<const UEdGraphNode*>> ConnectedNodes;
+	for (const FAdapterEdgeRecord& Edge : LayoutEdges)
+	{
+		const UEdGraphNode* Source = Edge.OutputPin != nullptr ? Edge.OutputPin->GetOwningNodeUnchecked() : nullptr;
+		const UEdGraphNode* Target = Edge.InputPin != nullptr ? Edge.InputPin->GetOwningNodeUnchecked() : nullptr;
+		if (Source == nullptr || Target == nullptr || !NodesByObject.Contains(Source) || !NodesByObject.Contains(Target))
+		{
+			continue;
+		}
+		ConnectedNodes.FindOrAdd(Source).AddUnique(Target);
+		ConnectedNodes.FindOrAdd(Target).AddUnique(Source);
+	}
+	const auto TryRightSideColumnShift = [&ReadabilityContext, &Result, &Current, &LastRejectedMoves, &ConnectedNodes](
+											 UEdGraphNode& Target, const double RequiredTargetX
+										 )
+	{
+		const FVector2D* TargetPosition = Result.Positions.Find(&Target);
+		if (TargetPosition == nullptr || TargetPosition->X + ReadabilityEpsilon >= RequiredTargetX) { return false; }
+		const double ThresholdX = TargetPosition->X;
+		TSet<const UEdGraphNode*> Component;
+		TArray<const UEdGraphNode*> Pending{ &Target };
+		for (int32 PendingIndex = 0; PendingIndex < Pending.Num(); ++PendingIndex)
+		{
+			const UEdGraphNode* Node = Pending[PendingIndex];
+			if (Node == nullptr || Component.Contains(Node)) { continue; }
+			Component.Add(Node);
+			if (const TArray<const UEdGraphNode*>* Neighbours = ConnectedNodes.Find(Node))
+			{
+				Pending.Append(*Neighbours);
+			}
+		}
+
+		const double DeltaX = RequiredTargetX - ThresholdX;
+		TMap<UEdGraphNode*, FVector2D> PreviousPositions;
+		for (const UEdGraphNode* ComponentNode : Component)
+		{
+			UEdGraphNode* Node = const_cast<UEdGraphNode*>(ComponentNode);
+			FVector2D* Position = Result.Positions.Find(Node);
+			if (Position == nullptr || Position->X + ReadabilityEpsilon < ThresholdX) { continue; }
+			PreviousPositions.Add(Node, *Position);
+			const double ShiftedX = Position->X + DeltaX;
+			Position->X = Node->IsA<UK2Node_Knot>() ? ShiftedX
+													: FMath::CeilToDouble(ShiftedX / ReadabilityContext.LayoutCellSize)
+														  * ReadabilityContext.LayoutCellSize;
+		}
+		if (PreviousPositions.IsEmpty()) { return false; }
+
+		FCandidateReadabilityEvaluation Trial = EvaluateReadabilityCandidate(ReadabilityContext, Result.Positions, false);
+		if (!Trial.Regression.IsEmpty())
+		{
+			for (const TPair<UEdGraphNode*, FVector2D>& Previous : PreviousPositions)
+			{
+				Result.Positions.FindChecked(Previous.Key) = Previous.Value;
+				LastRejectedMoves.Add(
+					Previous.Key,
+					FString::Printf(TEXT("shifting its right-side column group would cause %s"), *Trial.Regression)
+				);
+			}
+			return false;
+		}
+		for (const TPair<UEdGraphNode*, FVector2D>& Previous : PreviousPositions)
+		{
+			LastRejectedMoves.Remove(Previous.Key);
+		}
+		Current = MoveTemp(Trial);
+		Result.Readability = Current.Metrics;
+		return true;
+	};
 
 	// A move accepted later in a pass can make a previously unsafe grid snap viable. Iterate the
 	// grid and preferred-execution constraints together so a single format command reaches the same
@@ -1155,13 +1429,54 @@ FConservativeFallbackResult BuildConservativeFallback(
 			const double RequiredTargetX = FMath::CeilToDouble(UnsnappedTargetX / ReadabilityContext.LayoutCellSize)
 										 * ReadabilityContext.LayoutCellSize;
 			if (TargetPosition->X + ReadabilityEpsilon >= RequiredTargetX) { continue; }
-			if (TryPosition(*Target, FVector2D(RequiredTargetX, TargetPosition->Y)))
+			if (TryPosition(*Target, FVector2D(RequiredTargetX, TargetPosition->Y))
+				|| TryRightSideColumnShift(*Target, RequiredTargetX))
 			{
-				GridAlignedNodes.Add(Target);
+				for (const FAdapterNodeRecord& Node : ReadabilityContext.AuthoredNodes)
+				{
+					const FVector2D* Position = Result.Positions.Find(Node.Node);
+					if (Node.Node != nullptr && !Node.Node->IsA<UK2Node_Knot>() && Position != nullptr
+						&& FMath::IsNearlyZero(FMath::Fmod(Position->X, ReadabilityContext.LayoutCellSize), ReadabilityEpsilon))
+					{
+						GridAlignedNodes.Add(Node.Node);
+					}
+				}
 				bMovedInPass = true;
 			}
 		}
 		if (!bMovedInPass) { break; }
+	}
+
+	const TMap<UEdGraphNode*, FVector2D> RerouteAlignments = BuildAuthoredRerouteColumnAlignments(
+		ReadabilityContext.AuthoredNodes, LayoutEdges, ReadabilityContext.PinRecords, Result.Positions
+	);
+	if (!RerouteAlignments.IsEmpty())
+	{
+		TMap<UEdGraphNode*, FVector2D> PreviousPositions;
+		for (const TPair<UEdGraphNode*, FVector2D>& Alignment : RerouteAlignments)
+		{
+			if (FVector2D* Position = Result.Positions.Find(Alignment.Key))
+			{
+				PreviousPositions.Add(Alignment.Key, *Position);
+				*Position = Alignment.Value;
+			}
+		}
+		FCandidateReadabilityEvaluation Trial = EvaluateReadabilityCandidate(ReadabilityContext, Result.Positions, false);
+		if (Trial.Regression.IsEmpty())
+		{
+			Current = MoveTemp(Trial);
+			Result.Readability = Current.Metrics;
+		}
+		else
+		{
+			for (const TPair<UEdGraphNode*, FVector2D>& Previous : PreviousPositions)
+			{
+				Result.Positions.FindChecked(Previous.Key) = Previous.Value;
+			}
+			Result.Diagnostics.Add(
+				FString::Printf(TEXT("Kept authored reroute columns because pin alignment would cause %s."), *Trial.Regression)
+			);
+		}
 	}
 
 	for (const FAdapterNodeRecord& Node : ReadabilityContext.AuthoredNodes)
@@ -2056,13 +2371,13 @@ FK2FormatResult FK2GraphFormatter::FormatInternal(
 
 		FPlannedAdapterNode& PlannedNode = PlannedNodes.AddDefaulted_GetRef();
 		PlannedNode.Node = Node;
-		// User-authored reroutes are routing controls, not semantic providers. Preserve mode must
-		// retain their deliberately chosen channels; treating a multi-link knot as a tiny pure node
-		// can pull a clean data bus through the execution spine and make the safety gate discard the
-		// entire otherwise-valid layout. Reflow remains explicitly free to redraw them.
-		PlannedNode.bPreserveAuthoredReroute = bPreserveHumanLayout && Node->IsA<UK2Node_Knot>();
-		PlannedNode.Position = PlannedNode.bPreserveAuthoredReroute ? AdapterNode.OriginalPosition
-																	: LayoutNode.Position + AnchorOffset;
+		// User-authored reroutes are routing controls, not semantic providers. Preserve their selected
+		// horizontal channel here; after semantic columns settle, a separate deterministic pass aligns
+		// only their X coordinate to the relevant input/output pin column. Reflow remains explicitly
+		// free to redraw both axes.
+		PlannedNode.bPreserveAuthoredRerouteChannel = bPreserveHumanLayout && Node->IsA<UK2Node_Knot>();
+		PlannedNode.Position = PlannedNode.bPreserveAuthoredRerouteChannel ? AdapterNode.OriginalPosition
+																		   : LayoutNode.Position + AnchorOffset;
 		PlannedNode.Position.X = static_cast<double>(FMath::RoundToInt(PlannedNode.Position.X));
 		PlannedNode.Position.Y = static_cast<double>(FMath::RoundToInt(PlannedNode.Position.Y));
 		PlannedNode.Size = AdapterNode.Size;
@@ -2204,6 +2519,15 @@ FK2FormatResult FK2GraphFormatter::FormatInternal(
 		FinalNodePositions.Add(PlannedNode.Node, PlannedNode.Position);
 		PlannedNodeSizes.Add(PlannedNode.Node, PlannedNode.Size);
 		ExecutionRanks.Add(PlannedNode.Node, PlannedNode.ExecutionRank);
+	}
+	if (bPreserveHumanLayout)
+	{
+		const TMap<UEdGraphNode*, FVector2D> RerouteAlignments =
+			BuildAuthoredRerouteColumnAlignments(NodeRecords, EdgeRecords, PinRecords, FinalNodePositions);
+		for (const TPair<UEdGraphNode*, FVector2D>& Alignment : RerouteAlignments)
+		{
+			FinalNodePositions.FindChecked(Alignment.Key) = Alignment.Value;
+		}
 	}
 
 	// Generated knots are presentation artifacts and do not participate in semantic ranking. Plan
