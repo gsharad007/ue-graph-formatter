@@ -482,4 +482,93 @@ const FGraphNodeGeometrySnapshot* FGraphGeometrySnapshot::FindNode(const UEdGrap
 
 const FGraphPinGeometrySnapshot* FGraphGeometrySnapshot::FindPin(const UEdGraphPin* Pin) const noexcept
 { return Pins.Find(Pin); }
+
+FGraphGeometrySnapshot FGraphGeometrySnapshot::RemapToGraph(const UEdGraph& SourceGraph, UEdGraph& TargetGraph) const
+{
+	FGraphGeometrySnapshot Remapped;
+	Remapped.Status = Status;
+	Remapped.Diagnostics = Diagnostics;
+	Remapped.RequestedNodeCount = RequestedNodeCount;
+	Remapped.CapturedNodeBoundsCount = CapturedNodeBoundsCount;
+	Remapped.RequestedVisiblePinCount = RequestedVisiblePinCount;
+	Remapped.CapturedPinCount = CapturedPinCount;
+
+	TMap<FGuid, UEdGraphNode*> TargetNodesByGuid;
+	TMap<FName, UEdGraphNode*> TargetNodesByName;
+	for (const TObjectPtr<UEdGraphNode>& TargetNodePointer : TargetGraph.Nodes)
+	{
+		UEdGraphNode* TargetNode = TargetNodePointer.Get();
+		if (TargetNode == nullptr) { continue; }
+		if (TargetNode->NodeGuid.IsValid()) { TargetNodesByGuid.Add(TargetNode->NodeGuid, TargetNode); }
+		TargetNodesByName.Add(TargetNode->GetFName(), TargetNode);
+	}
+
+	TMap<const UEdGraphNode*, UEdGraphNode*> NodeRemap;
+	for (const TPair<const UEdGraphNode*, FGraphNodeGeometrySnapshot>& Pair : Nodes)
+	{
+		const UEdGraphNode* SourceNode = Pair.Key;
+		if (SourceNode == nullptr || SourceNode->GetGraph() != &SourceGraph) { continue; }
+		UEdGraphNode* TargetNode = SourceNode->NodeGuid.IsValid() ? TargetNodesByGuid.FindRef(SourceNode->NodeGuid)
+																  : nullptr;
+		if (TargetNode == nullptr) { TargetNode = TargetNodesByName.FindRef(SourceNode->GetFName()); }
+		if (TargetNode == nullptr) { continue; }
+
+		FGraphNodeGeometrySnapshot NodeSnapshot = Pair.Value;
+		NodeSnapshot.NodeGuid = TargetNode->NodeGuid;
+		NodeSnapshot.PersistedPosition = FVector2D(TargetNode->NodePosX, TargetNode->NodePosY);
+		NodeSnapshot.Position = NodeSnapshot.PersistedPosition;
+		NodeSnapshot.PositionSource = EGraphNodePositionSource::PersistedNode;
+		if (Pair.Value.Bounds.IsSet())
+		{
+			const FSlateRect& SourceBounds = Pair.Value.Bounds.GetValue();
+			const FVector2D Size(SourceBounds.Right - SourceBounds.Left, SourceBounds.Bottom - SourceBounds.Top);
+			NodeSnapshot.Bounds = FSlateRect::FromPointAndExtent(NodeSnapshot.Position, Size);
+		}
+		Remapped.Nodes.Add(TargetNode, MoveTemp(NodeSnapshot));
+		NodeRemap.Add(SourceNode, TargetNode);
+	}
+
+	for (const TPair<const UEdGraphPin*, FGraphPinGeometrySnapshot>& Pair : Pins)
+	{
+		const UEdGraphPin* SourcePin = Pair.Key;
+		const UEdGraphNode* SourceNode = SourcePin != nullptr ? SourcePin->GetOwningNodeUnchecked() : nullptr;
+		UEdGraphNode* const* TargetNodePointer = SourceNode != nullptr ? NodeRemap.Find(SourceNode) : nullptr;
+		UEdGraphNode* TargetNode = TargetNodePointer != nullptr ? *TargetNodePointer : nullptr;
+		if (SourcePin == nullptr || TargetNode == nullptr) { continue; }
+
+		UEdGraphPin* TargetPin = nullptr;
+		for (UEdGraphPin* Candidate : TargetNode->Pins)
+		{
+			if (Candidate != nullptr && Candidate->PinId == SourcePin->PinId)
+			{
+				TargetPin = Candidate;
+				break;
+			}
+		}
+		if (TargetPin == nullptr && SourcePin->PersistentGuid.IsValid())
+		{
+			for (UEdGraphPin* Candidate : TargetNode->Pins)
+			{
+				if (Candidate != nullptr && Candidate->PersistentGuid == SourcePin->PersistentGuid)
+				{
+					TargetPin = Candidate;
+					break;
+				}
+			}
+		}
+		if (TargetPin == nullptr)
+		{
+			const int32 SourcePinIndex = SourceNode->Pins.IndexOfByKey(SourcePin);
+			if (TargetNode->Pins.IsValidIndex(SourcePinIndex)) { TargetPin = TargetNode->Pins[SourcePinIndex]; }
+		}
+		if (TargetPin == nullptr) { continue; }
+
+		FGraphPinGeometrySnapshot PinSnapshot = Pair.Value;
+		PinSnapshot.PinId = TargetPin->PinId;
+		PinSnapshot.NodeGuid = TargetNode->NodeGuid;
+		PinSnapshot.Anchor = FVector2D(TargetNode->NodePosX, TargetNode->NodePosY) + PinSnapshot.NodeOffset;
+		Remapped.Pins.Add(TargetPin, MoveTemp(PinSnapshot));
+	}
+	return Remapped;
+}
 } // namespace GraphFormatter::K2

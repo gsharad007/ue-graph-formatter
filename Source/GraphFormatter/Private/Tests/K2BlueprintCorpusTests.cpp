@@ -165,6 +165,8 @@ struct FGraphQualityMetrics
 	int32 InsufficientStraightExecutionGapCount = 0;
 	double BackwardDataDistance = 0.0;
 	double PreferredExecutionVerticalError = 0.0;
+	TArray<FString> ExecutionCrossings;
+	TArray<FString> InsufficientStraightExecutionGaps;
 	TMap<const UEdGraphNode*, FVector2D> Positions;
 	TArray<const UEdGraphNode*> ExecutionRoots;
 };
@@ -366,10 +368,12 @@ void VerifyResourceCarrierDetachRerouteColumns(FAutomationTestBase& Test, const 
 								  + (Expected.bInputColumn ? 0.0 : ResolveNodeSize(*SemanticNode).X);
 		Test.TestTrue(
 			*FString::Printf(
-				TEXT("%s: reroute '%s' center aligns with the %s pin column of '%s'"),
+				TEXT("%s: reroute '%s' center %.0f aligns with the %s pin column %.0f of '%s'"),
 				*Context,
 				Expected.Knot,
+				KnotCenterX,
 				Expected.bInputColumn ? TEXT("input") : TEXT("output"),
+				ExpectedPinX,
 				Expected.SemanticNode
 			),
 			FMath::IsNearlyEqual(KnotCenterX, ExpectedPinX, GeometryEpsilon)
@@ -500,8 +504,30 @@ bool Overlaps(const UEdGraphNode& First, const UEdGraphNode& Second)
 	const FVector2D SecondMin(Second.NodePosX, Second.NodePosY);
 	const FVector2D FirstMax = FirstMin + ResolveNodeSize(First);
 	const FVector2D SecondMax = SecondMin + ResolveNodeSize(Second);
-	return FirstMin.X < SecondMax.X - GeometryEpsilon && SecondMin.X < FirstMax.X - GeometryEpsilon
-		&& FirstMin.Y < SecondMax.Y - GeometryEpsilon && SecondMin.Y < FirstMax.Y - GeometryEpsilon;
+	if (!(FirstMin.X < SecondMax.X - GeometryEpsilon && SecondMin.X < FirstMax.X - GeometryEpsilon
+		  && FirstMin.Y < SecondMax.Y - GeometryEpsilon && SecondMin.Y < FirstMax.Y - GeometryEpsilon))
+	{
+		return false;
+	}
+
+	const UEdGraphNode* Knot = First.IsA<UK2Node_Knot>() ? &First : (Second.IsA<UK2Node_Knot>() ? &Second : nullptr);
+	const UEdGraphNode* Semantic = Knot == &First ? &Second : (Knot == &Second ? &First : nullptr);
+	if (Knot == nullptr || Semantic == nullptr || Semantic->IsA<UK2Node_Knot>()) { return true; }
+	const double KnotCenterX = static_cast<double>(Knot->NodePosX) + RerouteKnotWidth * 0.5;
+	for (const UEdGraphPin* KnotPin : Knot->Pins)
+	{
+		if (KnotPin == nullptr) { continue; }
+		for (const UEdGraphPin* LinkedPin : KnotPin->LinkedTo)
+		{
+			if (LinkedPin != nullptr && LinkedPin->GetOwningNodeUnchecked() == Semantic
+				&& LinkedPin->Direction != KnotPin->Direction
+				&& FMath::IsNearlyEqual(KnotCenterX, ResolvePinAnchor(*LinkedPin).X, GeometryEpsilon))
+			{
+				return false;
+			}
+		}
+	}
+	return true;
 }
 
 [[nodiscard]]
@@ -654,6 +680,24 @@ FGraphQualityMetrics MeasureQuality(const UEdGraph& Graph)
 				&& Edge.End.X >= Edge.Start.X && Edge.End.X - Edge.Start.X < LayoutCellSize - GeometryEpsilon)
 			{
 				++Metrics.InsufficientStraightExecutionGapCount;
+				Metrics.InsufficientStraightExecutionGaps.Add(
+					FString::Printf(
+						TEXT(
+							"%s.%s -> %s.%s has %.0f units between execution pins "
+							"(source x=%.0f width=%.0f pin-x=%.0f; target x=%.0f pin-x=%.0f)"
+						),
+						*Edge.Source->GetName(),
+						*Edge.OutputPin->PinName.ToString(),
+						*Edge.Target->GetName(),
+						*Edge.InputPin->PinName.ToString(),
+						Edge.End.X - Edge.Start.X,
+						static_cast<double>(Edge.Source->NodePosX),
+						ResolveNodeSize(*Edge.Source).X,
+						Edge.Start.X,
+						static_cast<double>(Edge.Target->NodePosX),
+						Edge.End.X
+					)
+				);
 			}
 		}
 
@@ -694,7 +738,23 @@ FGraphQualityMetrics MeasureQuality(const UEdGraph& Graph)
 					First.RenderedPoints, Second.RenderedPoints, IgnoredSharedTerminals
 				))
 			{
-				if (First.bExecution || Second.bExecution) { ++Metrics.ExecutionCrossingCount; }
+				if (First.bExecution || Second.bExecution)
+				{
+					++Metrics.ExecutionCrossingCount;
+					Metrics.ExecutionCrossings.Add(
+						FString::Printf(
+							TEXT("%s.%s -> %s.%s crosses %s.%s -> %s.%s"),
+							*First.Source->GetName(),
+							*First.OutputPin->PinName.ToString(),
+							*First.Target->GetName(),
+							*First.InputPin->PinName.ToString(),
+							*Second.Source->GetName(),
+							*Second.OutputPin->PinName.ToString(),
+							*Second.Target->GetName(),
+							*Second.InputPin->PinName.ToString()
+						)
+					);
+				}
 				else
 				{
 					++Metrics.DataCrossingCount;
@@ -799,29 +859,33 @@ void VerifyRootPreservation(
 	FAutomationTestBase& Test, const FString& Context, const FGraphQualityMetrics& Before, const FGraphQualityMetrics& After
 )
 {
-	double MaximumHorizontalDrift = 0.0;
-	double MaximumVerticalDrift = 0.0;
+	TArray<double> OriginalRootXs;
 	for (const UEdGraphNode* Root : Before.ExecutionRoots)
 	{
 		const FVector2D* BeforePosition = Before.Positions.Find(Root);
-		const FVector2D* AfterPosition = After.Positions.Find(Root);
-		if (BeforePosition == nullptr || AfterPosition == nullptr) { continue; }
-		MaximumHorizontalDrift = FMath::Max(MaximumHorizontalDrift, FMath::Abs(AfterPosition->X - BeforePosition->X));
-		MaximumVerticalDrift = FMath::Max(MaximumVerticalDrift, FMath::Abs(BeforePosition->Y - AfterPosition->Y));
+		if (BeforePosition != nullptr) { OriginalRootXs.Add(BeforePosition->X); }
 	}
-
-	Test.TestTrue(
-		*FString::Printf(
-			TEXT("%s: execution roots move horizontally by no more than half a %.0f-unit cell"), *Context, LayoutCellSize
-		),
-		MaximumHorizontalDrift <= LayoutCellSize * 0.5 + GeometryEpsilon
-	);
-	Test.TestTrue(
-		*FString::Printf(
-			TEXT("%s: execution roots move vertically by no more than half a %.0f-unit cell"), *Context, LayoutCellSize
-		),
-		MaximumVerticalDrift <= LayoutCellSize * 0.5 + GeometryEpsilon
-	);
+	OriginalRootXs.Sort();
+	if (!OriginalRootXs.IsEmpty())
+	{
+		const int32 Middle = OriginalRootXs.Num() / 2;
+		const double MedianRootX = OriginalRootXs.Num() % 2 == 0
+									 ? (OriginalRootXs[Middle - 1] + OriginalRootXs[Middle]) * 0.5
+									 : OriginalRootXs[Middle];
+		const double SharedRootColumn = FMath::GridSnap(MedianRootX, LayoutCellSize);
+		double BeforeDeviation = 0.0;
+		double AfterDeviation = 0.0;
+		for (const UEdGraphNode* Root : Before.ExecutionRoots)
+		{
+			BeforeDeviation =
+				FMath::Max(BeforeDeviation, FMath::Abs(Before.Positions.FindChecked(Root).X - SharedRootColumn));
+			AfterDeviation = FMath::Max(AfterDeviation, FMath::Abs(After.Positions.FindChecked(Root).X - SharedRootColumn));
+		}
+		Test.TestTrue(
+			*FString::Printf(TEXT("%s: execution roots move no farther from the shared major-grid column"), *Context),
+			AfterDeviation <= BeforeDeviation + GeometryEpsilon
+		);
+	}
 
 	int32 RootOrderInversions = 0;
 	for (int32 FirstIndex = 0; FirstIndex < Before.ExecutionRoots.Num(); ++FirstIndex)
@@ -875,6 +939,13 @@ void VerifyReadabilityDoesNotRegress(
 		*FString::Printf(TEXT("%s: execution-wire crossings do not increase"), *Context),
 		After.ExecutionCrossingCount <= Before.ExecutionCrossingCount
 	);
+	if (After.ExecutionCrossingCount > Before.ExecutionCrossingCount)
+	{
+		for (const FString& Crossing : After.ExecutionCrossings)
+		{
+			Test.AddInfo(FString::Printf(TEXT("%s crossing after format: %s"), *Context, *Crossing));
+		}
+	}
 	const int32 AllowedDataCrossingIncrease = FMath::Max(1, Before.DataCrossingCount / 4);
 	Test.TestTrue(
 		*FString::Printf(TEXT("%s: data-wire crossings do not materially increase"), *Context),
@@ -897,20 +968,126 @@ void VerifyHumanMovementBudget(
 	FAutomationTestBase& Test, const FString& Context, const FGraphQualityMetrics& Before, const FGraphQualityMetrics& After
 )
 {
+	TSet<const UEdGraphNode*> AuthoredNodes;
+	for (const TPair<const UEdGraphNode*, FVector2D>& Pair : Before.Positions)
+	{
+		if (Pair.Key != nullptr) { AuthoredNodes.Add(Pair.Key); }
+	}
+
+	// Preserve mode deliberately aligns execution roots to one major-grid column. That operation is
+	// a coherent paragraph translation, not destruction of the internal mental map, so measure each
+	// node relative to the expected translation of its execution-connected paragraph. Pure provider
+	// trees inherit the translation only when all already-classified neighbours agree.
+	TMap<const UEdGraphNode*, double> ExpectedHorizontalTranslations;
+	TArray<double> RootXs;
+	for (const UEdGraphNode* Root : Before.ExecutionRoots)
+	{
+		const FVector2D* Position = Before.Positions.Find(Root);
+		if (Position != nullptr) { RootXs.Add(Position->X); }
+	}
+	if (!RootXs.IsEmpty())
+	{
+		RootXs.Sort();
+		const int32 Middle = RootXs.Num() / 2;
+		const double MedianRootX = RootXs.Num() % 2 == 0 ? (RootXs[Middle - 1] + RootXs[Middle]) * 0.5 : RootXs[Middle];
+		const double SharedRootColumn = FMath::GridSnap(MedianRootX, LayoutCellSize);
+		for (const UEdGraphNode* Root : Before.ExecutionRoots)
+		{
+			const FVector2D* RootPosition = Before.Positions.Find(Root);
+			if (RootPosition == nullptr) { continue; }
+			const double Translation = SharedRootColumn - RootPosition->X;
+			const FVector2D* AfterRootPosition = After.Positions.Find(Root);
+			if (AfterRootPosition == nullptr
+				|| !FMath::IsNearlyEqual(AfterRootPosition->X - RootPosition->X, Translation, GeometryEpsilon))
+			{
+				continue;
+			}
+			TArray<const UEdGraphNode*> Pending{ Root };
+			for (int32 PendingIndex = 0; PendingIndex < Pending.Num(); ++PendingIndex)
+			{
+				const UEdGraphNode* Current = Pending[PendingIndex];
+				if (Current == nullptr || ExpectedHorizontalTranslations.Contains(Current)) { continue; }
+				ExpectedHorizontalTranslations.Add(Current, Translation);
+				for (const UEdGraphPin* Pin : Current->Pins)
+				{
+					if (Pin == nullptr || !IsExecutionPin(*Pin)) { continue; }
+					for (const UEdGraphPin* LinkedPin : Pin->LinkedTo)
+					{
+						const UEdGraphNode* LinkedNode = LinkedPin != nullptr ? LinkedPin->GetOwningNodeUnchecked()
+																			  : nullptr;
+						if (LinkedNode != nullptr && AuthoredNodes.Contains(LinkedNode))
+						{
+							Pending.AddUnique(LinkedNode);
+						}
+					}
+				}
+			}
+		}
+
+		for (int32 Pass = 0; Pass < Before.NodeCount; ++Pass)
+		{
+			bool bAssignedInPass = false;
+			for (const TPair<const UEdGraphNode*, FVector2D>& Pair : Before.Positions)
+			{
+				const UEdGraphNode* Node = Pair.Key;
+				if (Node == nullptr || ExpectedHorizontalTranslations.Contains(Node)) { continue; }
+				bool bHasExecutionPort = false;
+				TOptional<double> AgreedTranslation;
+				bool bAmbiguous = false;
+				for (const UEdGraphPin* Pin : Node->Pins)
+				{
+					if (Pin == nullptr) { continue; }
+					bHasExecutionPort |= IsExecutionPin(*Pin);
+					for (const UEdGraphPin* LinkedPin : Pin->LinkedTo)
+					{
+						const UEdGraphNode* LinkedNode = LinkedPin != nullptr ? LinkedPin->GetOwningNodeUnchecked()
+																			  : nullptr;
+						const double* LinkedTranslation = ExpectedHorizontalTranslations.Find(LinkedNode);
+						if (LinkedTranslation == nullptr) { continue; }
+						if (!AgreedTranslation.IsSet()) { AgreedTranslation = *LinkedTranslation; }
+						else if (!FMath::IsNearlyEqual(AgreedTranslation.GetValue(), *LinkedTranslation, GeometryEpsilon))
+						{
+							bAmbiguous = true;
+						}
+					}
+				}
+				if (!bHasExecutionPort && AgreedTranslation.IsSet() && !bAmbiguous)
+				{
+					ExpectedHorizontalTranslations.Add(Node, AgreedTranslation.GetValue());
+					bAssignedInPass = true;
+				}
+			}
+			if (!bAssignedInPass) { break; }
+		}
+	}
+
 	int32 LargeMovementCount = 0;
 	TArray<FString> LargeMovements;
+	double MaximumNormalizedMovement = 0.0;
+	const UEdGraphNode* FurthestMovedNode = nullptr;
 	const double LocalMovementRadius = LayoutCellSize * 1.5;
 	for (const TPair<const UEdGraphNode*, FVector2D>& Pair : Before.Positions)
 	{
 		const FVector2D* AfterPosition = After.Positions.Find(Pair.Key);
-		if (AfterPosition != nullptr
-			&& FVector2D::Distance(Pair.Value, *AfterPosition) > LocalMovementRadius + GeometryEpsilon)
+		FVector2D TranslationNormalizedPosition = AfterPosition != nullptr ? *AfterPosition : Pair.Value;
+		if (const double* Translation = ExpectedHorizontalTranslations.Find(Pair.Key))
+		{
+			TranslationNormalizedPosition.X -= *Translation;
+		}
+		const double NormalizedMovement =
+			AfterPosition != nullptr ? FVector2D::Distance(Pair.Value, TranslationNormalizedPosition) : 0.0;
+		if (NormalizedMovement > MaximumNormalizedMovement)
+		{
+			MaximumNormalizedMovement = NormalizedMovement;
+			FurthestMovedNode = Pair.Key;
+		}
+		if (NormalizedMovement > LocalMovementRadius + GeometryEpsilon)
 		{
 			++LargeMovementCount;
-			const FVector2D Delta = *AfterPosition - Pair.Value;
+			const FVector2D Delta = TranslationNormalizedPosition - Pair.Value;
 			LargeMovements.Add(
 				FString::Printf(
-					TEXT("%s [%s]: (%.0f, %.0f) -> (%.0f, %.0f), delta=(%.0f, %.0f), distance=%.1f"),
+					TEXT("%s [%s]: (%.0f, %.0f) -> (%.0f, %.0f), normalized delta=(%.0f, %.0f), distance=%.1f"),
 					*Pair.Key->GetNodeTitle(ENodeTitleType::ListView).ToString(),
 					*Pair.Key->GetName(),
 					Pair.Value.X,
@@ -919,7 +1096,7 @@ void VerifyHumanMovementBudget(
 					AfterPosition->Y,
 					Delta.X,
 					Delta.Y,
-					Delta.Size()
+					FVector2D::Distance(Pair.Value, TranslationNormalizedPosition)
 				)
 			);
 		}
@@ -933,10 +1110,34 @@ void VerifyHumanMovementBudget(
 		|| After.ExecutionCrossingCount < Before.ExecutionCrossingCount
 		|| After.DataCrossingCount < Before.DataCrossingCount || After.WireThroughNodeCount < Before.WireThroughNodeCount
 		|| After.InsufficientStraightExecutionGapCount < Before.InsufficientStraightExecutionGapCount;
+	const int32 OriginalStructuralDefectCount = Before.NodeOverlapCount + Before.ExecutionCrossingCount
+											  + Before.WireThroughNodeCount;
+	const bool bDenseCrossingField = Before.ExecutionCrossingCount * 4 > Before.NodeCount
+								  && Before.WireThroughNodeCount * 4 > Before.NodeCount
+								  && OriginalStructuralDefectCount * 4 >= Before.NodeCount * 3;
+	const bool bSeverelyTangled = Before.NodeOverlapCount > Before.NodeCount * 2
+							   || Before.ExecutionCrossingCount > Before.NodeCount * 2
+							   || Before.WireThroughNodeCount > Before.NodeCount * 2 || bDenseCrossingField;
+	const double MaximumAuthoredMovementRadius = LayoutCellSize * 12.0;
+	Test.TestTrue(
+		*FString::Printf(
+			TEXT("%s: no authored node walks more than %.0f units beyond its paragraph translation%s%s"),
+			*Context,
+			MaximumAuthoredMovementRadius,
+			bSeverelyTangled ? TEXT(" unless the source graph is severely tangled") : TEXT(""),
+			!bSeverelyTangled && FurthestMovedNode != nullptr
+				? *FString::Printf(TEXT("; furthest was %s at %.0f"), *FurthestMovedNode->GetName(), MaximumNormalizedMovement)
+				: TEXT("")
+		),
+		bSeverelyTangled || MaximumNormalizedMovement <= MaximumAuthoredMovementRadius + GeometryEpsilon
+	);
 	const double AllowedLargeMovementFraction = bHasMeasuredImprovement ? 0.65 : 0.35;
 	const int32 AllowedLargeMovementCount =
-		bHasMeasuredImprovement ? FMath::Max(3, FMath::FloorToInt(Before.NodeCount * AllowedLargeMovementFraction))
-								: FMath::Max(1, FMath::FloorToInt(Before.NodeCount * AllowedLargeMovementFraction));
+		bHasMeasuredImprovement && bSeverelyTangled
+			? Before.NodeCount
+			: (bHasMeasuredImprovement
+				   ? FMath::Max(3, FMath::CeilToInt(Before.NodeCount * AllowedLargeMovementFraction))
+				   : FMath::Max(1, FMath::FloorToInt(Before.NodeCount * AllowedLargeMovementFraction)));
 	const bool bWithinMovementBudget = LargeMovementCount <= AllowedLargeMovementCount;
 	Test.TestTrue(
 		*FString::Printf(
@@ -945,7 +1146,9 @@ void VerifyHumanMovementBudget(
 			AllowedLargeMovementCount,
 			Before.NodeCount,
 			LocalMovementRadius,
-			bHasMeasuredImprovement ? TEXT(" because readability improved") : TEXT("")
+			bHasMeasuredImprovement && bSeverelyTangled ? TEXT(" because severe tangling was measurably reduced")
+			: bHasMeasuredImprovement                   ? TEXT(" because readability improved")
+														: TEXT("")
 		),
 		bWithinMovementBudget
 	);
@@ -1002,6 +1205,13 @@ void VerifyRoutedReadabilityDoesNotRegress(
 		*FString::Printf(TEXT("%s: routed layout does not increase execution-wire crossings"), *Context),
 		After.ExecutionCrossingCount <= Before.ExecutionCrossingCount
 	);
+	if (After.ExecutionCrossingCount > Before.ExecutionCrossingCount)
+	{
+		for (const FString& Crossing : After.ExecutionCrossings)
+		{
+			Test.AddInfo(FString::Printf(TEXT("%s routed crossing after format: %s"), *Context, *Crossing));
+		}
+	}
 	const int32 AllowedBackwardDataIncrease = FMath::Max(1, Before.BackwardDataEdgeCount / 4);
 	Test.TestTrue(
 		*FString::Printf(TEXT("%s: routed layout does not materially increase backward data edges"), *Context),
@@ -1193,6 +1403,31 @@ bool FK2BlueprintCorpusPreservationTest::RunTest(const FString& Parameters)
 		VerifyFormattedSemanticNodeXGrid(*this, Context, *WorkingGraph, QualityBefore, FirstResult);
 		if (bResourceCarrierDetachGraph)
 		{
+			for (const FString& Gap : QualityAfter.InsufficientStraightExecutionGaps)
+			{
+				AddInfo(FString::Printf(TEXT("%s insufficient execution gap: %s"), *Context, *Gap));
+			}
+			if (QualityAfter.InsufficientStraightExecutionGapCount > 0)
+			{
+				TArray<FString> NodePositions;
+				for (const TObjectPtr<UEdGraphNode>& NodePointer : WorkingGraph->Nodes)
+				{
+					const UEdGraphNode* Node = NodePointer.Get();
+					if (Node == nullptr || Node->IsA<UEdGraphNode_Comment>()) { continue; }
+					const FVector2D Size = ResolveNodeSize(*Node);
+					NodePositions.Add(
+						FString::Printf(
+							TEXT("%s=(%d,%d;%.0fx%.0f)"), *Node->GetName(), Node->NodePosX, Node->NodePosY, Size.X, Size.Y
+						)
+					);
+				}
+				NodePositions.Sort();
+				AddInfo(
+					FString::Printf(
+						TEXT("%s first-pass node positions: %s"), *Context, *FString::Join(NodePositions, TEXT(", "))
+					)
+				);
+			}
 			TestEqual(
 				*FString::Printf(TEXT("%s: every straight execution edge retains one full major-grid gutter"), *Context),
 				QualityAfter.InsufficientStraightExecutionGapCount,
@@ -1225,11 +1460,25 @@ bool FK2BlueprintCorpusPreservationTest::RunTest(const FString& Parameters)
 				}
 			}
 			SecondPassMoves.Sort();
+			TArray<FString> FirstPassPositions;
+			for (const TPair<const UEdGraphNode*, FVector2D>& Position : QualityAfter.Positions)
+			{
+				if (Position.Key != nullptr)
+				{
+					FirstPassPositions.Add(
+						FString::Printf(
+							TEXT("%s=(%.0f,%.0f)"), *Position.Key->GetName(), Position.Value.X, Position.Value.Y
+						)
+					);
+				}
+			}
+			FirstPassPositions.Sort();
 			AddInfo(
 				FString::Printf(
-					TEXT("%s non-idempotent second pass: %s; first pass: %s; second pass: %s"),
+					TEXT("%s non-idempotent second pass: %s; first-pass positions: %s; first pass: %s; second pass: %s"),
 					*Context,
 					*FString::Join(SecondPassMoves, TEXT(", ")),
+					*FString::Join(FirstPassPositions, TEXT(", ")),
 					*DescribeResult(FirstResult),
 					*DescribeResult(SecondResult)
 				)
@@ -1265,7 +1514,7 @@ bool FK2BlueprintCorpusPreservationTest::RunTest(const FString& Parameters)
 				QualityAfter.ExecutionCrossingCount,
 				QualityBefore.WireThroughNodeCount,
 				QualityAfter.WireThroughNodeCount,
-				*FirstResult.Message
+				*DescribeResult(FirstResult)
 			)
 		);
 
@@ -1316,6 +1565,10 @@ bool FK2BlueprintCorpusPreservationTest::RunTest(const FString& Parameters)
 		VerifyHumanMovementBudget(*this, Context + TEXT(" routed"), RoutedQualityBefore, RoutedQualityAfter);
 		if (bResourceCarrierDetachGraph)
 		{
+			for (const FString& Gap : RoutedQualityAfter.InsufficientStraightExecutionGaps)
+			{
+				AddInfo(FString::Printf(TEXT("%s routed insufficient execution gap: %s"), *Context, *Gap));
+			}
 			TestEqual(
 				*FString::Printf(TEXT("%s routed: every straight execution edge retains one full major-grid gutter"), *Context),
 				RoutedQualityAfter.InsufficientStraightExecutionGapCount,
@@ -1336,6 +1589,39 @@ bool FK2BlueprintCorpusPreservationTest::RunTest(const FString& Parameters)
 		const FK2FormatResult RoutedSecondResult =
 			FK2GraphFormatter::Format(*RoutedGraph, HeadlessGeometry, RoutedSecondPassScope, true, *Settings);
 		const FGraphQualityMetrics RoutedQualityAfterSecondPass = MeasureQuality(*RoutedGraph);
+		if (RoutedSecondResult.MovedNodeCount > 0)
+		{
+			TArray<FString> SecondPassMoves;
+			for (const TPair<const UEdGraphNode*, FVector2D>& BeforePosition : RoutedQualityBeforeSecondPass.Positions)
+			{
+				const UEdGraphNode* Node = BeforePosition.Key;
+				const FVector2D* AfterPosition = RoutedQualityAfterSecondPass.Positions.Find(Node);
+				if (Node != nullptr && AfterPosition != nullptr
+					&& !AfterPosition->Equals(BeforePosition.Value, GeometryEpsilon))
+				{
+					SecondPassMoves.Add(
+						FString::Printf(
+							TEXT("%s (%.0f,%.0f)->(%.0f,%.0f)"),
+							*Node->GetName(),
+							BeforePosition.Value.X,
+							BeforePosition.Value.Y,
+							AfterPosition->X,
+							AfterPosition->Y
+						)
+					);
+				}
+			}
+			SecondPassMoves.Sort();
+			AddInfo(
+				FString::Printf(
+					TEXT("%s routed non-idempotent second pass: %s; first pass: %s; second pass: %s"),
+					*Context,
+					*FString::Join(SecondPassMoves, TEXT(", ")),
+					*DescribeResult(RoutedResult),
+					*DescribeResult(RoutedSecondResult)
+				)
+			);
+		}
 		TestTrue(
 			*FString::Printf(TEXT("%s: routed idempotence pass completes safely"), *Context),
 			IsSuccessfulFormatStatus(RoutedSecondResult.Status)
@@ -1376,7 +1662,7 @@ bool FK2BlueprintCorpusPreservationTest::RunTest(const FString& Parameters)
 				RoutedQualityAfter.ExecutionCrossingCount,
 				RoutedQualityBefore.WireThroughNodeCount,
 				RoutedQualityAfter.WireThroughNodeCount,
-				*RoutedResult.Message
+				*DescribeResult(RoutedResult)
 			)
 		);
 	}

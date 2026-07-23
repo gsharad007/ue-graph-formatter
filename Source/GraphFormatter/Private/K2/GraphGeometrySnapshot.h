@@ -10,6 +10,7 @@
 #include "Layout/SlateRect.h"
 
 class SGraphPanel;
+class UEdGraph;
 class UEdGraphNode;
 class UEdGraphPin;
 
@@ -123,6 +124,14 @@ struct FGraphGeometrySnapshot
 
 	[[nodiscard]]
 	static FGraphGeometrySnapshot Capture(const SGraphPanel& Panel, TConstArrayView<UEdGraphNode*> NodesToCapture);
+
+	/**
+	 * Rebinds measured node sizes and pin offsets to a structurally duplicated graph. Positions and
+	 * absolute pin anchors are rebuilt from the duplicate's persisted coordinates. This lets
+	 * transient formatter comparisons use the exact same visual measurements as the source graph.
+	 */
+	[[nodiscard]]
+	FGraphGeometrySnapshot RemapToGraph(const UEdGraph& SourceGraph, UEdGraph& TargetGraph) const;
 
 	[[nodiscard]]
 	bool IsReady() const noexcept

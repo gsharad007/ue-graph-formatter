@@ -132,6 +132,7 @@ struct FReadabilityMetrics
 	int32 DataWireCrossingCount = 0;
 	double MaximumExecutionRootHorizontalDrift = 0.0;
 	double MaximumExecutionRootVerticalDrift = 0.0;
+	double ExecutionRootColumnDeviationIncrease = 0.0;
 	int32 ExecutionRootOrderInversionCount = 0;
 	bool bWorkBudgetExhausted = false;
 };
@@ -190,7 +191,7 @@ int32 FindNodePinIndex(const UEdGraphNode& Node, const UEdGraphPin& Pin)
 }
 
 [[nodiscard]]
-FString MakeStableNodeKey(const UEdGraph& Graph, const UEdGraphNode& Node)
+FString MakeLegacyStableNodeKey(const UEdGraph& Graph, const UEdGraphNode& Node)
 {
 	if (Node.NodeGuid.IsValid()) { return GuidKey(TEXT("N:"), Node.NodeGuid); }
 
@@ -200,7 +201,16 @@ FString MakeStableNodeKey(const UEdGraph& Graph, const UEdGraphNode& Node)
 }
 
 [[nodiscard]]
-FString MakeStablePinKey(const UEdGraphPin& Pin, const int32 PinOrdinal)
+FString MakeStableNodeKey(const UEdGraph& Graph, const UEdGraphNode& Node)
+{
+	// DuplicateObject legitimately regenerates Blueprint node GUIDs. The node UObject name remains
+	// unique within its graph, so place it before the persistent identity to keep layout/core
+	// tie-breaks deterministic across benchmark copies while retaining the GUID for route ownership.
+	return FString::Printf(TEXT("N:stable:%s|%s"), *Node.GetName(), *MakeLegacyStableNodeKey(Graph, Node));
+}
+
+[[nodiscard]]
+FString MakeLegacyStablePinKey(const UEdGraphPin& Pin, const int32 PinOrdinal)
 {
 #if WITH_EDITORONLY_DATA
 	if (Pin.PersistentGuid.IsValid()) { return GuidKey(TEXT("P:persistent:"), Pin.PersistentGuid); }
@@ -209,6 +219,21 @@ FString MakeStablePinKey(const UEdGraphPin& Pin, const int32 PinOrdinal)
 
 	return FString::Printf(
 		TEXT("P:fallback:%d:%08d:%s"), static_cast<int32>(Pin.Direction.GetValue()), PinOrdinal, *Pin.PinName.ToString()
+	);
+}
+
+[[nodiscard]]
+FString MakeStablePinKey(const UEdGraphPin& Pin, const int32 PinOrdinal)
+{
+	// Pin GUIDs can also be reconstructed in transient Blueprint copies. Direction, ordinal, and
+	// display name provide a deterministic semantic order; the legacy identity remains as a suffix
+	// so generated-route keys still uniquely own a physical pin.
+	return FString::Printf(
+		TEXT("P:stable:%d:%08d:%s|%s"),
+		static_cast<int32>(Pin.Direction.GetValue()),
+		PinOrdinal,
+		*Pin.PinName.ToString(),
+		*MakeLegacyStablePinKey(Pin, PinOrdinal)
 	);
 }
 
@@ -404,8 +429,57 @@ bool PinsShareRenderedTerminal(const UEdGraphPin* First, const UEdGraphPin* Seco
 	return FirstNode != nullptr && FirstNode == Second->GetOwningNodeUnchecked() && FirstNode->IsA<UK2Node_Knot>();
 }
 
+[[nodiscard]]
+bool IsPinAlignedRerouteTerminalContact(
+	const FAdapterNodeRecord& First,
+	const FAdapterNodeRecord& Second,
+	const TMap<const UEdGraphPin*, FAdapterPinRecord>& PinRecords,
+	const TMap<UEdGraphNode*, FVector2D>& Positions
+)
+{
+	const FAdapterNodeRecord* KnotRecord = First.Node != nullptr && First.Node->IsA<UK2Node_Knot>() ? &First : nullptr;
+	const FAdapterNodeRecord* SemanticRecord = KnotRecord == &First ? &Second : nullptr;
+	if (KnotRecord == nullptr && Second.Node != nullptr && Second.Node->IsA<UK2Node_Knot>())
+	{
+		KnotRecord = &Second;
+		SemanticRecord = &First;
+	}
+	if (KnotRecord == nullptr || SemanticRecord == nullptr || SemanticRecord->Node == nullptr
+		|| SemanticRecord->Node->IsA<UK2Node_Knot>())
+	{
+		return false;
+	}
+
+	const FVector2D* KnotPosition = Positions.Find(KnotRecord->Node);
+	if (KnotPosition == nullptr) { return false; }
+	const double KnotCenterX = KnotPosition->X + RerouteKnotWidth * 0.5;
+	for (const UEdGraphPin* KnotPin : KnotRecord->Node->Pins)
+	{
+		if (KnotPin == nullptr) { continue; }
+		for (const UEdGraphPin* LinkedPin : KnotPin->LinkedTo)
+		{
+			if (LinkedPin == nullptr || LinkedPin->GetOwningNodeUnchecked() != SemanticRecord->Node
+				|| LinkedPin->Direction == KnotPin->Direction)
+			{
+				continue;
+			}
+			FVector2D SemanticAnchor;
+			if (TryResolvePinAnchor(*LinkedPin, PinRecords, Positions, SemanticAnchor)
+				&& FMath::IsNearlyEqual(KnotCenterX, SemanticAnchor.X, ReadabilityEpsilon))
+			{
+				// A reroute centered on a directly connected pin necessarily straddles the node
+				// boundary by half of its tiny visual box. This is the intended terminal tangent,
+				// not a knot buried under an unrelated node.
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 void MeasureNodeReadability(
 	TConstArrayView<FAdapterNodeRecord> Nodes,
+	const TMap<const UEdGraphPin*, FAdapterPinRecord>& PinRecords,
 	const TMap<UEdGraphNode*, FVector2D>& Positions,
 	FReadabilityWorkBudget& WorkBudget,
 	FReadabilityMetrics& OutMetrics
@@ -426,7 +500,8 @@ void MeasureNodeReadability(
 				return;
 			}
 			const FBox2D SecondBounds = MakeNodeBox(*SecondPosition, Nodes[SecondIndex].Size);
-			if (HasPositiveAreaIntersection(FirstBounds, SecondBounds))
+			if (HasPositiveAreaIntersection(FirstBounds, SecondBounds)
+				&& !IsPinAlignedRerouteTerminalContact(Nodes[FirstIndex], Nodes[SecondIndex], PinRecords, Positions))
 			{
 				++OutMetrics.OverlapPairCount;
 				OutMetrics.OverlapPairs.Add(Nodes[FirstIndex].Key + TEXT("|") + Nodes[SecondIndex].Key);
@@ -682,6 +757,7 @@ void MeasureExecutionRootMovement(
 	TConstArrayView<FAdapterNodeRecord> Nodes,
 	const TMap<UEdGraphNode*, FVector2D>& OriginalPositions,
 	const TMap<UEdGraphNode*, FVector2D>& CandidatePositions,
+	const double LayoutCellSize,
 	FReadabilityMetrics& OutMetrics
 )
 {
@@ -699,17 +775,42 @@ void MeasureExecutionRootMovement(
 		if (bHasExecutionOutput && !bHasLinkedExecutionInput) { ExecutionRoots.Add(Node.Node); }
 	}
 
+	TArray<double> OriginalRootXs;
+	OriginalRootXs.Reserve(ExecutionRoots.Num());
 	for (UEdGraphNode* Root : ExecutionRoots)
 	{
 		const FVector2D* OriginalPosition = OriginalPositions.Find(Root);
 		const FVector2D* CandidatePosition = CandidatePositions.Find(Root);
 		if (OriginalPosition == nullptr || CandidatePosition == nullptr) { continue; }
+		OriginalRootXs.Add(OriginalPosition->X);
 		OutMetrics.MaximumExecutionRootHorizontalDrift = FMath::Max(
 			OutMetrics.MaximumExecutionRootHorizontalDrift, FMath::Abs(OriginalPosition->X - CandidatePosition->X)
 		);
 		OutMetrics.MaximumExecutionRootVerticalDrift = FMath::Max(
 			OutMetrics.MaximumExecutionRootVerticalDrift, FMath::Abs(OriginalPosition->Y - CandidatePosition->Y)
 		);
+	}
+	if (!OriginalRootXs.IsEmpty())
+	{
+		OriginalRootXs.Sort();
+		const int32 Middle = OriginalRootXs.Num() / 2;
+		const double MedianRootX = OriginalRootXs.Num() % 2 == 0
+									 ? (OriginalRootXs[Middle - 1] + OriginalRootXs[Middle]) * 0.5
+									 : OriginalRootXs[Middle];
+		const double SharedRootColumn = FMath::GridSnap(MedianRootX, LayoutCellSize);
+		double OriginalMaximumDeviation = 0.0;
+		double CandidateMaximumDeviation = 0.0;
+		for (UEdGraphNode* Root : ExecutionRoots)
+		{
+			const FVector2D* OriginalPosition = OriginalPositions.Find(Root);
+			const FVector2D* CandidatePosition = CandidatePositions.Find(Root);
+			if (OriginalPosition == nullptr || CandidatePosition == nullptr) { continue; }
+			OriginalMaximumDeviation =
+				FMath::Max(OriginalMaximumDeviation, FMath::Abs(OriginalPosition->X - SharedRootColumn));
+			CandidateMaximumDeviation =
+				FMath::Max(CandidateMaximumDeviation, FMath::Abs(CandidatePosition->X - SharedRootColumn));
+		}
+		OutMetrics.ExecutionRootColumnDeviationIncrease = CandidateMaximumDeviation - OriginalMaximumDeviation;
 	}
 
 	const TArray<UEdGraphNode*> OrderedExecutionRoots = ExecutionRoots.Array();
@@ -742,7 +843,7 @@ FReadabilityMetrics MeasureReadability(
 {
 	FReadabilityMetrics Metrics;
 	FReadabilityWorkBudget RemainingWork(WorkBudget);
-	MeasureNodeReadability(Nodes, Positions, RemainingWork, Metrics);
+	MeasureNodeReadability(Nodes, PinRecords, Positions, RemainingWork, Metrics);
 	if (!Metrics.bWorkBudgetExhausted)
 	{
 		MeasureWireReadability(
@@ -812,11 +913,15 @@ FString FindHardReadabilityRegression(
 )
 {
 	// A row-wrapped execution chain can trade one straight incoming gap for a longer backward
-	// continuation. Allow one spacing column plus the maximum coarse-grid snap correction.
-	const double LocalSpacingCorrection = LayoutCellSize * 1.5;
+	// continuation. Its source can advance by one spacing cell while both endpoints snap by up to
+	// half a cell in opposite directions, so the bounded local correction is at most two cells.
+	const double LocalSpacingCorrection = LayoutCellSize * 2.0;
 	if (ContainsNewKey(Candidate.OverlapPairs, Original.OverlapPairs))
 	{
-		return TEXT("the candidate creates a new node overlap");
+		return FString::Printf(
+			TEXT("the candidate creates a new node overlap (%s)"),
+			*FindFirstNewKey(Candidate.OverlapPairs, Original.OverlapPairs)
+		);
 	}
 	if (ContainsNewKey(Candidate.BackwardExecutionEdges, Original.BackwardExecutionEdges))
 	{
@@ -839,20 +944,29 @@ FString FindHardReadabilityRegression(
 	{
 		return TEXT("the candidate creates a sub-cell gap on a straight execution connection");
 	}
-	if (ContainsNewKey(Candidate.ExecutionWireCrossings, Original.ExecutionWireCrossings)
+	if (Candidate.ExecutionWireCrossings.Num() > Original.ExecutionWireCrossings.Num()
 		|| Candidate.ExecutionWireCrossingCount > Original.ExecutionWireCrossingCount)
 	{
-		return TEXT("the candidate introduces a new execution-wire crossing pair");
+		return TEXT("the candidate increases execution-wire crossing pairs or multiplicity");
 	}
 	return FString();
 }
 
 [[nodiscard]]
-FString FindWireThroughNodeRegression(const FReadabilityMetrics& Original, const FReadabilityMetrics& Candidate)
+FString FindWireThroughNodeRegression(
+	const FReadabilityMetrics& Original, const FReadabilityMetrics& Candidate, const bool bAllowRerouteTradeoffs
+)
 {
 	if (ContainsNewKey(Candidate.WiresThroughNodes, Original.WiresThroughNodes))
 	{
-		return TEXT("the candidate makes a wire pass through a new node");
+		const int32 AllowedIncrease = bAllowRerouteTradeoffs ? 1 : 0;
+		if (Candidate.WiresThroughNodes.Num() > Original.WiresThroughNodes.Num() + AllowedIncrease)
+		{
+			return FString::Printf(
+				TEXT("the candidate makes a wire pass through a new node (%s)"),
+				*FindFirstNewKey(Candidate.WiresThroughNodes, Original.WiresThroughNodes)
+			);
+		}
 	}
 	return FString();
 }
@@ -866,7 +980,19 @@ FString FindBackwardDataRegression(const FReadabilityMetrics& Original, const FR
 			Candidate.BackwardDataDistance, Original.BackwardDataDistance, LayoutCellSize * 2.0, MaterialReadabilityRatio
 		))
 	{
-		return TEXT("the candidate introduces materially worse backward data wiring");
+		const int32 OriginalStructuralDefects = Original.OverlapPairCount + Original.ExecutionWireCrossingCount
+											  + Original.WiresThroughNodes.Num();
+		const int32 CandidateStructuralDefects = Candidate.OverlapPairCount + Candidate.ExecutionWireCrossingCount
+											   + Candidate.WiresThroughNodes.Num();
+		// Generated/LLM graphs can begin with nearly every node stacked at one coordinate. In that
+		// state a canonical left-to-right redraw may lengthen some data returns while eliminating
+		// hundreds of overlaps, execution crossings, and wires under nodes. Treat a 50% aggregate
+		// structural cleanup as the dominant readability win; ordinary authored graphs keep the
+		// conservative backward-data gate.
+		if (OriginalStructuralDefects < 8 || CandidateStructuralDefects * 2 > OriginalStructuralDefects)
+		{
+			return TEXT("the candidate introduces materially worse backward data wiring");
+		}
 	}
 	return FString();
 }
@@ -874,25 +1000,19 @@ FString FindBackwardDataRegression(const FReadabilityMetrics& Original, const FR
 [[nodiscard]]
 FString FindDataCrossingRegression(const FReadabilityMetrics& Original, const FReadabilityMetrics& Candidate)
 {
-	if (ContainsNewKey(Candidate.DataWireCrossings, Original.DataWireCrossings)
-		|| Candidate.DataWireCrossingCount > Original.DataWireCrossingCount)
+	if (Candidate.DataWireCrossingCount > Original.DataWireCrossingCount)
 	{
-		return TEXT("the candidate introduces a new data-wire crossing pair");
+		return TEXT("the candidate increases total data-wire crossing multiplicity");
 	}
 	return FString();
 }
 
 [[nodiscard]]
-FString FindRootPreservationRegression(const FReadabilityMetrics& Candidate, const double LayoutCellSize)
+FString FindRootPreservationRegression(const FReadabilityMetrics& Candidate)
 {
-	const double SnapTolerance = LayoutCellSize * 0.5 + ReadabilityEpsilon;
-	if (Candidate.MaximumExecutionRootHorizontalDrift > SnapTolerance)
+	if (Candidate.ExecutionRootColumnDeviationIncrease > ReadabilityEpsilon)
 	{
-		return TEXT("the candidate moves an execution graph start horizontally beyond coarse-grid snapping");
-	}
-	if (Candidate.MaximumExecutionRootVerticalDrift > SnapTolerance)
-	{
-		return TEXT("the candidate moves an execution graph start vertically beyond coarse-grid snapping");
+		return TEXT("the candidate moves execution graph starts farther from their shared major-grid column");
 	}
 	if (Candidate.ExecutionRootOrderInversionCount > 0)
 	{
@@ -928,7 +1048,117 @@ FString FindAuthoredMovementRegression(
 	const double LayoutCellSize
 )
 {
+	TSet<UEdGraphNode*> AuthoredNodeSet;
+	TMap<UEdGraphNode*, const FAdapterNodeRecord*> AuthoredRecords;
+	TArray<UEdGraphNode*> ExecutionRoots;
+	TArray<double> ExecutionRootXs;
+	for (const FAdapterNodeRecord& Node : Nodes)
+	{
+		if (Node.Node == nullptr) { continue; }
+		AuthoredNodeSet.Add(Node.Node);
+		AuthoredRecords.Add(Node.Node, &Node);
+		bool bHasExecutionOutput = false;
+		bool bHasLinkedExecutionInput = false;
+		for (const UEdGraphPin* Pin : Node.Node->Pins)
+		{
+			if (Pin == nullptr || !IsExecutionPin(*Pin)) { continue; }
+			bHasExecutionOutput |= Pin->Direction == EGPD_Output;
+			bHasLinkedExecutionInput |= Pin->Direction == EGPD_Input && !Pin->LinkedTo.IsEmpty();
+		}
+		if (bHasExecutionOutput && !bHasLinkedExecutionInput)
+		{
+			ExecutionRoots.Add(Node.Node);
+			ExecutionRootXs.Add(Node.OriginalPosition.X);
+		}
+	}
+
+	TMap<UEdGraphNode*, double> ExpectedHorizontalTranslations;
+	if (!ExecutionRootXs.IsEmpty())
+	{
+		ExecutionRootXs.Sort();
+		const int32 Middle = ExecutionRootXs.Num() / 2;
+		const double MedianRootX = ExecutionRootXs.Num() % 2 == 0
+									 ? (ExecutionRootXs[Middle - 1] + ExecutionRootXs[Middle]) * 0.5
+									 : ExecutionRootXs[Middle];
+		const double SharedRootColumn = FMath::GridSnap(MedianRootX, LayoutCellSize);
+		for (UEdGraphNode* Root : ExecutionRoots)
+		{
+			const FAdapterNodeRecord* const* RootRecord = AuthoredRecords.Find(Root);
+			if (RootRecord == nullptr) { continue; }
+			const double Translation = SharedRootColumn - (*RootRecord)->OriginalPosition.X;
+			const FVector2D* CandidateRootPosition = CandidatePositions.Find(Root);
+			if (CandidateRootPosition == nullptr
+				|| !FMath::IsNearlyEqual(
+					CandidateRootPosition->X - (*RootRecord)->OriginalPosition.X, Translation, ReadabilityEpsilon
+				))
+			{
+				// A paragraph receives the normalization only when its root actually made the
+				// canonical column translation. Otherwise a downstream-only shift could masquerade
+				// as harmless whole-paragraph movement and repeat on every invocation.
+				continue;
+			}
+			TArray<UEdGraphNode*> Pending{ Root };
+			for (int32 PendingIndex = 0; PendingIndex < Pending.Num(); ++PendingIndex)
+			{
+				UEdGraphNode* Current = Pending[PendingIndex];
+				if (Current == nullptr || ExpectedHorizontalTranslations.Contains(Current)) { continue; }
+				ExpectedHorizontalTranslations.Add(Current, Translation);
+				for (const UEdGraphPin* Pin : Current->Pins)
+				{
+					if (Pin == nullptr || !IsExecutionPin(*Pin)) { continue; }
+					for (const UEdGraphPin* LinkedPin : Pin->LinkedTo)
+					{
+						UEdGraphNode* LinkedNode = LinkedPin != nullptr ? LinkedPin->GetOwningNodeUnchecked() : nullptr;
+						if (LinkedNode != nullptr && AuthoredNodeSet.Contains(LinkedNode))
+						{
+							Pending.AddUnique(LinkedNode);
+						}
+					}
+				}
+			}
+		}
+
+		// Pure provider trees visually belong to their execution consumer. Extend the component
+		// translation only when every already-assigned neighbour agrees, so a shared provider that
+		// bridges two event islands is never dragged arbitrarily with one of them.
+		for (int32 Pass = 0; Pass < Nodes.Num(); ++Pass)
+		{
+			bool bAssignedInPass = false;
+			for (const FAdapterNodeRecord& Node : Nodes)
+			{
+				if (Node.Node == nullptr || ExpectedHorizontalTranslations.Contains(Node.Node)) { continue; }
+				bool bHasExecutionPort = false;
+				TOptional<double> AgreedTranslation;
+				bool bAmbiguous = false;
+				for (const UEdGraphPin* Pin : Node.Node->Pins)
+				{
+					if (Pin == nullptr) { continue; }
+					bHasExecutionPort |= IsExecutionPin(*Pin);
+					for (const UEdGraphPin* LinkedPin : Pin->LinkedTo)
+					{
+						UEdGraphNode* LinkedNode = LinkedPin != nullptr ? LinkedPin->GetOwningNodeUnchecked() : nullptr;
+						const double* LinkedTranslation = ExpectedHorizontalTranslations.Find(LinkedNode);
+						if (LinkedTranslation == nullptr) { continue; }
+						if (!AgreedTranslation.IsSet()) { AgreedTranslation = *LinkedTranslation; }
+						else if (!FMath::IsNearlyEqual(AgreedTranslation.GetValue(), *LinkedTranslation, ReadabilityEpsilon))
+						{
+							bAmbiguous = true;
+						}
+					}
+				}
+				if (!bHasExecutionPort && AgreedTranslation.IsSet() && !bAmbiguous)
+				{
+					ExpectedHorizontalTranslations.Add(Node.Node, AgreedTranslation.GetValue());
+					bAssignedInPass = true;
+				}
+			}
+			if (!bAssignedInPass) { break; }
+		}
+	}
+
 	int32 LargeMovementCount = 0;
+	double MaximumNormalizedMovement = 0.0;
+	const UEdGraphNode* FurthestMovedNode = nullptr;
 	// A locally authored node can need one full execution-spacing column plus up to half a
 	// coarse-grid cell of snap correction. Treat that combined adjustment as local; otherwise a
 	// valid 620 -> 768 correction is postponed until a second formatter invocation.
@@ -936,22 +1166,58 @@ FString FindAuthoredMovementRegression(
 	for (const FAdapterNodeRecord& Node : Nodes)
 	{
 		const FVector2D* CandidatePosition = CandidatePositions.Find(Node.Node);
-		if (CandidatePosition != nullptr
-			&& FVector2D::Distance(Node.OriginalPosition, *CandidatePosition) > LocalMovementRadius + ReadabilityEpsilon)
+		FVector2D TranslationNormalizedPosition = CandidatePosition != nullptr ? *CandidatePosition : Node.OriginalPosition;
+		if (const double* Translation = ExpectedHorizontalTranslations.Find(Node.Node))
 		{
-			++LargeMovementCount;
+			TranslationNormalizedPosition.X -= *Translation;
 		}
+		const double NormalizedMovement = CandidatePosition != nullptr
+											? FVector2D::Distance(Node.OriginalPosition, TranslationNormalizedPosition)
+											: 0.0;
+		if (NormalizedMovement > MaximumNormalizedMovement)
+		{
+			MaximumNormalizedMovement = NormalizedMovement;
+			FurthestMovedNode = Node.Node;
+		}
+		if (NormalizedMovement > LocalMovementRadius + ReadabilityEpsilon) { ++LargeMovementCount; }
 	}
 	if (LargeMovementCount == 0) { return FString(); }
 
 	const bool bReadabilityImproved =
 		HasMaterialReadabilityImprovement(OriginalReadability, CandidateReadability, LayoutCellSize);
+	const int32 OriginalStructuralDefectCount = OriginalReadability.OverlapPairCount
+											  + OriginalReadability.ExecutionWireCrossingCount
+											  + OriginalReadability.WiresThroughNodes.Num();
+	const bool bDenseCrossingField = OriginalReadability.ExecutionWireCrossingCount * 4 > Nodes.Num()
+								  && OriginalReadability.WiresThroughNodes.Num() * 4 > Nodes.Num()
+								  && OriginalStructuralDefectCount * 4 >= Nodes.Num() * 3;
+	const bool bSeverelyTangled = OriginalReadability.OverlapPairCount > Nodes.Num() * 2
+							   || OriginalReadability.ExecutionWireCrossingCount > Nodes.Num() * 2
+							   || OriginalReadability.WiresThroughNodes.Num() > Nodes.Num() * 2 || bDenseCrossingField;
+	// Preserve mode must not let a small tail of an otherwise hand-authored graph "walk" several
+	// columns on every invocation merely because earlier safe moves made the next rank admissible.
+	// Whole-paragraph root normalization is removed above, and severely tangled generated graphs
+	// remain eligible for a complete reflow.
+	const double MaximumAuthoredMovementRadius = LayoutCellSize * 12.0;
+	if (!bSeverelyTangled && MaximumNormalizedMovement > MaximumAuthoredMovementRadius + ReadabilityEpsilon)
+	{
+		return FString::Printf(
+			TEXT("the candidate moves authored node '%s' %.0f units beyond its paragraph translation (maximum %.0f)"),
+			FurthestMovedNode != nullptr ? *FurthestMovedNode->GetName() : TEXT("<unknown>"),
+			MaximumNormalizedMovement,
+			MaximumAuthoredMovementRadius
+		);
+	}
 	// Preserve mode is deliberately conservative. A small graph may move up to three helper nodes
 	// when that straightens execution or removes a concrete readability defect. Larger authored
 	// paragraphs must retain most of their mental map; a broad canonical redraw belongs to Reflow.
-	const int32 AllowedLargeMovementCount = bReadabilityImproved
-											  ? FMath::Max(3, FMath::FloorToInt(static_cast<double>(Nodes.Num()) * 0.65))
-											  : FMath::Max(1, FMath::FloorToInt(static_cast<double>(Nodes.Num()) * 0.35));
+	// A severely tangled generated graph has no useful spatial mental map to preserve, so allow the
+	// complete deterministic cleanup when the ordinary readability gates confirm a real gain.
+	const int32 AllowedLargeMovementCount =
+		bSeverelyTangled
+			? Nodes.Num()
+			: (bReadabilityImproved ? FMath::Max(3, FMath::CeilToInt(static_cast<double>(Nodes.Num()) * 0.65))
+									: FMath::Max(1, FMath::FloorToInt(static_cast<double>(Nodes.Num()) * 0.35)));
 	if (LargeMovementCount > AllowedLargeMovementCount)
 	{
 		return FString::Printf(
@@ -967,7 +1233,11 @@ FString FindAuthoredMovementRegression(
 
 [[nodiscard]]
 FString FindReadabilityRegression(
-	const FReadabilityMetrics& Original, const FReadabilityMetrics& Candidate, const double LayoutCellSize, const bool bPreserveHumanLayout
+	const FReadabilityMetrics& Original,
+	const FReadabilityMetrics& Candidate,
+	const double LayoutCellSize,
+	const bool bPreserveHumanLayout,
+	const bool bAllowRerouteTradeoffs = false
 )
 {
 	if (Original.bWorkBudgetExhausted || Candidate.bWorkBudgetExhausted)
@@ -980,7 +1250,10 @@ FString FindReadabilityRegression(
 	}
 	// Routing is best-effort and can be skipped when no safe path exists or its work budget is
 	// exhausted. Never accept a layout that depends on a later routing attempt for node clearance.
-	if (FString Reason = FindWireThroughNodeRegression(Original, Candidate); !Reason.IsEmpty()) { return Reason; }
+	if (FString Reason = FindWireThroughNodeRegression(Original, Candidate, bAllowRerouteTradeoffs); !Reason.IsEmpty())
+	{
+		return Reason;
+	}
 	if (FString Reason = FindBackwardDataRegression(Original, Candidate, LayoutCellSize); !Reason.IsEmpty())
 	{
 		return Reason;
@@ -988,10 +1261,7 @@ FString FindReadabilityRegression(
 	if (FString Reason = FindDataCrossingRegression(Original, Candidate); !Reason.IsEmpty()) { return Reason; }
 	if (bPreserveHumanLayout)
 	{
-		if (FString Reason = FindRootPreservationRegression(Candidate, LayoutCellSize); !Reason.IsEmpty())
-		{
-			return Reason;
-		}
+		if (FString Reason = FindRootPreservationRegression(Candidate); !Reason.IsEmpty()) { return Reason; }
 	}
 	return FString();
 }
@@ -1017,7 +1287,10 @@ struct FCandidateReadabilityEvaluation
 
 [[nodiscard]]
 FCandidateReadabilityEvaluation EvaluateReadabilityCandidate(
-	const FReadabilityEvaluationContext& Context, const TMap<UEdGraphNode*, FVector2D>& CandidatePositions, const bool bUsePlannedRoutes
+	const FReadabilityEvaluationContext& Context,
+	const TMap<UEdGraphNode*, FVector2D>& CandidatePositions,
+	const bool bUsePlannedRoutes,
+	const bool bAllowRerouteTradeoffs = false
 )
 {
 	FCandidateReadabilityEvaluation Evaluation;
@@ -1033,11 +1306,11 @@ FCandidateReadabilityEvaluation EvaluateReadabilityCandidate(
 	if (!Context.OriginalReadability.bWorkBudgetExhausted && !Evaluation.Metrics.bWorkBudgetExhausted)
 	{
 		MeasureExecutionRootMovement(
-			Context.ReadabilityNodes, Context.OriginalPositions, CandidatePositions, Evaluation.Metrics
+			Context.ReadabilityNodes, Context.OriginalPositions, CandidatePositions, Context.LayoutCellSize, Evaluation.Metrics
 		);
 	}
 	Evaluation.Regression = FindReadabilityRegression(
-		Context.OriginalReadability, Evaluation.Metrics, Context.LayoutCellSize, Context.bPreserveHumanLayout
+		Context.OriginalReadability, Evaluation.Metrics, Context.LayoutCellSize, Context.bPreserveHumanLayout, bAllowRerouteTradeoffs
 	);
 	if (Evaluation.Regression.IsEmpty() && Context.bPreserveHumanLayout)
 	{
@@ -1106,6 +1379,18 @@ TMap<UEdGraphNode*, FVector2D> BuildAuthoredRerouteColumnAlignments(
 	{
 		Pair.Value.Sort([&StableNodeLess](const UEdGraphNode& Left, const UEdGraphNode& Right)
 						{ return StableNodeLess(Left, Right); });
+	}
+	const auto StableEdgeLess = [](const FAdapterEdgeRecord& Left, const FAdapterEdgeRecord& Right)
+	{ return Left.Key < Right.Key; };
+	for (TPair<UEdGraphNode*, TArray<const FAdapterEdgeRecord*>>& Pair : IncomingEdges)
+	{
+		Pair.Value.Sort([&StableEdgeLess](const FAdapterEdgeRecord& Left, const FAdapterEdgeRecord& Right)
+						{ return StableEdgeLess(Left, Right); });
+	}
+	for (TPair<UEdGraphNode*, TArray<const FAdapterEdgeRecord*>>& Pair : OutgoingEdges)
+	{
+		Pair.Value.Sort([&StableEdgeLess](const FAdapterEdgeRecord& Left, const FAdapterEdgeRecord& Right)
+						{ return StableEdgeLess(Left, Right); });
 	}
 
 	const auto ResolvePinX = [&PinRecords, &Positions](const UEdGraphPin* Pin, double& OutX)
@@ -1225,6 +1510,9 @@ TMap<UEdGraphNode*, FVector2D> BuildAuthoredRerouteColumnAlignments(
 					DesiredCenters.Add(Chain[Index], PreviousOutputX);
 				}
 			}
+			// In a branching bus, every knot after the first is the outgoing continuation of the
+			// semantic node in the preceding column. That rule also applies to the terminal knot:
+			// snapping it to its eventual consumer would erase the final producer-column alignment.
 		}
 		else
 		{
@@ -1264,7 +1552,9 @@ TMap<UEdGraphNode*, FVector2D> BuildAuthoredRerouteColumnAlignments(
 
 [[nodiscard]]
 FConservativeFallbackResult BuildConservativeFallback(
-	const FReadabilityEvaluationContext& ReadabilityContext, TConstArrayView<FAdapterEdgeRecord> LayoutEdges
+	const FReadabilityEvaluationContext& ReadabilityContext,
+	TConstArrayView<FAdapterEdgeRecord> LayoutEdges,
+	const TMap<UEdGraphNode*, FVector2D>& PreferredPositions
 )
 {
 	FConservativeFallbackResult Result;
@@ -1274,14 +1564,17 @@ FConservativeFallbackResult BuildConservativeFallback(
 	if (!Current.Regression.IsEmpty()) { return Result; }
 
 	TMap<const UEdGraphNode*, FString> LastRejectedMoves;
-	const auto TryPosition =
-		[&ReadabilityContext, &Result, &Current, &LastRejectedMoves](UEdGraphNode& Node, const FVector2D Position)
+	TMap<const UEdGraphNode*, FString> LastForwardExecutionShiftRejections;
+	const auto TryPositionWithPolicy = [&ReadabilityContext, &Result, &Current, &LastRejectedMoves](
+										   UEdGraphNode& Node, const FVector2D Position, const bool bAllowRerouteTradeoffs
+									   )
 	{
 		FVector2D* Existing = Result.Positions.Find(&Node);
 		if (Existing == nullptr || Existing->Equals(Position, ReadabilityEpsilon)) { return false; }
 		const FVector2D Previous = *Existing;
 		*Existing = Position;
-		FCandidateReadabilityEvaluation Trial = EvaluateReadabilityCandidate(ReadabilityContext, Result.Positions, false);
+		FCandidateReadabilityEvaluation Trial =
+			EvaluateReadabilityCandidate(ReadabilityContext, Result.Positions, false, bAllowRerouteTradeoffs);
 		if (!Trial.Regression.IsEmpty())
 		{
 			LastRejectedMoves.Add(
@@ -1298,6 +1591,68 @@ FConservativeFallbackResult BuildConservativeFallback(
 		Result.Readability = Current.Metrics;
 		return true;
 	};
+	const auto TryPosition = [&TryPositionWithPolicy](UEdGraphNode& Node, const FVector2D Position)
+	{ return TryPositionWithPolicy(Node, Position, false); };
+	const auto TryReroutePosition = [&TryPositionWithPolicy](UEdGraphNode& Node, const FVector2D Position)
+	{ return TryPositionWithPolicy(Node, Position, true); };
+	const auto TryPositionsWithPolicy = [&ReadabilityContext, &Result, &Current, &LastRejectedMoves](
+											TConstArrayView<UEdGraphNode*> Nodes,
+											const TMap<UEdGraphNode*, FVector2D>& Positions,
+											const bool bAllowRerouteTradeoffs,
+											const bool bRequireReadabilityImprovement
+										)
+	{
+		TMap<UEdGraphNode*, FVector2D> PreviousPositions;
+		for (UEdGraphNode* Node : Nodes)
+		{
+			const FVector2D* DesiredPosition = Positions.Find(Node);
+			FVector2D* ExistingPosition = Result.Positions.Find(Node);
+			if (Node == nullptr || DesiredPosition == nullptr || ExistingPosition == nullptr
+				|| ExistingPosition->Equals(*DesiredPosition, ReadabilityEpsilon))
+			{
+				continue;
+			}
+			PreviousPositions.Add(Node, *ExistingPosition);
+			*ExistingPosition = *DesiredPosition;
+		}
+		if (PreviousPositions.IsEmpty()) { return false; }
+
+		FCandidateReadabilityEvaluation Trial =
+			EvaluateReadabilityCandidate(ReadabilityContext, Result.Positions, false, bAllowRerouteTradeoffs);
+		const bool bImprovesReadability =
+			HasMaterialReadabilityImprovement(Current.Metrics, Trial.Metrics, ReadabilityContext.LayoutCellSize);
+		if (!Trial.Regression.IsEmpty() || (bRequireReadabilityImprovement && !bImprovesReadability))
+		{
+			for (const TPair<UEdGraphNode*, FVector2D>& Previous : PreviousPositions)
+			{
+				Result.Positions.FindChecked(Previous.Key) = Previous.Value;
+				LastRejectedMoves.Add(
+					Previous.Key,
+					Trial.Regression.IsEmpty()
+						? TEXT("moving its preferred layout group would not materially improve readability")
+						: FString::Printf(TEXT("moving its preferred layout group would cause %s"), *Trial.Regression)
+				);
+			}
+			return false;
+		}
+
+		for (const TPair<UEdGraphNode*, FVector2D>& Previous : PreviousPositions)
+		{
+			LastRejectedMoves.Remove(Previous.Key);
+		}
+		Current = MoveTemp(Trial);
+		Result.Readability = Current.Metrics;
+		return true;
+	};
+	const auto TryPositions =
+		[&TryPositionsWithPolicy](TConstArrayView<UEdGraphNode*> Nodes, const TMap<UEdGraphNode*, FVector2D>& Positions)
+	{ return TryPositionsWithPolicy(Nodes, Positions, false, false); };
+	const auto TryImprovingPositions =
+		[&TryPositionsWithPolicy](TConstArrayView<UEdGraphNode*> Nodes, const TMap<UEdGraphNode*, FVector2D>& Positions)
+	{ return TryPositionsWithPolicy(Nodes, Positions, false, true); };
+	const auto TryReroutePositions =
+		[&TryPositionsWithPolicy](TConstArrayView<UEdGraphNode*> Nodes, const TMap<UEdGraphNode*, FVector2D>& Positions)
+	{ return TryPositionsWithPolicy(Nodes, Positions, true, false); };
 
 	TMap<const UEdGraphNode*, const FAdapterNodeRecord*> NodesByObject;
 	for (const FAdapterNodeRecord& Node : ReadabilityContext.AuthoredNodes)
@@ -1305,6 +1660,8 @@ FConservativeFallbackResult BuildConservativeFallback(
 		NodesByObject.Add(Node.Node, &Node);
 	}
 	TMap<const UEdGraphNode*, TArray<const UEdGraphNode*>> ConnectedNodes;
+	TMap<const UEdGraphNode*, TArray<const UEdGraphNode*>> ExecutionConnectedNodes;
+	TMap<const UEdGraphNode*, TArray<const UEdGraphNode*>> ExecutionSuccessors;
 	for (const FAdapterEdgeRecord& Edge : LayoutEdges)
 	{
 		const UEdGraphNode* Source = Edge.OutputPin != nullptr ? Edge.OutputPin->GetOwningNodeUnchecked() : nullptr;
@@ -1315,14 +1672,325 @@ FConservativeFallbackResult BuildConservativeFallback(
 		}
 		ConnectedNodes.FindOrAdd(Source).AddUnique(Target);
 		ConnectedNodes.FindOrAdd(Target).AddUnique(Source);
+		if (Edge.bExecution)
+		{
+			ExecutionConnectedNodes.FindOrAdd(Source).AddUnique(Target);
+			ExecutionConnectedNodes.FindOrAdd(Target).AddUnique(Source);
+			ExecutionSuccessors.FindOrAdd(Source).AddUnique(Target);
+		}
 	}
+	const auto TryForwardExecutionShift =
+		[&ReadabilityContext,
+		 &Result,
+		 &ExecutionSuccessors,
+		 &ConnectedNodes,
+		 &LayoutEdges,
+		 &NodesByObject,
+		 &LastForwardExecutionShiftRejections,
+		 &LastRejectedMoves,
+		 &TryPositionsWithPolicy](const UEdGraphNode& Source, UEdGraphNode& Target, const double RequiredTargetX)
+	{
+		const FVector2D* TargetPosition = Result.Positions.Find(&Target);
+		if (TargetPosition == nullptr || TargetPosition->X + ReadabilityEpsilon >= RequiredTargetX) { return false; }
+
+		TArray<const UEdGraphNode*> Pending{ &Target };
+		TSet<const UEdGraphNode*> Visited;
+		for (int32 PendingIndex = 0; PendingIndex < Pending.Num(); ++PendingIndex)
+		{
+			const UEdGraphNode* Node = Pending[PendingIndex];
+			if (Node == nullptr || Visited.Contains(Node)) { continue; }
+			if (Node == &Source)
+			{
+				// Do not translate an execution cycle through its own source; the individual and
+				// right-side fallbacks below can still admit a smaller safe correction.
+				return false;
+			}
+			Visited.Add(Node);
+			if (const TArray<const UEdGraphNode*>* Successors = ExecutionSuccessors.Find(Node))
+			{
+				Pending.Append(*Successors);
+			}
+		}
+		if (Visited.IsEmpty()) { return false; }
+
+		// Solve every downstream preferred-execution gutter in the same atomic candidate. A
+		// uniform suffix translation only fixes the first short gap; each later formatter click
+		// would otherwise advance the next suffix by one more cell.
+		TMap<UEdGraphNode*, FVector2D> ShiftedPositions;
+		for (const UEdGraphNode* Node : Visited)
+		{
+			if (const FVector2D* Position = Result.Positions.Find(Node))
+			{
+				ShiftedPositions.Add(const_cast<UEdGraphNode*>(Node), *Position);
+			}
+		}
+		FVector2D* ShiftedTargetPosition = ShiftedPositions.Find(&Target);
+		if (ShiftedTargetPosition == nullptr) { return false; }
+		ShiftedTargetPosition->X = RequiredTargetX;
+
+		const auto ResolveCandidatePosition = [&Result, &ShiftedPositions](const UEdGraphNode* Node) -> const FVector2D*
+		{
+			if (const FVector2D* ShiftedPosition = ShiftedPositions.Find(Node)) { return ShiftedPosition; }
+			return Result.Positions.Find(Node);
+		};
+		const int32 MaximumPropagationPasses = FMath::Max(1, Visited.Num() * 2);
+		for (int32 Pass = 0; Pass < MaximumPropagationPasses; ++Pass)
+		{
+			bool bChangedInPass = false;
+			for (const FAdapterEdgeRecord& Edge : LayoutEdges)
+			{
+				if (!Edge.bExecution || !Edge.bPreferredAlignment || Edge.OutputPin == nullptr || Edge.InputPin == nullptr)
+				{
+					continue;
+				}
+				const UEdGraphNode* EdgeSource = Edge.OutputPin->GetOwningNodeUnchecked();
+				UEdGraphNode* EdgeTarget = Edge.InputPin->GetOwningNodeUnchecked();
+				if (EdgeSource == nullptr || EdgeTarget == nullptr || EdgeSource->IsA<UK2Node_Knot>()
+					|| EdgeTarget->IsA<UK2Node_Knot>() || !Visited.Contains(EdgeTarget))
+				{
+					continue;
+				}
+				const FAdapterNodeRecord* const* SourceRecord = NodesByObject.Find(EdgeSource);
+				const FAdapterNodeRecord* const* TargetRecord = NodesByObject.Find(EdgeTarget);
+				const FVector2D* OriginalSourcePosition = ReadabilityContext.OriginalPositions.Find(EdgeSource);
+				const FVector2D* OriginalTargetPosition = ReadabilityContext.OriginalPositions.Find(EdgeTarget);
+				const FVector2D* SourcePosition = ResolveCandidatePosition(EdgeSource);
+				FVector2D* CandidateTargetPosition = ShiftedPositions.Find(EdgeTarget);
+				if (SourceRecord == nullptr || TargetRecord == nullptr || OriginalSourcePosition == nullptr
+					|| OriginalTargetPosition == nullptr || SourcePosition == nullptr
+					|| CandidateTargetPosition == nullptr || OriginalTargetPosition->X <= OriginalSourcePosition->X)
+				{
+					continue;
+				}
+
+				double SourceColumnRight = SourcePosition->X + (*SourceRecord)->Size.X;
+				for (const FAdapterNodeRecord& ColumnNode : ReadabilityContext.AuthoredNodes)
+				{
+					const FVector2D* ColumnPosition = ResolveCandidatePosition(ColumnNode.Node);
+					if (ColumnPosition != nullptr
+						&& FMath::IsNearlyEqual(ColumnPosition->X, SourcePosition->X, ReadabilityEpsilon))
+					{
+						SourceColumnRight = FMath::Max(SourceColumnRight, ColumnPosition->X + ColumnNode.Size.X);
+					}
+				}
+
+				const FAdapterPinRecord* OutputPin = ReadabilityContext.PinRecords.Find(Edge.OutputPin);
+				const FAdapterPinRecord* InputPin = ReadabilityContext.PinRecords.Find(Edge.InputPin);
+				double UnsnappedTargetX = SourceColumnRight + ReadabilityContext.LayoutCellSize;
+				if (OutputPin != nullptr && InputPin != nullptr)
+				{
+					UnsnappedTargetX = FMath::Max(
+						UnsnappedTargetX,
+						SourcePosition->X + OutputPin->Offset.X + ReadabilityContext.LayoutCellSize - InputPin->Offset.X
+					);
+				}
+				const double PropagatedTargetX = FMath::CeilToDouble(UnsnappedTargetX / ReadabilityContext.LayoutCellSize)
+											   * ReadabilityContext.LayoutCellSize;
+				if (CandidateTargetPosition->X + ReadabilityEpsilon < PropagatedTargetX)
+				{
+					CandidateTargetPosition->X = PropagatedTargetX;
+					bChangedInPass = true;
+				}
+			}
+			if (!bChangedInPass) { break; }
+		}
+
+		// Carry a pure provider tree only when every one of its consumers already belongs to this
+		// suffix and those consumers agree on one translation. This keeps local getter/operator
+		// wiring attached without dragging shared state or a neighbouring execution paragraph.
+		TMap<const UEdGraphNode*, double> TranslationByIncludedNode;
+		for (const TPair<UEdGraphNode*, FVector2D>& ShiftedPosition : ShiftedPositions)
+		{
+			if (const FVector2D* CurrentPosition = Result.Positions.Find(ShiftedPosition.Key))
+			{
+				TranslationByIncludedNode.Add(ShiftedPosition.Key, ShiftedPosition.Value.X - CurrentPosition->X);
+			}
+		}
+		for (int32 Pass = 0; Pass < ReadabilityContext.AuthoredNodes.Num(); ++Pass)
+		{
+			bool bAttachedInPass = false;
+			for (const FAdapterNodeRecord& NodeRecord : ReadabilityContext.AuthoredNodes)
+			{
+				UEdGraphNode* Node = NodeRecord.Node;
+				if (Node == nullptr || Node->IsA<UK2Node_Knot>() || TranslationByIncludedNode.Contains(Node))
+				{
+					continue;
+				}
+
+				bool bHasExecutionPin = false;
+				for (const UEdGraphPin* Pin : Node->Pins)
+				{
+					bHasExecutionPin |= Pin != nullptr && IsExecutionPin(*Pin);
+				}
+				if (bHasExecutionPin) { continue; }
+
+				bool bHasConsumer = false;
+				bool bSharedOrConflicting = false;
+				TOptional<double> AgreedTranslation;
+				for (const FAdapterEdgeRecord& Edge : LayoutEdges)
+				{
+					const UEdGraphNode* Provider = Edge.OutputPin != nullptr ? Edge.OutputPin->GetOwningNodeUnchecked()
+																			 : nullptr;
+					if (Edge.bExecution || Provider != Node || Edge.InputPin == nullptr) { continue; }
+					bHasConsumer = true;
+					const UEdGraphNode* Consumer = Edge.InputPin->GetOwningNodeUnchecked();
+					const double* ConsumerTranslation = TranslationByIncludedNode.Find(Consumer);
+					if (ConsumerTranslation == nullptr)
+					{
+						bSharedOrConflicting = true;
+						break;
+					}
+					if (!AgreedTranslation.IsSet()) { AgreedTranslation = *ConsumerTranslation; }
+					else if (!FMath::IsNearlyEqual(AgreedTranslation.GetValue(), *ConsumerTranslation, ReadabilityEpsilon))
+					{
+						bSharedOrConflicting = true;
+						break;
+					}
+				}
+				if (!bHasConsumer || bSharedOrConflicting || !AgreedTranslation.IsSet()
+					|| FMath::IsNearlyZero(AgreedTranslation.GetValue(), ReadabilityEpsilon))
+				{
+					continue;
+				}
+				const FVector2D* CurrentPosition = Result.Positions.Find(Node);
+				if (CurrentPosition == nullptr) { continue; }
+				FVector2D ProviderPosition = *CurrentPosition;
+				ProviderPosition.X =
+					FMath::GridSnap(ProviderPosition.X + AgreedTranslation.GetValue(), ReadabilityContext.LayoutCellSize);
+				const double SnappedTranslation = ProviderPosition.X - CurrentPosition->X;
+				if (FMath::IsNearlyZero(SnappedTranslation, ReadabilityEpsilon)) { continue; }
+				ShiftedPositions.Add(Node, ProviderPosition);
+				// Propagate the provider's actual snapped displacement, rather than the consumer's
+				// displacement. An upstream provider chain then converges on visible major-grid
+				// columns as one atomic candidate without independently snapping into itself.
+				TranslationByIncludedNode.Add(Node, SnappedTranslation);
+				bAttachedInPass = true;
+			}
+			if (!bAttachedInPass) { break; }
+		}
+
+		// Let affected authored reroute chains follow their semantic terminals inside the same
+		// candidate. Unrelated reroutes remain exactly where the author placed them.
+		TMap<UEdGraphNode*, FVector2D> CandidatePositions = Result.Positions;
+		for (const TPair<UEdGraphNode*, FVector2D>& ShiftedPosition : ShiftedPositions)
+		{
+			CandidatePositions.FindOrAdd(ShiftedPosition.Key) = ShiftedPosition.Value;
+		}
+		const TMap<UEdGraphNode*, FVector2D> RerouteAlignments = BuildAuthoredRerouteColumnAlignments(
+			ReadabilityContext.AuthoredNodes, LayoutEdges, ReadabilityContext.PinRecords, CandidatePositions
+		);
+		TSet<const UEdGraphNode*> AffectedKnots;
+		Pending.Reset();
+		for (const TPair<UEdGraphNode*, FVector2D>& ShiftedPosition : ShiftedPositions)
+		{
+			Pending.Add(ShiftedPosition.Key);
+		}
+		for (int32 PendingIndex = 0; PendingIndex < Pending.Num(); ++PendingIndex)
+		{
+			const UEdGraphNode* Node = Pending[PendingIndex];
+			if (const TArray<const UEdGraphNode*>* Neighbours = ConnectedNodes.Find(Node))
+			{
+				for (const UEdGraphNode* Neighbour : *Neighbours)
+				{
+					if (Neighbour != nullptr && Neighbour->IsA<UK2Node_Knot>() && !AffectedKnots.Contains(Neighbour))
+					{
+						AffectedKnots.Add(Neighbour);
+						Pending.Add(Neighbour);
+					}
+				}
+			}
+		}
+		for (const UEdGraphNode* Knot : AffectedKnots)
+		{
+			if (const FVector2D* Alignment = RerouteAlignments.Find(Knot))
+			{
+				ShiftedPositions.FindOrAdd(const_cast<UEdGraphNode*>(Knot)) = *Alignment;
+			}
+		}
+
+		TArray<UEdGraphNode*> ShiftedNodes;
+		ShiftedPositions.GetKeys(ShiftedNodes);
+		ShiftedNodes.Sort(
+			[&NodesByObject](const UEdGraphNode& Left, const UEdGraphNode& Right)
+			{
+				const FAdapterNodeRecord* const* LeftRecord = NodesByObject.Find(&Left);
+				const FAdapterNodeRecord* const* RightRecord = NodesByObject.Find(&Right);
+				return LeftRecord != nullptr && RightRecord != nullptr ? (*LeftRecord)->Key < (*RightRecord)->Key
+																	   : Left.GetName() < Right.GetName();
+			}
+		);
+		// Execution gutters are the primary visual spine. Admit this complete, converged suffix
+		// only when it trades at most one additional data wire-under-node defect; because every
+		// downstream gutter, owned provider, and affected reroute is included atomically, that
+		// bounded allowance cannot accumulate through partial suffix shifts or repeat clicks.
+		if (TryPositionsWithPolicy(ShiftedNodes, ShiftedPositions, true, false))
+		{
+			LastForwardExecutionShiftRejections.Remove(&Target);
+			return true;
+		}
+		const FString AllReroutesRejection = LastRejectedMoves.FindRef(&Target);
+
+		// A data-reroute adjustment may be the only unsafe part of an otherwise complete semantic
+		// fixed point. Keep execution knots attached to their shifted branch/merge pins, but retry
+		// with data knots authored; the bounded reconciliation phase below will independently admit
+		// every safe data-reroute endpoint.
+		for (const UEdGraphNode* Knot : AffectedKnots)
+		{
+			const UK2Node_Knot* TypedKnot = Cast<UK2Node_Knot>(Knot);
+			if (TypedKnot != nullptr && TypedKnot->GetInputPin() != nullptr && IsExecutionPin(*TypedKnot->GetInputPin()))
+			{
+				continue;
+			}
+			if (const FVector2D* CurrentPosition = Result.Positions.Find(Knot))
+			{
+				ShiftedPositions.FindOrAdd(const_cast<UEdGraphNode*>(Knot)) = *CurrentPosition;
+			}
+		}
+		if (TryPositionsWithPolicy(ShiftedNodes, ShiftedPositions, false, false))
+		{
+			LastForwardExecutionShiftRejections.Remove(&Target);
+			return true;
+		}
+		const FString ExecutionReroutesRejection = LastRejectedMoves.FindRef(&Target);
+
+		// If even an execution-knot alignment is unsafe, leave every reroute authored and retain
+		// the semantic move only when it independently clears all strict readability gates.
+		for (const UEdGraphNode* Knot : AffectedKnots)
+		{
+			if (const FVector2D* CurrentPosition = Result.Positions.Find(Knot))
+			{
+				ShiftedPositions.FindOrAdd(const_cast<UEdGraphNode*>(Knot)) = *CurrentPosition;
+			}
+		}
+		if (TryPositionsWithPolicy(ShiftedNodes, ShiftedPositions, false, false))
+		{
+			LastForwardExecutionShiftRejections.Remove(&Target);
+			return true;
+		}
+		const FString SemanticOnlyRejection = LastRejectedMoves.FindRef(&Target);
+		LastForwardExecutionShiftRejections.Add(
+			&Target,
+			SemanticOnlyRejection.IsEmpty()
+				? TEXT("solving the complete downstream execution suffix was not readability-safe")
+				: FString::Printf(
+					  TEXT(
+						  "solving the complete downstream execution suffix was rejected with all reroutes (%s), "
+						  "execution reroutes only (%s), and authored reroutes (%s)"
+					  ),
+					  AllReroutesRejection.IsEmpty() ? TEXT("unknown") : *AllReroutesRejection,
+					  ExecutionReroutesRejection.IsEmpty() ? TEXT("unknown") : *ExecutionReroutesRejection,
+					  *SemanticOnlyRejection
+				  )
+		);
+		return false;
+	};
 	const auto TryRightSideColumnShift = [&ReadabilityContext, &Result, &Current, &LastRejectedMoves, &ConnectedNodes](
 											 UEdGraphNode& Target, const double RequiredTargetX
 										 )
 	{
 		const FVector2D* TargetPosition = Result.Positions.Find(&Target);
 		if (TargetPosition == nullptr || TargetPosition->X + ReadabilityEpsilon >= RequiredTargetX) { return false; }
-		const double ThresholdX = TargetPosition->X;
+		const double ThresholdColumnX = FMath::GridSnap(TargetPosition->X, ReadabilityContext.LayoutCellSize);
 		TSet<const UEdGraphNode*> Component;
 		TArray<const UEdGraphNode*> Pending{ &Target };
 		for (int32 PendingIndex = 0; PendingIndex < Pending.Num(); ++PendingIndex)
@@ -1336,18 +2004,19 @@ FConservativeFallbackResult BuildConservativeFallback(
 			}
 		}
 
-		const double DeltaX = RequiredTargetX - ThresholdX;
+		const double ColumnDeltaX = RequiredTargetX - ThresholdColumnX;
 		TMap<UEdGraphNode*, FVector2D> PreviousPositions;
 		for (const UEdGraphNode* ComponentNode : Component)
 		{
 			UEdGraphNode* Node = const_cast<UEdGraphNode*>(ComponentNode);
 			FVector2D* Position = Result.Positions.Find(Node);
-			if (Position == nullptr || Position->X + ReadabilityEpsilon < ThresholdX) { continue; }
+			if (Position == nullptr) { continue; }
+			const double NodeColumnX = Node->IsA<UK2Node_Knot>()
+										 ? Position->X
+										 : FMath::GridSnap(Position->X, ReadabilityContext.LayoutCellSize);
+			if (NodeColumnX + ReadabilityEpsilon < ThresholdColumnX) { continue; }
 			PreviousPositions.Add(Node, *Position);
-			const double ShiftedX = Position->X + DeltaX;
-			Position->X = Node->IsA<UK2Node_Knot>() ? ShiftedX
-													: FMath::CeilToDouble(ShiftedX / ReadabilityContext.LayoutCellSize)
-														  * ReadabilityContext.LayoutCellSize;
+			Position->X = Node->IsA<UK2Node_Knot>() ? Position->X + ColumnDeltaX : NodeColumnX + ColumnDeltaX;
 		}
 		if (PreviousPositions.IsEmpty()) { return false; }
 
@@ -1425,12 +2094,45 @@ FConservativeFallbackResult BuildConservativeFallback(
 			{
 				continue;
 			}
-			const double UnsnappedTargetX = SourcePosition->X + (*SourceRecord)->Size.X + ReadabilityContext.LayoutCellSize;
+			double SourceColumnRight = SourcePosition->X + (*SourceRecord)->Size.X;
+			for (const FAdapterNodeRecord& ColumnNode : ReadabilityContext.AuthoredNodes)
+			{
+				const FVector2D* ColumnPosition = Result.Positions.Find(ColumnNode.Node);
+				if (ColumnPosition != nullptr
+					&& FMath::IsNearlyEqual(ColumnPosition->X, SourcePosition->X, ReadabilityEpsilon))
+				{
+					SourceColumnRight = FMath::Max(SourceColumnRight, ColumnPosition->X + ColumnNode.Size.X);
+				}
+			}
+			const FAdapterPinRecord* OutputPin = ReadabilityContext.PinRecords.Find(Edge.OutputPin);
+			const FAdapterPinRecord* InputPin = ReadabilityContext.PinRecords.Find(Edge.InputPin);
+			double UnsnappedTargetX = SourceColumnRight + ReadabilityContext.LayoutCellSize;
+			if (OutputPin != nullptr && InputPin != nullptr)
+			{
+				// The visible gutter is measured between execution pins, not only between the
+				// cached node bounds. Some Slate node styles place their output pin slightly past
+				// the measured body, so the body-only rule could still leave a 96-unit wire.
+				UnsnappedTargetX = FMath::Max(
+					UnsnappedTargetX,
+					SourcePosition->X + OutputPin->Offset.X + ReadabilityContext.LayoutCellSize - InputPin->Offset.X
+				);
+			}
 			const double RequiredTargetX = FMath::CeilToDouble(UnsnappedTargetX / ReadabilityContext.LayoutCellSize)
 										 * ReadabilityContext.LayoutCellSize;
-			if (TargetPosition->X + ReadabilityEpsilon >= RequiredTargetX) { continue; }
-			if (TryPosition(*Target, FVector2D(RequiredTargetX, TargetPosition->Y))
-				|| TryRightSideColumnShift(*Target, RequiredTargetX))
+			const double FinalTargetX = FMath::Max(TargetPosition->X, RequiredTargetX);
+			bool bMovedTarget = false;
+			if (OutputPin != nullptr && InputPin != nullptr)
+			{
+				const double StraightExecutionY = SourcePosition->Y + OutputPin->Offset.Y - InputPin->Offset.Y;
+				bMovedTarget = TryPosition(*Target, FVector2D(FinalTargetX, StraightExecutionY));
+			}
+			if (!bMovedTarget && TargetPosition->X + ReadabilityEpsilon < RequiredTargetX)
+			{
+				bMovedTarget = TryPosition(*Target, FVector2D(RequiredTargetX, TargetPosition->Y))
+							|| TryForwardExecutionShift(*Source, *Target, RequiredTargetX)
+							|| TryRightSideColumnShift(*Target, RequiredTargetX);
+			}
+			if (bMovedTarget)
 			{
 				for (const FAdapterNodeRecord& Node : ReadabilityContext.AuthoredNodes)
 				{
@@ -1447,34 +2149,505 @@ FConservativeFallbackResult BuildConservativeFallback(
 		if (!bMovedInPass) { break; }
 	}
 
-	const TMap<UEdGraphNode*, FVector2D> RerouteAlignments = BuildAuthoredRerouteColumnAlignments(
-		ReadabilityContext.AuthoredNodes, LayoutEdges, ReadabilityContext.PinRecords, Result.Positions
-	);
-	if (!RerouteAlignments.IsEmpty())
+	// Never let a later semantic-group admission undo a gutter already established by the
+	// execution-first fallback. Anchor execution roots at their current authored row, then
+	// propagate exact pin alignment through each preferred execution chain. This makes the target
+	// independent of which neighbouring paragraph happened to become safe first.
+	TMap<UEdGraphNode*, FVector2D> MonotonicPreferredPositions = PreferredPositions;
+	const auto HasFullPreferredExecutionGutter = [&ReadabilityContext, &Result, &LayoutEdges, &NodesByObject](
+													 const UEdGraphNode& Target, const FVector2D& TargetPosition
+												 )
 	{
-		TMap<UEdGraphNode*, FVector2D> PreviousPositions;
-		for (const TPair<UEdGraphNode*, FVector2D>& Alignment : RerouteAlignments)
+		bool bHasPreferredIncomingEdge = false;
+		for (const FAdapterEdgeRecord& Edge : LayoutEdges)
 		{
-			if (FVector2D* Position = Result.Positions.Find(Alignment.Key))
+			if (!Edge.bExecution || !Edge.bPreferredAlignment || Edge.OutputPin == nullptr || Edge.InputPin == nullptr
+				|| Edge.InputPin->GetOwningNodeUnchecked() != &Target)
 			{
-				PreviousPositions.Add(Alignment.Key, *Position);
-				*Position = Alignment.Value;
+				continue;
+			}
+
+			const UEdGraphNode* Source = Edge.OutputPin->GetOwningNodeUnchecked();
+			const FAdapterNodeRecord* const* SourceRecord = NodesByObject.Find(Source);
+			const FVector2D* SourcePosition = Result.Positions.Find(Source);
+			if (Source == nullptr || Source->IsA<UK2Node_Knot>() || SourceRecord == nullptr || SourcePosition == nullptr)
+			{
+				continue;
+			}
+			bHasPreferredIncomingEdge = true;
+
+			double SourceColumnRight = SourcePosition->X + (*SourceRecord)->Size.X;
+			for (const FAdapterNodeRecord& ColumnNode : ReadabilityContext.AuthoredNodes)
+			{
+				const FVector2D* ColumnPosition = Result.Positions.Find(ColumnNode.Node);
+				if (ColumnPosition != nullptr
+					&& FMath::IsNearlyEqual(ColumnPosition->X, SourcePosition->X, ReadabilityEpsilon))
+				{
+					SourceColumnRight = FMath::Max(SourceColumnRight, ColumnPosition->X + ColumnNode.Size.X);
+				}
+			}
+
+			const FAdapterPinRecord* OutputPin = ReadabilityContext.PinRecords.Find(Edge.OutputPin);
+			const FAdapterPinRecord* InputPin = ReadabilityContext.PinRecords.Find(Edge.InputPin);
+			double RequiredTargetX = SourceColumnRight + ReadabilityContext.LayoutCellSize;
+			if (OutputPin != nullptr && InputPin != nullptr)
+			{
+				RequiredTargetX = FMath::Max(
+					RequiredTargetX,
+					SourcePosition->X + OutputPin->Offset.X + ReadabilityContext.LayoutCellSize - InputPin->Offset.X
+				);
+			}
+			RequiredTargetX = FMath::CeilToDouble(RequiredTargetX / ReadabilityContext.LayoutCellSize)
+							* ReadabilityContext.LayoutCellSize;
+			if (TargetPosition.X + ReadabilityEpsilon < RequiredTargetX) { return false; }
+		}
+		return bHasPreferredIncomingEdge;
+	};
+	for (const FAdapterNodeRecord& Node : ReadabilityContext.AuthoredNodes)
+	{
+		FVector2D* PreferredPosition = MonotonicPreferredPositions.Find(Node.Node);
+		const FVector2D* CurrentPosition = Result.Positions.Find(Node.Node);
+		if (Node.Node == nullptr || PreferredPosition == nullptr || CurrentPosition == nullptr) { continue; }
+
+		bool bHasExecutionOutput = false;
+		bool bHasLinkedExecutionInput = false;
+		for (const UEdGraphPin* Pin : Node.Node->Pins)
+		{
+			if (Pin == nullptr || !IsExecutionPin(*Pin)) { continue; }
+			bHasExecutionOutput |= Pin->Direction == EGPD_Output;
+			bHasLinkedExecutionInput |= Pin->Direction == EGPD_Input && !Pin->LinkedTo.IsEmpty();
+		}
+		const bool bExecutionRoot = bHasExecutionOutput && !bHasLinkedExecutionInput;
+		PreferredPosition->X = bExecutionRoot || HasFullPreferredExecutionGutter(*Node.Node, *CurrentPosition)
+								 ? CurrentPosition->X
+								 : FMath::Max(PreferredPosition->X, CurrentPosition->X);
+		if (bExecutionRoot) { PreferredPosition->Y = CurrentPosition->Y; }
+	}
+	for (int32 Pass = 0; Pass < ReadabilityContext.AuthoredNodes.Num(); ++Pass)
+	{
+		bool bAlignedInPass = false;
+		for (const FAdapterEdgeRecord& Edge : LayoutEdges)
+		{
+			if (!Edge.bExecution || !Edge.bPreferredAlignment || Edge.OutputPin == nullptr || Edge.InputPin == nullptr)
+			{
+				continue;
+			}
+			UEdGraphNode* Source = Edge.OutputPin->GetOwningNodeUnchecked();
+			UEdGraphNode* Target = Edge.InputPin->GetOwningNodeUnchecked();
+			FVector2D* SourcePosition = MonotonicPreferredPositions.Find(Source);
+			FVector2D* TargetPosition = MonotonicPreferredPositions.Find(Target);
+			const FAdapterPinRecord* OutputPin = ReadabilityContext.PinRecords.Find(Edge.OutputPin);
+			const FAdapterPinRecord* InputPin = ReadabilityContext.PinRecords.Find(Edge.InputPin);
+			if (SourcePosition == nullptr || TargetPosition == nullptr || OutputPin == nullptr || InputPin == nullptr)
+			{
+				continue;
+			}
+			const double AlignedTargetY = SourcePosition->Y + OutputPin->Offset.Y - InputPin->Offset.Y;
+			if (!FMath::IsNearlyEqual(TargetPosition->Y, AlignedTargetY, ReadabilityEpsilon))
+			{
+				TargetPosition->Y = AlignedTargetY;
+				bAlignedInPass = true;
 			}
 		}
-		FCandidateReadabilityEvaluation Trial = EvaluateReadabilityCandidate(ReadabilityContext, Result.Positions, false);
-		if (Trial.Regression.IsEmpty())
+		if (!bAlignedInPass) { break; }
+	}
+
+	// When the complete semantic layout is unsafe, retain coherent pieces that are safe in the
+	// original graph-wide wire field. Execution-connected paragraphs move atomically, including
+	// pure provider trees that belong unambiguously to one paragraph. Isolated semantic moves are
+	// deliberately not admitted here: accepting only one rank changes the authored rank medians on
+	// the next invocation and produces the rightward "stair-step" that used to require repeated
+	// formatter clicks.
+	TArray<TArray<UEdGraphNode*>> PreferredSemanticGroups;
+	TMap<const UEdGraphNode*, int32> SemanticGroupByNode;
+	for (const FAdapterNodeRecord& Node : ReadabilityContext.AuthoredNodes)
+	{
+		if (Node.Node == nullptr || Node.Node->IsA<UK2Node_Knot>() || SemanticGroupByNode.Contains(Node.Node)
+			|| !ExecutionConnectedNodes.Contains(Node.Node))
 		{
-			Current = MoveTemp(Trial);
-			Result.Readability = Current.Metrics;
+			continue;
 		}
-		else
+
+		const int32 GroupIndex = PreferredSemanticGroups.AddDefaulted();
+		TArray<const UEdGraphNode*> Pending{ Node.Node };
+		for (int32 PendingIndex = 0; PendingIndex < Pending.Num(); ++PendingIndex)
 		{
-			for (const TPair<UEdGraphNode*, FVector2D>& Previous : PreviousPositions)
+			const UEdGraphNode* CurrentNode = Pending[PendingIndex];
+			if (CurrentNode == nullptr || SemanticGroupByNode.Contains(CurrentNode)) { continue; }
+			SemanticGroupByNode.Add(CurrentNode, GroupIndex);
+			PreferredSemanticGroups[GroupIndex].Add(const_cast<UEdGraphNode*>(CurrentNode));
+			if (const TArray<const UEdGraphNode*>* Neighbours = ExecutionConnectedNodes.Find(CurrentNode))
 			{
-				Result.Positions.FindChecked(Previous.Key) = Previous.Value;
+				Pending.Append(*Neighbours);
 			}
+		}
+	}
+
+	// Attach a pure provider only when all of its already classified neighbours agree on the same
+	// execution paragraph. Shared providers that bridge paragraphs stay authored.
+	for (int32 Pass = 0; Pass < ReadabilityContext.AuthoredNodes.Num(); ++Pass)
+	{
+		bool bAssignedInPass = false;
+		for (const FAdapterNodeRecord& Node : ReadabilityContext.AuthoredNodes)
+		{
+			if (Node.Node == nullptr || Node.Node->IsA<UK2Node_Knot>() || SemanticGroupByNode.Contains(Node.Node))
+			{
+				continue;
+			}
+			bool bHasExecutionPin = false;
+			for (const UEdGraphPin* Pin : Node.Node->Pins)
+			{
+				bHasExecutionPin |= Pin != nullptr && IsExecutionPin(*Pin);
+			}
+			if (bHasExecutionPin) { continue; }
+
+			TOptional<int32> AgreedGroup;
+			bool bAmbiguous = false;
+			if (const TArray<const UEdGraphNode*>* Neighbours = ConnectedNodes.Find(Node.Node))
+			{
+				for (const UEdGraphNode* Neighbour : *Neighbours)
+				{
+					const int32* NeighbourGroup = SemanticGroupByNode.Find(Neighbour);
+					if (NeighbourGroup == nullptr) { continue; }
+					if (!AgreedGroup.IsSet()) { AgreedGroup = *NeighbourGroup; }
+					else if (AgreedGroup.GetValue() != *NeighbourGroup) { bAmbiguous = true; }
+				}
+			}
+			if (AgreedGroup.IsSet() && !bAmbiguous)
+			{
+				SemanticGroupByNode.Add(Node.Node, AgreedGroup.GetValue());
+				PreferredSemanticGroups[AgreedGroup.GetValue()].Add(Node.Node);
+				bAssignedInPass = true;
+			}
+		}
+		if (!bAssignedInPass) { break; }
+	}
+	for (TArray<UEdGraphNode*>& Group : PreferredSemanticGroups)
+	{
+		Group.Sort(
+			[&NodesByObject](const UEdGraphNode& Left, const UEdGraphNode& Right)
+			{
+				const FAdapterNodeRecord* const* LeftRecord = NodesByObject.Find(&Left);
+				const FAdapterNodeRecord* const* RightRecord = NodesByObject.Find(&Right);
+				return LeftRecord != nullptr && RightRecord != nullptr ? (*LeftRecord)->Key < (*RightRecord)->Key
+																	   : Left.GetName() < Right.GetName();
+			}
+		);
+	}
+
+	// Equal translations are a second safe atomic unit for data-only islands and for a paragraph
+	// whose full semantic target is rejected by a data-wire constraint.
+	TMap<FString, TArray<UEdGraphNode*>> PreferredTranslationGroups;
+	for (const FAdapterNodeRecord& Node : ReadabilityContext.AuthoredNodes)
+	{
+		const FVector2D* PreferredPosition = MonotonicPreferredPositions.Find(Node.Node);
+		if (Node.Node == nullptr || Node.Node->IsA<UK2Node_Knot>() || PreferredPosition == nullptr) { continue; }
+		const FVector2D Delta = *PreferredPosition - Node.OriginalPosition;
+		const FString TranslationKey =
+			FString::Printf(TEXT("%d:%d"), FMath::RoundToInt(Delta.X), FMath::RoundToInt(Delta.Y));
+		PreferredTranslationGroups.FindOrAdd(TranslationKey).Add(Node.Node);
+	}
+	TArray<FString> PreferredTranslationKeys;
+	PreferredTranslationGroups.GetKeys(PreferredTranslationKeys);
+	PreferredTranslationKeys.Sort();
+	for (int32 Pass = 0; Pass < MaximumFallbackPasses; ++Pass)
+	{
+		bool bMovedInPass = false;
+		for (const TArray<UEdGraphNode*>& Group : PreferredSemanticGroups)
+		{
+			if (Group.Num() > 1) { bMovedInPass |= TryImprovingPositions(Group, MonotonicPreferredPositions); }
+		}
+		for (const FString& TranslationKey : PreferredTranslationKeys)
+		{
+			const TArray<UEdGraphNode*>& Group = PreferredTranslationGroups.FindChecked(TranslationKey);
+			if (Group.Num() > 1) { bMovedInPass |= TryImprovingPositions(Group, MonotonicPreferredPositions); }
+		}
+		if (!bMovedInPass) { break; }
+	}
+
+	// Solve each accepted execution paragraph to its transitive fixed point and admit that result
+	// atomically. Moving A after A->B was checked can otherwise make B->C safe only on the next
+	// formatter click, and moving one node at a time can temporarily create a wire-under-node defect
+	// that the complete paragraph position does not contain.
+	for (const TArray<UEdGraphNode*>& Group : PreferredSemanticGroups)
+	{
+		if (Group.Num() <= 1) { continue; }
+		TSet<const UEdGraphNode*> GroupNodes;
+		TMap<UEdGraphNode*, FVector2D> FixedPointPositions;
+		for (UEdGraphNode* Node : Group)
+		{
+			const FVector2D* Position = Result.Positions.Find(Node);
+			if (Node != nullptr && Position != nullptr)
+			{
+				GroupNodes.Add(Node);
+				FixedPointPositions.Add(Node, *Position);
+			}
+		}
+
+		bool bChanged = false;
+		for (int32 Pass = 0; Pass < Group.Num(); ++Pass)
+		{
+			bool bChangedInPass = false;
+			for (const FAdapterEdgeRecord& Edge : LayoutEdges)
+			{
+				if (!Edge.bExecution || !Edge.bPreferredAlignment || Edge.OutputPin == nullptr || Edge.InputPin == nullptr)
+				{
+					continue;
+				}
+				UEdGraphNode* Source = Edge.OutputPin->GetOwningNodeUnchecked();
+				UEdGraphNode* Target = Edge.InputPin->GetOwningNodeUnchecked();
+				if (!GroupNodes.Contains(Source) || !GroupNodes.Contains(Target) || Source->IsA<UK2Node_Knot>()
+					|| Target->IsA<UK2Node_Knot>())
+				{
+					continue;
+				}
+				const FAdapterNodeRecord* const* SourceRecord = NodesByObject.Find(Source);
+				const FAdapterNodeRecord* const* TargetRecord = NodesByObject.Find(Target);
+				FVector2D* SourcePosition = FixedPointPositions.Find(Source);
+				FVector2D* TargetPosition = FixedPointPositions.Find(Target);
+				const FAdapterPinRecord* OutputPin = ReadabilityContext.PinRecords.Find(Edge.OutputPin);
+				const FAdapterPinRecord* InputPin = ReadabilityContext.PinRecords.Find(Edge.InputPin);
+				if (SourceRecord == nullptr || TargetRecord == nullptr || SourcePosition == nullptr
+					|| TargetPosition == nullptr || OutputPin == nullptr || InputPin == nullptr
+					|| (*TargetRecord)->OriginalPosition.X <= (*SourceRecord)->OriginalPosition.X)
+				{
+					continue;
+				}
+
+				double SourceColumnRight = SourcePosition->X + (*SourceRecord)->Size.X;
+				for (const FAdapterNodeRecord& ColumnNode : ReadabilityContext.AuthoredNodes)
+				{
+					const FVector2D* ColumnPosition = FixedPointPositions.Find(ColumnNode.Node);
+					if (ColumnPosition == nullptr) { ColumnPosition = Result.Positions.Find(ColumnNode.Node); }
+					if (ColumnPosition != nullptr
+						&& FMath::IsNearlyEqual(ColumnPosition->X, SourcePosition->X, ReadabilityEpsilon))
+					{
+						SourceColumnRight = FMath::Max(SourceColumnRight, ColumnPosition->X + ColumnNode.Size.X);
+					}
+				}
+				const double UnsnappedTargetX = FMath::Max(
+					SourceColumnRight + ReadabilityContext.LayoutCellSize,
+					SourcePosition->X + OutputPin->Offset.X + ReadabilityContext.LayoutCellSize - InputPin->Offset.X
+				);
+				const double RequiredTargetX = FMath::CeilToDouble(UnsnappedTargetX / ReadabilityContext.LayoutCellSize)
+											 * ReadabilityContext.LayoutCellSize;
+				const double AlignedTargetY = SourcePosition->Y + OutputPin->Offset.Y - InputPin->Offset.Y;
+				if (TargetPosition->X + ReadabilityEpsilon < RequiredTargetX
+					|| !FMath::IsNearlyEqual(TargetPosition->Y, AlignedTargetY, ReadabilityEpsilon))
+				{
+					TargetPosition->X = FMath::Max(TargetPosition->X, RequiredTargetX);
+					TargetPosition->Y = AlignedTargetY;
+					bChangedInPass = true;
+					bChanged = true;
+				}
+			}
+			if (!bChangedInPass) { break; }
+		}
+		if (bChanged) { TryImprovingPositions(Group, FixedPointPositions); }
+	}
+
+	// Semantic snapping/gutter changes can make a reroute alignment safe, while anchoring a reroute
+	// can in turn make a previously rejected semantic snap or gutter safe. Solve both layers as one
+	// bounded fixed point so those dependent corrections do not leak into a second formatter click.
+	FString DeferredRerouteRejectionDiagnostic;
+	constexpr int32 MaximumRerouteReconciliationPasses = 4;
+	for (int32 ReconciliationPass = 0; ReconciliationPass < MaximumRerouteReconciliationPasses; ++ReconciliationPass)
+	{
+		DeferredRerouteRejectionDiagnostic.Reset();
+		const TMap<UEdGraphNode*, FVector2D> PositionsBeforeReconciliation = Result.Positions;
+		for (int32 Pass = 0; Pass < MaximumFallbackPasses; ++Pass)
+		{
+			bool bMovedInPass = false;
+			for (const FAdapterNodeRecord& Node : ReadabilityContext.AuthoredNodes)
+			{
+				if (Node.Node == nullptr || Node.Node->IsA<UK2Node_Knot>()) { continue; }
+				const FVector2D* Position = Result.Positions.Find(Node.Node);
+				if (Position == nullptr) { continue; }
+				const FVector2D GridPosition(FMath::GridSnap(Position->X, ReadabilityContext.LayoutCellSize), Position->Y);
+				bMovedInPass |= TryPosition(*Node.Node, GridPosition);
+			}
+
+			for (const FAdapterEdgeRecord& Edge : LayoutEdges)
+			{
+				if (!Edge.bExecution || !Edge.bPreferredAlignment || Edge.OutputPin == nullptr || Edge.InputPin == nullptr)
+				{
+					continue;
+				}
+				UEdGraphNode* Source = Edge.OutputPin->GetOwningNodeUnchecked();
+				UEdGraphNode* Target = Edge.InputPin->GetOwningNodeUnchecked();
+				if (Source == nullptr || Target == nullptr || Source->IsA<UK2Node_Knot>() || Target->IsA<UK2Node_Knot>())
+				{
+					continue;
+				}
+				const FAdapterNodeRecord* const* SourceRecord = NodesByObject.Find(Source);
+				const FAdapterNodeRecord* const* TargetRecord = NodesByObject.Find(Target);
+				const FVector2D* SourcePosition = Result.Positions.Find(Source);
+				const FVector2D* TargetPosition = Result.Positions.Find(Target);
+				if (SourceRecord == nullptr || TargetRecord == nullptr || SourcePosition == nullptr || TargetPosition == nullptr
+					|| (*TargetRecord)->OriginalPosition.X <= (*SourceRecord)->OriginalPosition.X)
+				{
+					continue;
+				}
+
+				double SourceColumnRight = SourcePosition->X + (*SourceRecord)->Size.X;
+				for (const FAdapterNodeRecord& ColumnNode : ReadabilityContext.AuthoredNodes)
+				{
+					const FVector2D* ColumnPosition = Result.Positions.Find(ColumnNode.Node);
+					if (ColumnPosition != nullptr
+						&& FMath::IsNearlyEqual(ColumnPosition->X, SourcePosition->X, ReadabilityEpsilon))
+					{
+						SourceColumnRight = FMath::Max(SourceColumnRight, ColumnPosition->X + ColumnNode.Size.X);
+					}
+				}
+
+				const FAdapterPinRecord* OutputPin = ReadabilityContext.PinRecords.Find(Edge.OutputPin);
+				const FAdapterPinRecord* InputPin = ReadabilityContext.PinRecords.Find(Edge.InputPin);
+				double UnsnappedTargetX = SourceColumnRight + ReadabilityContext.LayoutCellSize;
+				if (OutputPin != nullptr && InputPin != nullptr)
+				{
+					UnsnappedTargetX = FMath::Max(
+						UnsnappedTargetX,
+						SourcePosition->X + OutputPin->Offset.X + ReadabilityContext.LayoutCellSize - InputPin->Offset.X
+					);
+				}
+				const double RequiredTargetX = FMath::CeilToDouble(UnsnappedTargetX / ReadabilityContext.LayoutCellSize)
+											 * ReadabilityContext.LayoutCellSize;
+				const double FinalTargetX = FMath::Max(TargetPosition->X, RequiredTargetX);
+				bool bMovedTarget = false;
+				if (OutputPin != nullptr && InputPin != nullptr)
+				{
+					const double StraightExecutionY = SourcePosition->Y + OutputPin->Offset.Y - InputPin->Offset.Y;
+					bMovedTarget = TryPosition(*Target, FVector2D(FinalTargetX, StraightExecutionY));
+				}
+				if (!bMovedTarget && TargetPosition->X + ReadabilityEpsilon < RequiredTargetX)
+				{
+					bMovedTarget = TryPosition(*Target, FVector2D(RequiredTargetX, TargetPosition->Y))
+								|| TryForwardExecutionShift(*Source, *Target, RequiredTargetX)
+								|| TryRightSideColumnShift(*Target, RequiredTargetX);
+				}
+				bMovedInPass |= bMovedTarget;
+			}
+			if (!bMovedInPass) { break; }
+		}
+
+		const TMap<UEdGraphNode*, FVector2D> RerouteAlignments = BuildAuthoredRerouteColumnAlignments(
+			ReadabilityContext.AuthoredNodes, LayoutEdges, ReadabilityContext.PinRecords, Result.Positions
+		);
+		if (!RerouteAlignments.IsEmpty())
+		{
+			TMap<const UEdGraphNode*, TArray<const UEdGraphNode*>> AlignedKnotNeighbours;
+			for (const FAdapterEdgeRecord& Edge : LayoutEdges)
+			{
+				const UEdGraphNode* Source = Edge.OutputPin != nullptr ? Edge.OutputPin->GetOwningNodeUnchecked() : nullptr;
+				const UEdGraphNode* Target = Edge.InputPin != nullptr ? Edge.InputPin->GetOwningNodeUnchecked() : nullptr;
+				if (RerouteAlignments.Contains(Source) && RerouteAlignments.Contains(Target))
+				{
+					AlignedKnotNeighbours.FindOrAdd(Source).AddUnique(Target);
+					AlignedKnotNeighbours.FindOrAdd(Target).AddUnique(Source);
+				}
+			}
+			TArray<UEdGraphNode*> OrderedAlignedKnots;
+			RerouteAlignments.GetKeys(OrderedAlignedKnots);
+			OrderedAlignedKnots.Sort(
+				[&NodesByObject](const UEdGraphNode& Left, const UEdGraphNode& Right)
+				{
+					const FAdapterNodeRecord* const* LeftRecord = NodesByObject.Find(&Left);
+					const FAdapterNodeRecord* const* RightRecord = NodesByObject.Find(&Right);
+					return LeftRecord != nullptr && RightRecord != nullptr ? (*LeftRecord)->Key < (*RightRecord)->Key
+																		   : Left.GetName() < Right.GetName();
+				}
+			);
+
+			TSet<const UEdGraphNode*> VisitedAlignedKnots;
+			for (UEdGraphNode* Start : OrderedAlignedKnots)
+			{
+				if (VisitedAlignedKnots.Contains(Start)) { continue; }
+				TArray<UEdGraphNode*> ChainGroup;
+				TArray<const UEdGraphNode*> Pending{ Start };
+				for (int32 PendingIndex = 0; PendingIndex < Pending.Num(); ++PendingIndex)
+				{
+					const UEdGraphNode* Knot = Pending[PendingIndex];
+					if (Knot == nullptr || VisitedAlignedKnots.Contains(Knot)) { continue; }
+					VisitedAlignedKnots.Add(Knot);
+					ChainGroup.Add(const_cast<UEdGraphNode*>(Knot));
+					if (const TArray<const UEdGraphNode*>* Neighbours = AlignedKnotNeighbours.Find(Knot))
+					{
+						Pending.Append(*Neighbours);
+					}
+				}
+				TryReroutePositions(ChainGroup, RerouteAlignments);
+			}
+
+			// If one member makes a chain-level alignment unsafe, retain every independently safe
+			// endpoint/column instead of rolling back all authored reroutes in the graph.
+			for (int32 Pass = 0; Pass < MaximumFallbackPasses; ++Pass)
+			{
+				bool bMovedInPass = false;
+				for (UEdGraphNode* Knot : OrderedAlignedKnots)
+				{
+					bMovedInPass |= TryReroutePosition(*Knot, RerouteAlignments.FindChecked(Knot));
+				}
+				if (!bMovedInPass) { break; }
+			}
+
+			int32 RejectedAlignmentCount = 0;
+			FString FirstRejection;
+			for (UEdGraphNode* Knot : OrderedAlignedKnots)
+			{
+				const FVector2D* Position = Result.Positions.Find(Knot);
+				if (Position == nullptr || Position->Equals(RerouteAlignments.FindChecked(Knot), ReadabilityEpsilon))
+				{
+					continue;
+				}
+				++RejectedAlignmentCount;
+				if (FirstRejection.IsEmpty()) { FirstRejection = LastRejectedMoves.FindRef(Knot); }
+			}
+			if (RejectedAlignmentCount > 0)
+			{
+				DeferredRerouteRejectionDiagnostic = FString::Printf(
+					TEXT("Kept %d authored reroute column(s) because %s."),
+					RejectedAlignmentCount,
+					FirstRejection.IsEmpty() ? TEXT("their pin alignment was not readability-safe") : *FirstRejection
+				);
+			}
+		}
+		bool bMovedInReconciliation = PositionsBeforeReconciliation.Num() != Result.Positions.Num();
+		if (!bMovedInReconciliation)
+		{
+			for (const TPair<UEdGraphNode*, FVector2D>& Position : Result.Positions)
+			{
+				const FVector2D* PreviousPosition = PositionsBeforeReconciliation.Find(Position.Key);
+				if (PreviousPosition == nullptr || !PreviousPosition->Equals(Position.Value, ReadabilityEpsilon))
+				{
+					bMovedInReconciliation = true;
+					break;
+				}
+			}
+		}
+		if (!bMovedInReconciliation) { break; }
+	}
+	if (!DeferredRerouteRejectionDiagnostic.IsEmpty())
+	{
+		Result.Diagnostics.Add(MoveTemp(DeferredRerouteRejectionDiagnostic));
+	}
+
+	for (const FAdapterNodeRecord& Node : ReadabilityContext.AuthoredNodes)
+	{
+		if (Result.Diagnostics.Num() >= 8 || Node.Node == nullptr || Node.Node->IsA<UK2Node_Knot>()) { continue; }
+		const FVector2D* Position = Result.Positions.Find(Node.Node);
+		const FString* Rejection = LastRejectedMoves.Find(Node.Node);
+		if (Position == nullptr || Rejection == nullptr) { continue; }
+		const double GridX = FMath::GridSnap(Position->X, ReadabilityContext.LayoutCellSize);
+		if (!FMath::IsNearlyEqual(Position->X, GridX, ReadabilityEpsilon))
+		{
 			Result.Diagnostics.Add(
-				FString::Printf(TEXT("Kept authored reroute columns because pin alignment would cause %s."), *Trial.Regression)
+				FString::Printf(
+					TEXT("Could not align '%s' from X %.0f to major-grid X %.0f because %s."),
+					*Node.Node->GetName(),
+					Position->X,
+					GridX,
+					**Rejection
+				)
 			);
 		}
 	}
@@ -1497,7 +2670,8 @@ FConservativeFallbackResult BuildConservativeFallback(
 		const FAdapterNodeRecord* const* SourceRecord = NodesByObject.Find(Source);
 		const FVector2D* SourcePosition = Result.Positions.Find(Source);
 		const FVector2D* TargetPosition = Result.Positions.Find(Target);
-		const FString* Rejection = LastRejectedMoves.Find(Target);
+		const FString* Rejection = LastForwardExecutionShiftRejections.Find(Target);
+		if (Rejection == nullptr) { Rejection = LastRejectedMoves.Find(Target); }
 		if (SourceRecord == nullptr || SourcePosition == nullptr || TargetPosition == nullptr || Rejection == nullptr)
 		{
 			continue;
@@ -1511,6 +2685,71 @@ FConservativeFallbackResult BuildConservativeFallback(
 		}
 	}
 	return Result;
+}
+
+[[nodiscard]]
+FConservativeFallbackResult BuildConvergedConservativeFallback(
+	const FReadabilityEvaluationContext& OriginalContext,
+	TConstArrayView<FAdapterEdgeRecord> LayoutEdges,
+	const TMap<UEdGraphNode*, FVector2D>& PreferredPositions
+)
+{
+	FConservativeFallbackResult Combined = BuildConservativeFallback(OriginalContext, LayoutEdges, PreferredPositions);
+	if (Combined.Readability.bWorkBudgetExhausted) { return Combined; }
+
+	// The safe subset admitted by one fallback pass can make another grid or execution-gutter
+	// correction safe. Model those subsequent formatter clicks in memory, but only retain a
+	// combined result that still passes the original graph-wide safety baseline. This reaches a
+	// fixed point in one transaction without allowing per-pass regressions to accumulate.
+	constexpr int32 MaximumRefinementPasses = 4;
+	for (int32 Pass = 0; Pass < MaximumRefinementPasses; ++Pass)
+	{
+		TArray<FAdapterNodeRecord> RefinementReadabilityNodes;
+		RefinementReadabilityNodes.Reserve(OriginalContext.ReadabilityNodes.Num());
+		for (const FAdapterNodeRecord& Node : OriginalContext.ReadabilityNodes)
+		{
+			FAdapterNodeRecord& Copy = RefinementReadabilityNodes.Add_GetRef(Node);
+			if (const FVector2D* Position = Combined.Positions.Find(Copy.Node)) { Copy.OriginalPosition = *Position; }
+		}
+
+		TArray<FAdapterNodeRecord> RefinementAuthoredNodes;
+		RefinementAuthoredNodes.Reserve(OriginalContext.AuthoredNodes.Num());
+		for (const FAdapterNodeRecord& Node : OriginalContext.AuthoredNodes)
+		{
+			FAdapterNodeRecord& Copy = RefinementAuthoredNodes.Add_GetRef(Node);
+			if (const FVector2D* Position = Combined.Positions.Find(Copy.Node)) { Copy.OriginalPosition = *Position; }
+		}
+
+		const FReadabilityEvaluationContext RefinementContext{
+			RefinementReadabilityNodes,
+			RefinementAuthoredNodes,
+			OriginalContext.Edges,
+			OriginalContext.PinRecords,
+			Combined.Positions,
+			Combined.Readability,
+			OriginalContext.WorkBudget,
+			OriginalContext.LayoutCellSize,
+			OriginalContext.bPreserveHumanLayout,
+		};
+		FConservativeFallbackResult Refined = BuildConservativeFallback(RefinementContext, LayoutEdges, PreferredPositions);
+		if (Refined.MovedNodeCount == 0 || Refined.Readability.bWorkBudgetExhausted) { break; }
+
+		FCandidateReadabilityEvaluation CombinedEvaluation =
+			EvaluateReadabilityCandidate(OriginalContext, Refined.Positions, false, true);
+		if (!CombinedEvaluation.Regression.IsEmpty() || CombinedEvaluation.Metrics.bWorkBudgetExhausted) { break; }
+
+		Combined.Positions = MoveTemp(Refined.Positions);
+		Combined.Readability = MoveTemp(CombinedEvaluation.Metrics);
+	}
+
+	Combined.MovedNodeCount = 0;
+	for (const FAdapterNodeRecord& Node : OriginalContext.AuthoredNodes)
+	{
+		const FVector2D* Position = Combined.Positions.Find(Node.Node);
+		Combined.MovedNodeCount +=
+			Position != nullptr && !Position->Equals(Node.OriginalPosition, ReadabilityEpsilon) ? 1 : 0;
+	}
+	return Combined;
 }
 
 [[nodiscard]]
@@ -1807,7 +3046,15 @@ FK2FormatResult FK2GraphFormatter::FormatInternal(
 			*MakeStableNodeKey(Graph, *InputNode),
 			*MakeStablePinKey(*CandidateRoute.InputPin, InputPinIndex)
 		);
-		if (ExpectedKey != LogicalEdgeKey)
+		const FString LegacyExpectedKey = FString::Printf(
+			TEXT("%s:%s/%s->%s/%s"),
+			bExecution ? TEXT("E") : TEXT("D"),
+			*MakeLegacyStableNodeKey(Graph, *OutputNode),
+			*MakeLegacyStablePinKey(*CandidateRoute.OutputPin, OutputPinIndex),
+			*MakeLegacyStableNodeKey(Graph, *InputNode),
+			*MakeLegacyStablePinKey(*CandidateRoute.InputPin, InputPinIndex)
+		);
+		if (ExpectedKey != LogicalEdgeKey && LegacyExpectedKey != LogicalEdgeKey)
 		{
 			Result.Diagnostics.Add(
 				FString::Printf(TEXT("Ignored generated reroute chain with stale identity '%s'."), *LogicalEdgeKey)
@@ -1819,7 +3066,9 @@ FK2FormatResult FK2GraphFormatter::FormatInternal(
 		{
 			ValidatedGeneratedKnots.Add(Knot);
 		}
-		ValidatedGeneratedRoutes.Add(LogicalEdgeKey, MoveTemp(CandidateRoute));
+		// Normalize legacy metadata to the deterministic key in memory. Existing knots remain
+		// untouched; if the route is ever rebuilt, the router writes the new identity.
+		ValidatedGeneratedRoutes.Add(ExpectedKey, MoveTemp(CandidateRoute));
 	}
 
 	TArray<FAdapterNodeRecord> NodeRecords;
@@ -2312,6 +3561,54 @@ FK2FormatResult FK2GraphFormatter::FormatInternal(
 													 : K2Layout::ELayoutMode::Reflow;
 
 	K2Layout::FLayoutPlan LayoutPlan = K2Layout::BuildLayout(LayoutSnapshot, LayoutSettings);
+	if (bPreserveHumanLayout && !LayoutPlan.HasErrors() && LayoutPlan.Nodes.Num() == LayoutSnapshot.Nodes.Num())
+	{
+		// BuildLayout is pure, so refine the authored snapshot in memory until it reaches the same
+		// fixed point a user would otherwise get by clicking Format Graph repeatedly. This is
+		// especially important for provider placement: moving its consumer can change which
+		// collision-free shelf is preferred on the next invocation.
+		constexpr int32 MaximumAuthoredRefinementPasses = 8;
+		for (int32 Pass = 0; Pass < MaximumAuthoredRefinementPasses; ++Pass)
+		{
+			TMap<FString, FVector2D> CurrentPositionsByKey;
+			for (const K2Layout::FPlannedNodePosition& PlannedNode : LayoutPlan.Nodes)
+			{
+				CurrentPositionsByKey.Add(PlannedNode.Node.Value, PlannedNode.Position);
+			}
+
+			K2Layout::FGraphSnapshot RefinedSnapshot = LayoutSnapshot;
+			bool bCompleteSnapshot = true;
+			for (K2Layout::FNodeSnapshot& Node : RefinedSnapshot.Nodes)
+			{
+				const FVector2D* Position = CurrentPositionsByKey.Find(Node.Key.Value);
+				if (Position == nullptr)
+				{
+					bCompleteSnapshot = false;
+					break;
+				}
+				Node.OriginalPosition = *Position;
+				Node.bHasOriginalPosition = true;
+			}
+			if (!bCompleteSnapshot) { break; }
+
+			K2Layout::FLayoutPlan RefinedPlan = K2Layout::BuildLayout(RefinedSnapshot, LayoutSettings);
+			if (RefinedPlan.HasErrors() || RefinedPlan.Nodes.Num() != LayoutPlan.Nodes.Num()) { break; }
+
+			bool bPositionsChanged = false;
+			for (const K2Layout::FPlannedNodePosition& PlannedNode : RefinedPlan.Nodes)
+			{
+				const FVector2D* PreviousPosition = CurrentPositionsByKey.Find(PlannedNode.Node.Value);
+				if (PreviousPosition == nullptr || !PreviousPosition->Equals(PlannedNode.Position, ReadabilityEpsilon))
+				{
+					bPositionsChanged = true;
+					break;
+				}
+			}
+			LayoutSnapshot = MoveTemp(RefinedSnapshot);
+			LayoutPlan = MoveTemp(RefinedPlan);
+			if (!bPositionsChanged) { break; }
+		}
+	}
 	for (const K2Layout::FLayoutDiagnostic& Diagnostic : LayoutPlan.Diagnostics)
 	{
 		Result.Diagnostics.Add(Diagnostic.Message);
@@ -2654,7 +3951,8 @@ FK2FormatResult FK2GraphFormatter::FormatInternal(
 	bool bUsedConservativeFallback = false;
 	if (bPrimaryLayoutRejected && bPreserveHumanLayout)
 	{
-		const FConservativeFallbackResult Fallback = BuildConservativeFallback(ReadabilityContext, EdgeRecords);
+		const FConservativeFallbackResult Fallback =
+			BuildConvergedConservativeFallback(ReadabilityContext, EdgeRecords, CandidateReadabilityPositions);
 		if ((Fallback.MovedNodeCount > 0 || bRouteWires) && !Fallback.Readability.bWorkBudgetExhausted)
 		{
 			bUsedConservativeFallback = true;
@@ -3089,7 +4387,7 @@ FK2FormatResult FK2GraphFormatter::FormatInternal(
 			if (ReadabilityEdge != nullptr) { ReadabilityEdge->PlannedRouteWaypoints = PlannedRoute.Waypoints; }
 		}
 
-		CandidateEvaluation = EvaluateReadabilityCandidate(ReadabilityContext, CandidateReadabilityPositions, true);
+		CandidateEvaluation = EvaluateReadabilityCandidate(ReadabilityContext, CandidateReadabilityPositions, true, true);
 		CandidateReadability = CandidateEvaluation.Metrics;
 		ReadabilityRegression = CandidateEvaluation.Regression;
 		if (!ReadabilityRegression.IsEmpty())

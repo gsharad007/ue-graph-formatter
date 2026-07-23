@@ -6,6 +6,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "UObject/WeakObjectPtr.h"
 
 class UEdGraph;
 class UEdGraphNode;
@@ -36,6 +37,8 @@ struct FRerouteEdge
 	FString StableKey;
 	/** Optional engine-independent layout-core route, excluding the two real pin anchors. */
 	TArray<FVector2D> PreferredWaypoints;
+	/** Validate the preferred polyline exactly; do not silently replace an unsafe external proposal with a native route. */
+	bool bValidatePreferredWaypointsOnly = false;
 	int32 RankSpan = 0;
 	bool bExecution = false;
 	/** Stock Kismet reverses endpoint tangents when a user knot points back toward its input side. */
@@ -68,6 +71,8 @@ struct FPlannedReroute
 struct FReroutePlan
 {
 	TArray<FPlannedReroute> Routes;
+	/** Stable keys whose direct baseline had a routing defect, even when no safe route was found. */
+	TArray<FString> RequiredRouteKeys;
 	int32 SkippedWires = 0;
 	bool bPlanningBudgetExhausted = false;
 	TArray<FString> Diagnostics;

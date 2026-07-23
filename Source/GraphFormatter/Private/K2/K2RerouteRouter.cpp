@@ -911,40 +911,44 @@ TArray<FVector2D> BuildRoute(
 
 	if (bHasPreferredRoute) { ConsiderCandidate(MoveTemp(PreferredRoute), -1, true); }
 
-	double TerminalStub = Channel;
-	const bool bGeometricallyBackward = Edge.InputAnchor.X <= Edge.OutputAnchor.X;
-	if (!bGeometricallyBackward)
+	if (!Edge.bValidatePreferredWaypointsOnly)
 	{
-		const double HalfAvailableGap = (Edge.InputAnchor.X - Edge.OutputAnchor.X - GridSize) * 0.5;
-		TerminalStub = FMath::Min(Channel, FMath::Max(0.0, FMath::FloorToDouble(HalfAvailableGap / GridSize) * GridSize));
-	}
-	// Preserve the stock Kismet side chosen for user-authored reversed knots. Routing a
-	// reversed endpoint through the ordinary right-output/left-input stubs would make the
-	// rendered spline curl back through its endpoint node and can also change the knot's
-	// reversal after the new neighbor is installed.
-	const double OutputStubDirection = Edge.bReverseOutputTangent ? -1.0 : 1.0;
-	const double InputStubDirection = Edge.bReverseInputTangent ? 1.0 : -1.0;
-	const double BaseOutputChannelX = Snap(Edge.OutputAnchor.X + OutputStubDirection * TerminalStub, GridSize);
-	const double BaseInputChannelX = Snap(Edge.InputAnchor.X + InputStubDirection * TerminalStub, GridSize);
-	const double PortLaneStep = FMath::Max(Channel, Snap(RerouteKnotWidth + Channel, GridSize));
-	const int32 CandidateCount = FMath::Clamp(2 + ReservedRoutes.Num() * 2, 2, MaxChannelCandidateCount);
-	for (int32 CandidateIndex = 0; CandidateIndex < CandidateCount && !Budget.bExhausted; ++CandidateIndex)
-	{
-		const bool bTop = CandidateIndex % 2 == 0;
-		const int32 ChannelRing = CandidateIndex / 2;
-		const double RouteY = bTop ? TopCandidate - ChannelRing * Channel : BottomCandidate + ChannelRing * Channel;
-		const double PortOffset = bGeometricallyBackward ? CandidateIndex * PortLaneStep : 0.0;
-		const double OutputChannelX = BaseOutputChannelX + OutputStubDirection * PortOffset;
-		const double InputChannelX = BaseInputChannelX + InputStubDirection * PortOffset;
-		if (!bGeometricallyBackward && OutputChannelX >= InputChannelX) { continue; }
-		TArray<FVector2D> Candidate;
-		Candidate.Add(Edge.OutputAnchor);
-		Candidate.Add(FVector2D(OutputChannelX, Edge.OutputAnchor.Y));
-		Candidate.Add(FVector2D(OutputChannelX, RouteY));
-		Candidate.Add(FVector2D(InputChannelX, RouteY));
-		Candidate.Add(FVector2D(InputChannelX, Edge.InputAnchor.Y));
-		Candidate.Add(Edge.InputAnchor);
-		ConsiderCandidate(MoveTemp(Candidate), CandidateIndex, false);
+		double TerminalStub = Channel;
+		const bool bGeometricallyBackward = Edge.InputAnchor.X <= Edge.OutputAnchor.X;
+		if (!bGeometricallyBackward)
+		{
+			const double HalfAvailableGap = (Edge.InputAnchor.X - Edge.OutputAnchor.X - GridSize) * 0.5;
+			TerminalStub =
+				FMath::Min(Channel, FMath::Max(0.0, FMath::FloorToDouble(HalfAvailableGap / GridSize) * GridSize));
+		}
+		// Preserve the stock Kismet side chosen for user-authored reversed knots. Routing a
+		// reversed endpoint through the ordinary right-output/left-input stubs would make the
+		// rendered spline curl back through its endpoint node and can also change the knot's
+		// reversal after the new neighbor is installed.
+		const double OutputStubDirection = Edge.bReverseOutputTangent ? -1.0 : 1.0;
+		const double InputStubDirection = Edge.bReverseInputTangent ? 1.0 : -1.0;
+		const double BaseOutputChannelX = Snap(Edge.OutputAnchor.X + OutputStubDirection * TerminalStub, GridSize);
+		const double BaseInputChannelX = Snap(Edge.InputAnchor.X + InputStubDirection * TerminalStub, GridSize);
+		const double PortLaneStep = FMath::Max(Channel, Snap(RerouteKnotWidth + Channel, GridSize));
+		const int32 CandidateCount = FMath::Clamp(2 + ReservedRoutes.Num() * 2, 2, MaxChannelCandidateCount);
+		for (int32 CandidateIndex = 0; CandidateIndex < CandidateCount && !Budget.bExhausted; ++CandidateIndex)
+		{
+			const bool bTop = CandidateIndex % 2 == 0;
+			const int32 ChannelRing = CandidateIndex / 2;
+			const double RouteY = bTop ? TopCandidate - ChannelRing * Channel : BottomCandidate + ChannelRing * Channel;
+			const double PortOffset = bGeometricallyBackward ? CandidateIndex * PortLaneStep : 0.0;
+			const double OutputChannelX = BaseOutputChannelX + OutputStubDirection * PortOffset;
+			const double InputChannelX = BaseInputChannelX + InputStubDirection * PortOffset;
+			if (!bGeometricallyBackward && OutputChannelX >= InputChannelX) { continue; }
+			TArray<FVector2D> Candidate;
+			Candidate.Add(Edge.OutputAnchor);
+			Candidate.Add(FVector2D(OutputChannelX, Edge.OutputAnchor.Y));
+			Candidate.Add(FVector2D(OutputChannelX, RouteY));
+			Candidate.Add(FVector2D(InputChannelX, RouteY));
+			Candidate.Add(FVector2D(InputChannelX, Edge.InputAnchor.Y));
+			Candidate.Add(Edge.InputAnchor);
+			ConsiderCandidate(MoveTemp(Candidate), CandidateIndex, false);
+		}
 	}
 	if (Budget.bExhausted) { return {}; }
 
@@ -1370,7 +1374,6 @@ FReroutePlan FK2RerouteRouter::Plan(
 )
 {
 	FReroutePlan Result;
-	FRoutePlanningBudget PlanningBudget(Settings.PlanningWorkBudget);
 
 	TArray<FRerouteEdge> SortedEdges;
 	SortedEdges.Reserve(Edges.Num());
@@ -1389,6 +1392,21 @@ FReroutePlan FK2RerouteRouter::Plan(
 			return Left.StableKey < Right.StableKey;
 		}
 	);
+	int32 PlanningSlotCount = 0;
+	for (const FRerouteEdge& Edge : SortedEdges)
+	{
+		UEdGraphNode* OutputNode = Edge.OutputPin ? Edge.OutputPin->GetOwningNodeUnchecked() : nullptr;
+		UEdGraphNode* InputNode = Edge.InputPin ? Edge.InputPin->GetOwningNodeUnchecked() : nullptr;
+		if (!Edge.bReservationOnly && OutputNode != nullptr && InputNode != nullptr && Scope.Contains(OutputNode)
+			&& Scope.Contains(InputNode))
+		{
+			// Existing generated routes retain their original planning slot. This prevents their
+			// inexpensive second-pass reservation from donating work to later wires and creating
+			// another route on every formatter invocation.
+			++PlanningSlotCount;
+		}
+	}
+	const int32 PerEdgePlanningBudget = FMath::Max(1, Settings.PlanningWorkBudget / FMath::Max(1, PlanningSlotCount));
 
 	TArray<FReservedRoute> ReservedRoutes;
 	ReservedRoutes.Reserve(SortedEdges.Num() * 2);
@@ -1437,23 +1455,26 @@ FReroutePlan FK2RerouteRouter::Plan(
 
 		bool bRouteRequired = false;
 		FString PlanningFailure;
+		FRoutePlanningBudget PlanningBudget(PerEdgePlanningBudget);
 		TArray<FVector2D> Waypoints = BuildRoute(
 			Edge, Obstacles, ReservedRoutes, Settings, GridSize, PlanningBudget, bRouteRequired, PlanningFailure
 		);
+		if (bRouteRequired) { Result.RequiredRouteKeys.Add(Edge.StableKey); }
 		if (PlanningBudget.bExhausted)
 		{
-			// The current baseline was removed only for planning. Put it back before aborting so the
-			// reservation model remains an exact description of every unchanged wire.
+			// The current baseline was removed only for planning. Restore it and continue with the
+			// next wire's deterministic fair share; one pathological wire must not consume the
+			// entire graph budget or make later passes progressively add routes.
 			ReservedRoutes.Add(MakeReservation(Edge, TConstArrayView<FVector2D>()));
 			Result.bPlanningBudgetExhausted = true;
 			++Result.SkippedWires;
 			Result.Diagnostics.Add(
 				FString::Printf(
-					TEXT("%s: The deterministic routing work budget was exhausted; this wire and all remaining wires were left unchanged."),
+					TEXT("%s: The deterministic per-wire routing work budget was exhausted; this wire was left unchanged."),
 					*Edge.StableKey
 				)
 			);
-			break;
+			continue;
 		}
 		if (Waypoints.IsEmpty())
 		{

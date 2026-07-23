@@ -12,9 +12,13 @@ namespace UnrealBuildTool.Rules
 		public GraphFormatter(ReadOnlyTargetRules Target) : base(Target)
 		{
 			PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
-            PublicIncludePaths.Add(ModuleDirectory);
+			PublicIncludePaths.Add(ModuleDirectory);
+			PrivateIncludePaths.Add(Path.Combine(ModuleDirectory, "Private", "ThirdParty", "BlueprintAutoLayout"));
+			PrivateDefinitions.Add("BLUEPRINTAUTOLAYOUT_API=");
+			PrivateIncludePathModuleNames.Add("GraphFormatterAdaptagrams");
+			DynamicallyLoadedModuleNames.Add("GraphFormatterAdaptagrams");
 
-            PrivateDependencyModuleNames.AddRange(
+			PrivateDependencyModuleNames.AddRange(
 				new string[]
 				{
 					"Core",
@@ -28,6 +32,8 @@ namespace UnrealBuildTool.Rules
 					"Slate",
 					"EditorStyle",
 					"GraphEditor",
+					"Json",
+					"Projects",
 					"BlueprintGraph",
 					"MaterialEditor",
 					"AIModule",

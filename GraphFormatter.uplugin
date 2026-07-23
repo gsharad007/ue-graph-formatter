@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
-	"Version": 5,
-	"VersionName": "3.0.0",
+	"Version": 6,
+	"VersionName": "3.1.0",
 	"FriendlyName": "GraphFormatter",
 	"Description": "Deterministic, execution-first graph layout with readable data grouping, grid alignment, and opt-in K2 reroute generation.",
 	"Category": "Tools",
@@ -20,6 +20,16 @@
 			"Name": "GraphFormatter",
 			"Type": "Editor",
 			"LoadingPhase": "PostEngineInit",
+			"PlatformAllowList": [
+				"Win64",
+				"Mac",
+				"Linux"
+			]
+		},
+		{
+			"Name": "GraphFormatterAdaptagrams",
+			"Type": "Editor",
+			"LoadingPhase": "None",
 			"PlatformAllowList": [
 				"Win64",
 				"Mac",

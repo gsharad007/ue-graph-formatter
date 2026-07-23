@@ -7,6 +7,7 @@
 
 #include "CoreMinimal.h"
 #include "Framework/Commands/Commands.h"
+#include "Styling/ISlateStyle.h"
 #include "FormatterStyle.h"
 
 class FFormatterCommands : public TCommands<FFormatterCommands>
@@ -24,6 +25,8 @@ public:
 
 	TSharedPtr<FUICommandInfo> FormatGraph;
 	TSharedPtr<FUICommandInfo> FormatGraphWithRouting;
+	// Runs only against transient Blueprint copies; the active graph remains untouched.
+	TSharedPtr<FUICommandInfo> CompareFormatters;
 	TSharedPtr<FUICommandInfo> StraightenConnections;
 	TSharedPtr<FUICommandInfo> PlaceBlock;
 	virtual void RegisterCommands() override;

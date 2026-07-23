@@ -25,6 +25,14 @@ void FFormatterCommands::RegisterCommands()
 		FInputChord()
 	);
 	UI_COMMAND(
+		CompareFormatters,
+		"Compare A/B/C/D",
+		"Open a blinded, source-preserving comparison between GraphFormatter, Blueprint Auto Layout, "
+		"Adaptagrams/libavoid, and ELK Layered",
+		EUserInterfaceActionType::Button,
+		FInputChord()
+	);
+	UI_COMMAND(
 		StraightenConnections,
 		"Flat Spline Rendering",
 		"Toggle Unreal's global zero-tangent spline rendering; this does not move nodes or route wires",

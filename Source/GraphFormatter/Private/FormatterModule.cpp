@@ -8,6 +8,7 @@
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
+#include "EdGraphSchema_K2.h"
 #include "Editor.h"
 #include "Framework/Commands/UICommandList.h"
 #include "Framework/Docking/TabManager.h"
@@ -16,6 +17,7 @@
 #include "GraphEditorSettings.h"
 #include "ISettingsModule.h"
 #include "Modules/ModuleManager.h"
+#include "Misc/MessageDialog.h"
 #include "SGraphPanel.h"
 #include "Subsystems/AssetEditorSubsystem.h"
 #include "Toolkits/AssetEditorToolkit.h"
@@ -26,6 +28,7 @@
 #include "Widgets/Text/STextBlock.h"
 
 #include "Formatter.h"
+#include "Benchmark/GraphFormatterBenchmark.h"
 #include "FormatterCommands.h"
 #include "FormatterLog.h"
 #include "FormatterSettings.h"
@@ -213,6 +216,15 @@ bool CanExecuteGraphCommand(const TSharedPtr<const FFormatterCommandContext> Con
 		&& IsGraphTargetEditable(Editor);
 }
 
+bool CanExecuteBenchmarkCommand(const TSharedPtr<const FFormatterCommandContext> Context)
+{
+	SGraphEditor* Editor = nullptr;
+	UObject* Object = nullptr;
+	const UEdGraph* Graph = ResolveGraphTarget(Context, Editor, Object) ? Editor->GetCurrentGraph() : nullptr;
+	return Graph != nullptr && IsFormattingEnabledForObject(Object) && IsGraphTargetEditable(Editor)
+		&& Cast<UEdGraphSchema_K2>(Graph->GetSchema()) != nullptr;
+}
+
 void RecordDetectedGraphEditor(UObject* Object)
 {
 	if (Object == nullptr) { return; }
@@ -249,6 +261,20 @@ void ExecutePlaceBlock(const TSharedPtr<const FFormatterCommandContext> Context)
 
 	PrepareGraphCommand(Object, Editor);
 	FFormatter::Instance().PlaceBlock();
+}
+
+void ExecuteCompareFormatters(const TSharedPtr<const FFormatterCommandContext> Context)
+{
+	SGraphEditor* Editor = nullptr;
+	UObject* Object = nullptr;
+	if (!ResolveGraphTarget(Context, Editor, Object) || Editor == nullptr || Object == nullptr) { return; }
+
+	FString Error;
+	if (!GraphFormatter::Benchmark::FGraphFormatterBenchmark::Open(*Editor, *Object, Error))
+	{
+		UE_LOG(LogGraphFormatter, Warning, TEXT("Could not start formatter comparison: %s"), *Error);
+		FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(Error));
+	}
 }
 
 bool IsStraightenConnectionsEnabled()
@@ -335,6 +361,14 @@ void FillToolbar(FToolBarBuilder& ToolbarBuilder)
 		TAttribute<FText>(),
 		FSlateIcon(FFormatterStyle::Get()->GetStyleSetName(), "GraphFormatter.ApplyIcon"),
 		TEXT("GraphFormatterRoute")
+	);
+	ToolbarBuilder.AddToolBarButton(
+		Commands.CompareFormatters,
+		NAME_None,
+		TAttribute<FText>(),
+		TAttribute<FText>(),
+		FSlateIcon(FFormatterStyle::Get()->GetStyleSetName(), "GraphFormatter.ApplyIcon"),
+		TEXT("GraphFormatterCompare")
 	);
 
 	ToolbarBuilder.AddWidget(
@@ -424,6 +458,11 @@ TSharedRef<FExtender> CreateToolbarExtender(const TSharedRef<FUICommandList> Com
 		FCanExecuteAction::CreateStatic(&CanExecuteGraphCommand, SharedContext)
 	);
 	CommandList->MapAction(
+		Commands.CompareFormatters,
+		FExecuteAction::CreateStatic(&ExecuteCompareFormatters, SharedContext),
+		FCanExecuteAction::CreateStatic(&CanExecuteBenchmarkCommand, SharedContext)
+	);
+	CommandList->MapAction(
 		Commands.PlaceBlock,
 		FExecuteAction::CreateStatic(&ExecutePlaceBlock, SharedContext),
 		FCanExecuteAction::CreateStatic(&CanExecuteGraphCommand, SharedContext)
@@ -472,6 +511,7 @@ void UnmapCommands()
 		{
 			CommandList->UnmapAction(Commands.FormatGraph);
 			CommandList->UnmapAction(Commands.FormatGraphWithRouting);
+			CommandList->UnmapAction(Commands.CompareFormatters);
 			CommandList->UnmapAction(Commands.PlaceBlock);
 			CommandList->UnmapAction(Commands.StraightenConnections);
 		}

@@ -1122,7 +1122,7 @@ bool FK2LayoutPreservedEventIslandAnchorsTest::RunTest(const FString& Parameters
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FK2LayoutPreservedStartColumnScopeTest,
-	"Project.Unit Tests.GraphFormatter.K2Layout.Preservation.StartColumnClusteringIsConservative",
+	"Project.Unit Tests.GraphFormatter.K2Layout.Preservation.ExecutionRootsShareScopeWideStartColumn",
 	EAutomationTestFlags::ProductFilter | EAutomationTestFlags::EditorContext
 )
 
@@ -1152,8 +1152,8 @@ bool FK2LayoutPreservedStartColumnScopeTest::RunTest(const FString& Parameters)
 
 	TestFalse(TEXT("the start-column scope graph is valid"), Plan.HasErrors());
 	TestTrue(
-		TEXT("execution roots authored one full coarse cell apart retain distinct columns"),
-		FMath::IsNearlyEqual(FirstEventRoot->Position.X, 100.0, PositionTolerance)
+		TEXT("all execution roots share the scope-wide median major-grid column"),
+		FMath::IsNearlyEqual(FirstEventRoot->Position.X, 150.0, PositionTolerance)
 			&& FMath::IsNearlyEqual(SecondEventRoot->Position.X, 150.0, PositionTolerance)
 	);
 	TestTrue(

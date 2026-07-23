@@ -1061,17 +1061,18 @@ bool FK2ReroutePlanningBudgetTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("the dense pass reports planning-budget exhaustion"), CanonicalResult.bPlanningBudgetExhausted);
 	TestEqual(TEXT("budget exhaustion installs no routes"), CanonicalResult.RoutedWires, 0);
 	TestEqual(TEXT("budget exhaustion creates no knots"), CanonicalResult.CreatedKnots, 0);
-	TestEqual(TEXT("the wire where bounded planning stops is reported as skipped"), CanonicalResult.SkippedWires, 1);
-	TestEqual(TEXT("budget exhaustion emits one deterministic diagnostic"), CanonicalResult.Diagnostics.Num(), 1);
-	if (CanonicalResult.Diagnostics.Num() == 1)
+	TestTrue(TEXT("every wire that exhausts its fair share is reported as skipped"), CanonicalResult.SkippedWires > 0);
+	TestEqual(
+		TEXT("every exhausted fair share emits one deterministic diagnostic"),
+		CanonicalResult.Diagnostics.Num(),
+		CanonicalResult.SkippedWires
+	);
+	for (const FString& Diagnostic : CanonicalResult.Diagnostics)
 	{
+		TestTrue(TEXT("each diagnostic identifies its deterministic dense edge"), Diagnostic.Contains(TEXT("Dense.")));
 		TestTrue(
-			TEXT("the diagnostic identifies the deterministic dense edge where work stopped"),
-			CanonicalResult.Diagnostics[0].Contains(TEXT("Dense."))
-		);
-		TestTrue(
-			TEXT("the diagnostic identifies work-budget exhaustion"),
-			CanonicalResult.Diagnostics[0].Contains(TEXT("work budget was exhausted"))
+			TEXT("each diagnostic identifies work-budget exhaustion"),
+			Diagnostic.Contains(TEXT("work budget was exhausted"))
 		);
 	}
 	for (int32 Index = 0; Index < CanonicalFixture.Sources.Num(); ++Index)
@@ -1092,13 +1093,16 @@ bool FK2ReroutePlanningBudgetTest::RunTest(const FString& Parameters)
 		ReversedResult.Diagnostics.Num(),
 		CanonicalResult.Diagnostics.Num()
 	);
-	if (ReversedResult.Diagnostics.Num() == 1 && CanonicalResult.Diagnostics.Num() == 1)
+	if (ReversedResult.Diagnostics.Num() == CanonicalResult.Diagnostics.Num())
 	{
-		TestEqual(
-			TEXT("budget diagnostic is insertion-order invariant"),
-			ReversedResult.Diagnostics[0],
-			CanonicalResult.Diagnostics[0]
-		);
+		for (int32 Index = 0; Index < CanonicalResult.Diagnostics.Num(); ++Index)
+		{
+			TestEqual(
+				*FString::Printf(TEXT("fair-share diagnostic %d is insertion-order invariant"), Index),
+				ReversedResult.Diagnostics[Index],
+				CanonicalResult.Diagnostics[Index]
+			);
+		}
 	}
 	TestEqual(TEXT("reversed dense input also creates no knots"), ReversedResult.CreatedKnots, 0);
 	return true;
@@ -1216,6 +1220,7 @@ bool FK2ReroutePreferredWaypointsTest::RunTest(const FString& Parameters)
 		FVector2D(336.0, 200.0),
 		FVector2D(336.0, 100.0),
 	};
+	Edge.bValidatePreferredWaypointsOnly = true;
 	const FRerouteResult Result = RouteEdge(Fixture, Edge);
 	const TArray<UK2Node_Knot*> Knots = GetGeneratedKnotsForLogicalEdge(*Fixture.Graph, TEXT("Preferred.LogicalEdge"));
 
@@ -1229,6 +1234,42 @@ bool FK2ReroutePreferredWaypointsTest::RunTest(const FString& Parameters)
 			Edge.PreferredWaypoints[Index]
 		);
 	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FK2RerouteUnsafeMandatoryWaypointsTest,
+	"Project.Unit Tests.GraphFormatter.K2Routing.UnsafeExternalWaypointsAreRejectedNotSubstituted",
+	EAutomationTestFlags::ProductFilter | EAutomationTestFlags::EditorContext
+)
+
+bool FK2RerouteUnsafeMandatoryWaypointsTest::RunTest(const FString& Parameters)
+{
+	(void)Parameters;
+	FRouteFixture Fixture = MakeBackwardFixture();
+	FRerouteEdge Edge =
+		MakeEdge(Fixture, TEXT("Preferred.Unsafe.External"), FVector2D(0.0, 100.0), FVector2D(400.0, 100.0));
+	Edge.PreferredWaypoints = {
+		FVector2D(64.0, 100.0),
+		FVector2D(64.0, 200.0),
+		FVector2D(336.0, 200.0),
+		FVector2D(336.0, 100.0),
+	};
+	Edge.bValidatePreferredWaypointsOnly = true;
+	UK2Node_Knot* ObstacleNode = AddKnot(*Fixture.Graph, FVector2D(200.0, 200.0));
+	FRerouteObstacle Obstacle;
+	Obstacle.Node = ObstacleNode;
+	Obstacle.Bounds = FBox2D(FVector2D(150.0, 150.0), FVector2D(250.0, 250.0));
+
+	const FRerouteResult Result = RouteEdge(Fixture, Edge, MakeArrayView(&Obstacle, 1));
+	TestEqual(TEXT("the unsafe external proposal is not replaced by a native route"), Result.RoutedWires, 0);
+	TestEqual(TEXT("the rejected proposal is reported as skipped"), Result.SkippedWires, 1);
+	TestTrue(TEXT("the original direct topology remains intact"), HasDirectLink(*Fixture.Source, *Fixture.Destination));
+	TestEqual(
+		TEXT("no generated route knots were installed"),
+		GetGeneratedKnotsForLogicalEdge(*Fixture.Graph, TEXT("Preferred.Unsafe.External")).Num(),
+		0
+	);
 	return true;
 }
 

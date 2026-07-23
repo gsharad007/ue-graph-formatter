@@ -2,11 +2,15 @@
 
 ## Executive decision
 
-The selected architecture is a deterministic, native C++ Blueprint/K2 layout core plus a separate,
-conservative native wire router. It ships with no Java, JavaScript, .NET, GPL, LGPL, or EPL layout
-dependency. The design borrows proven ideas from ELK Layered, Graphviz/dot, Sugiyama-style layered
-drawing, and object-avoiding connector routers, but owns the Unreal-specific semantic model,
-transactions, geometry capture, and topology safety.
+The selected production architecture is a deterministic, native C++ Blueprint/K2 layout core plus a
+separate, conservative native wire router. The production formatting path has no Java, JavaScript,
+.NET, GPL, LGPL, or EPL layout dependency. The plugin now also ships two explicitly optional benchmark
+oracles: LGPL Adaptagrams/libavoid in a separate dynamically loaded editor DLL, and the unmodified
+EPL-2.0 elkjs bundle launched out of process through a local Node.js runtime. Neither is used by the
+production command. They exist so independent placement and routing results can be compared on real
+graphs. The design borrows proven ideas from ELK Layered, Graphviz/dot, Sugiyama-style layered drawing,
+and object-avoiding connector routers, but owns the Unreal-specific semantic model, transactions,
+geometry capture, and topology safety.
 
 That choice is deliberate. ELK is the closest general-purpose match for port-aware layered layout,
 and libavoid is the closest focused match for connector routing, but neither can be dropped into an
@@ -101,8 +105,9 @@ future vendoring or binary distribution still requires project legal review.
 
 | Candidate | Relevant strengths | Integration and license | Decision |
 |---|---|---|---|
-| [ELK Layered](https://eclipse.dev/elk/reference/algorithms/org-eclipse-elk-layered.html) | The strongest conceptual fit: layered directed layout, explicit ports, port order/side constraints, compound graphs, crossing minimization, and straight/orthogonal/spline routing. Its [port constraints](https://eclipse.dev/elk/reference/options/org-eclipse-elk-portConstraints.html) and [model-order constraints](https://eclipse.dev/elk/blog/posts/2023/23-01-09-constraining-the-model.html) map well to Blueprint pins. | The [ELK repository](https://github.com/eclipse-elk/elk) is Java under EPL 2.0. Shipping it means embedding/launching a JVM, using a transpiled JS build, or maintaining a native port, plus EPL notices and source obligations for modifications. It still would not understand Unreal transactions or K2 topology. | **Reference design, not a shipping dependency.** Use its phase structure and constraint vocabulary as an oracle for future improvements. |
-| [libavoid](https://www.adaptagrams.org/documentation/libavoid.html) | Cross-platform C++ object-avoiding orthogonal/polyline connector routing, incremental diagram-editor use, crossing/segment penalties, and mature routing research. | The [Adaptagrams repository](https://github.com/mjwybrow/adaptagrams) is LGPL 2.1-or-later and dual-licensed commercially. It is a router, not a complete semantic node-placement engine, and its repository has no formal releases. Static Unreal plugin distribution needs careful LGPL compliance or a commercial license. | **Best optional future routing backend**, but only behind an adapter and only after licensing/build evaluation. Not required by the current native router. |
+| [ELK Layered](https://eclipse.dev/elk/reference/algorithms/org-eclipse-elk-layered.html) | The strongest conceptual fit: layered directed layout, explicit ports, port order/side constraints, compound graphs, crossing minimization, and straight/orthogonal/spline routing. Its [port constraints](https://eclipse.dev/elk/reference/options/org-eclipse-elk-portConstraints.html) and [model-order constraints](https://eclipse.dev/elk/blog/posts/2023/23-01-09-constraining-the-model.html) map well to Blueprint pins. | The primary [ELK repository](https://github.com/eclipse-elk/elk) is Java under EPL 2.0; the pinned elkjs build is EPL-2.0 OR GPL-3.0-or-later. Production use would mean embedding/launching a runtime or maintaining a native port, plus distribution obligations. It still would not understand Unreal transactions or K2 topology. | **Implemented as an optional comparison backend, not a shipping dependency.** An unmodified elkjs 0.12.0 bundle is launched out of process, receives measured fixed ports and K2-weighted constraints, and returns placement plus orthogonal edge sections for a transient copy. |
+| [libavoid](https://www.adaptagrams.org/documentation/libavoid.html) | Cross-platform C++ object-avoiding orthogonal/polyline connector routing, incremental diagram-editor use, crossing/segment penalties, and mature routing research. | The [Adaptagrams repository](https://github.com/mjwybrow/adaptagrams) is LGPL 2.1-or-later and dual-licensed commercially. It is a router, not a complete semantic node-placement engine, and its repository has no formal releases. Static linking into the MIT formatter would create avoidable distribution ambiguity. | **Implemented as an optional comparison backend only.** Pinned source is isolated in a dynamically loaded LGPL editor-module DLL behind an Unreal-value interface. It is paired with native placement and is not required by the current native router. |
+| [Blueprint Auto Layout](https://github.com/ibrews/blueprint-auto-layout) | Native Unreal, MIT licensed, pin-aware layered layout with long-edge lanes and a Blueprint reroute pass. It provides a directly comparable independent implementation without another runtime. | The callable algorithm is small enough to vendor and pin. Its editor commands, settings, and startup hooks would conflict with this plugin if imported wholesale. | **Implemented as a benchmark backend.** Only the MIT callable algorithm is embedded; no competing toolbar or module startup is included. |
 | [Blueprint Assist](https://blueprintassist.github.io/miscellaneous/settings/) | Native Unreal integration, strong workflow polish, auto-formatting, extensive settings, and useful [visual formatting examples](https://blueprintassist.github.io/miscellaneous/formatting-examples/). It is the closest product-level usability benchmark. | It is a paid proprietary Fab/Marketplace product, not an open-source layout library. Public documentation does not grant reusable source rights. Its own listing recommends a separate comment-sizing plugin. | **UX and output-quality benchmark only.** It cannot be the foundation of this MIT plugin. |
 | [Graphviz/dot](https://graphviz.org/docs/layouts/dot/) | Proven hierarchical ranking, crossing reduction, clusters, ports in several representations, and node-avoiding spline output. Native C libraries are widely deployed. | Current Graphviz is [EPL 2.0](https://graphviz.org/license/). Its [orthogonal spline mode](https://graphviz.org/docs/attrs/splines/) explicitly does not handle ports in `dot`, which is a major K2 mismatch. Adapting DOT output back to exact Slate pin anchors and UE transactions would remain substantial. | **Algorithm reference and possible offline comparison tool**, not the selected in-editor engine. |
 | [OGDF](https://ogdf.github.io/doc/ogdf/group__graph-drawing.html) | Very broad native C++ graph-drawing toolkit: Sugiyama, planarization, orthogonal, clustered, and force-directed algorithms. | OGDF is distributed under GPL v2 or v3 according to its [official license page](https://www.ogdf.uni-osnabrueck.de/license/). That is not compatible with the current goal of distributing this plugin as an MIT editor plugin without broader copyleft obligations or a separate agreement. Its generic ports still need a K2 adapter. | **Rejected for the shipping plugin on license grounds.** Useful research reference. |
@@ -233,7 +238,8 @@ while routing remains a fallback for unavoidable detours.
 In preservation mode, adjacent authored rank deltas are an expand-only lower bound. A cramped gap grows
 to satisfy the widest-node/provider-corridor clearance, and that growth propagates rightward without
 consuming a later generous gap. Deltas are measured independently from absolute authored positions, so
-nearby event roots can share a snapped start column without changing the spacing inside either paragraph.
+all execution-rooted paragraphs can share the scope-wide authored-median start column without changing
+the spacing inside any paragraph.
 Interpolated authored positions on long-edge virtual ranks also contribute to those adjacent deltas, so a
 skip edge keeps a readable progression through intermediate columns instead of being compressed around
 the shorter real-node branch that established the ranks.
@@ -536,9 +542,9 @@ screenshot or geometry manifest proves the visual result.
 | Straight primary execution links | Track ratio and prevent corpus regressions. |
 | Backward execution/data links | Never introduce backward execution; reject material backward-data regressions. |
 | Authored horizontal spacing | Expand gaps required by configured gutters, propagate that expansion, and never consume a later generous adjacent-rank gap. |
-| Authored event roots | Limit drift in both axes to coarse-grid snap tolerance and never invert top-to-bottom order. |
+| Authored event roots | Align all execution starts to the scope-wide median major-grid X column, retain authored top-to-bottom order, and move vertically only for snapping or required inter-island clearance. |
 | Unrouted wire/node intersections | Reject newly introduced rendered-spline intersections before mutation; evaluate direct and generated routes with the same flattened Kismet curve model. |
-| Rendered wire crossings | The pre-mutation layout gate permits no new execution or data crossing-pair identity, including equal-count substitutions; every installed reroute is additionally crossing-pair monotonic against the complete reserved wire field. |
+| Rendered wire crossings | The pre-mutation placement gate never increases total execution or data crossing multiplicity; equal-count pair substitutions may proceed. Every installed reroute is additionally crossing-pair monotonic against the complete reserved wire field. |
 | Wire/node intersections | Zero for accepted generated routes under the stock Kismet policy. |
 | Bends and generated knots | Minimize after safety/crossings; enforce the per-wire cap and reject node/knot-box overlap. |
 | Determinism | Identical plan across snapshot insertion permutations. |
@@ -585,9 +591,11 @@ The current architecture intentionally does not promise the following:
 - **Editor integration is part of correctness.** Multiple asset-editor windows, unusual toolkits, and
   automation require exact target binding; layout-core correctness cannot compensate for formatting
   the wrong visible graph.
-- **Licenses are not performance features.** ELK, libavoid, OGDF, Graphviz, MSAGL, or dagre should not be
-  vendored casually because a screenshot looked good. Any backend must pass the same topology,
-  determinism, integration, and distribution gates.
+- **Licenses are not performance features.** ELK, OGDF, Graphviz, MSAGL, or dagre should not be
+  vendored casually because a screenshot looked good. The benchmark-only libavoid integration is
+  isolated in its own dynamically loaded LGPL DLL; the benchmark-only elkjs bundle is pinned, unmodified,
+  separately noticed, and launched out of process. Neither is part of the production formatter. Any
+  backend must pass the same topology, determinism, integration, and distribution gates.
 
 ## Roadmap to “god mode”
 
@@ -632,12 +640,24 @@ Preservation-first positioning, authored event-paragraph order, coarse-cell stat
 pre-mutation readability rejection gate are implemented. This phase now concerns explicit user locks,
 incremental scope selection, and interactive preview rather than basic mental-map preservation.
 
-### Phase 4: evidence-driven tuning
+### Phase 4: evidence-driven tuning (started)
 
 - Grow the real Blueprint corpus and store per-graph metrics.
-- Compare native results offline against ELK/Graphviz and, if legally evaluated, libavoid; use them as
-  oracles, not shipping requirements.
-- Run pairwise human reviews focused on scan time and error rate, not only compactness.
+- Use the implemented blinded original/A/B/C/D window to compare the native formatter, the pinned MIT
+  Blueprint Auto Layout implementation, native placement plus isolated libavoid routing, and pinned
+  elkjs/ELK Layered placement plus orthogonal routing. Persist per-criterion ballots, objective metrics,
+  geometry/configuration provenance, and all five judged PNG panes; treat backends as oracles, not
+  production requirements. Refuse fallback-only source captures, recapture metrics from the rendered
+  result panes, and use one common zoom factor for all five images. The libavoid adapter routes only
+  defect wires and validates the exact external proposal through the production rendered-spline safety
+  gate. Blueprint Auto Layout consumes captured source pin offsets instead of silently estimating every
+  pin in its transient graph. ELK receives measured node sizes and fixed linked-pin ports, K2-weighted
+  execution/model-order/spacing constraints, and preserves its exact JSON input, output, and process log
+  for audit. Hard readability regressions are labelled invalid rather than hidden behind a successful
+  backend return code.
+- Keep Graphviz as an offline oracle candidate only if a later experiment justifies its integration and
+  runtime cost.
+- Run repeated human reviews focused on scan time and error rate, not only compactness.
 - Tune presets such as `Readable`, `Compact`, `Minimal Movement`, and `Aggressive Routing` without
   weakening topology invariants.
 

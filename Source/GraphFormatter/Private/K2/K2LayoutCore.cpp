@@ -1061,10 +1061,9 @@ void FLayoutBuilder::BuildPreservedComponents()
 	}
 	Components = MoveTemp(AuthoredComponents);
 
-	// Event roots that were authored as one visual start column should not split merely
-	// because they straddle a coarse-cell rounding boundary. Cluster only nearby execution
-	// starts, then snap the cluster median once. Data-only islands and roots authored one full
-	// coarse cell apart remain independent.
+	// A Blueprint reads as one document when every independent execution island begins on the
+	// same major-grid column. Use the scope-wide authored median so the shared column minimizes
+	// total horizontal movement. Data-only islands remain independent.
 	TArray<int32> ComponentsByAnchorX;
 	for (int32 ComponentIndex = 0; ComponentIndex < Components.Num(); ++ComponentIndex)
 	{
@@ -1078,35 +1077,19 @@ void FLayoutBuilder::BuildPreservedComponents()
 		}
 		if (bHasExecutionOutput) { ComponentsByAnchorX.Add(ComponentIndex); }
 	}
-	ComponentsByAnchorX.Sort(
-		[this](const int32 A, const int32 B)
-		{
-			const double LeftX = Components[A].AuthoredAnchor.X;
-			const double RightX = Components[B].AuthoredAnchor.X;
-			return LeftX == RightX ? StableLess(Components[A].StableKey, Components[B].StableKey) : LeftX < RightX;
-		}
-	);
-	for (int32 ClusterStart = 0; ClusterStart < ComponentsByAnchorX.Num();)
+	if (!ComponentsByAnchorX.IsEmpty())
 	{
-		int32 ClusterEnd = ClusterStart + 1;
-		const double FirstX = Components[ComponentsByAnchorX[ClusterStart]].AuthoredAnchor.X;
-		while (ClusterEnd < ComponentsByAnchorX.Num()
-			   && Components[ComponentsByAnchorX[ClusterEnd]].AuthoredAnchor.X - FirstX < LayoutCell() * 0.5)
+		TArray<double> AuthoredRootXs;
+		AuthoredRootXs.Reserve(ComponentsByAnchorX.Num());
+		for (const int32 ComponentIndex : ComponentsByAnchorX)
 		{
-			++ClusterEnd;
+			AuthoredRootXs.Add(Components[ComponentIndex].AuthoredAnchor.X);
 		}
-		TArray<double> ClusterXs;
-		ClusterXs.Reserve(ClusterEnd - ClusterStart);
-		for (int32 ClusterIndex = ClusterStart; ClusterIndex < ClusterEnd; ++ClusterIndex)
+		const double SharedAnchorX = SnapNearest(Median(MoveTemp(AuthoredRootXs)), LayoutCell());
+		for (const int32 ComponentIndex : ComponentsByAnchorX)
 		{
-			ClusterXs.Add(Components[ComponentsByAnchorX[ClusterIndex]].AuthoredAnchor.X);
+			Components[ComponentIndex].AuthoredAnchor.X = SharedAnchorX;
 		}
-		const double SharedAnchorX = SnapNearest(Median(MoveTemp(ClusterXs)), LayoutCell());
-		for (int32 ClusterIndex = ClusterStart; ClusterIndex < ClusterEnd; ++ClusterIndex)
-		{
-			Components[ComponentsByAnchorX[ClusterIndex]].AuthoredAnchor.X = SharedAnchorX;
-		}
-		ClusterStart = ClusterEnd;
 	}
 }
 
